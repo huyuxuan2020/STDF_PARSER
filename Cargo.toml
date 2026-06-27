@@ -1,0 +1,3 @@
+[workspace]
+members = ["stdf-core", "src-tauri"]
+resolver = "2"

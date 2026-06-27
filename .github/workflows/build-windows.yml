@@ -1,0 +1,41 @@
+name: Build Windows Installer
+
+# 仅手动触发：用于临时打一个 Windows 安装包做测试（产物在该次运行的 Artifacts 里下载）。
+# 正式发版（含自动更新签名 + 双平台）请改用 release.yml —— 推一个 v* tag 即可。
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Build Tauri app (Windows installers)
+        run: npm run tauri build
+
+      # 上传安装包到本次运行的 Artifacts（手动触发时用这个下载）
+      - name: Upload installers as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installers
+          path: |
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/msi/*.msi
+          if-no-files-found: error

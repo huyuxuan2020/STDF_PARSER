@@ -1,0 +1,95 @@
+name: Release (auto-update)
+
+# 正式发版：推一个 v* tag 即可同时构建 macOS + Windows，
+# 自动用更新私钥签名、生成 latest.json、创建并发布 GitHub Release。
+# 用户端 App 启动时会读取 Release 里的 latest.json 来检查更新。
+#
+#   git tag v0.2.0
+#   git push origin v0.2.0
+#
+# 注意：tauri.conf.json 里的 version 要先改成与 tag 一致（去掉前缀 v）。
+on:
+  push:
+    tags:
+      - "v*"
+  # 也允许手动触发（需要在下面填一个已存在的 tag 名）
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（如 v0.2.0）"
+        required: true
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: "--target universal-apple-darwin"
+            rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          - platform: windows-latest
+            args: ""
+            rust-targets: ""
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Build, sign & release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # —— 自动更新签名（两个平台都需要）——
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # —— macOS 代码签名 + 公证（仅 mac 任务用到，windows 任务忽略）——
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        with:
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: "STDF Parser ${{ github.event.inputs.tag || github.ref_name }}"
+          # 面向用户的发布说明。每次发新版前按需更新这段文字。
+          releaseBody: |
+            ### ✨ 新功能
+            - **自动更新**：软件现在会在启动时自动检查新版本。有更新时会弹窗提示，点一下即可下载并安装，不必再手动下载安装包。
+            - 左侧工具栏新增「更新」按钮，可随时手动检查更新。
+
+            ### 📥 下载
+            - **macOS**：下载 `.dmg` 安装。
+            - **Windows**：下载 `.exe` 安装。
+
+            ### 📝 说明
+            - 本版本起，后续新版都会通过自动更新推送。
+            - 已装本版本的用户，下次发版会自动收到升级提示。
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}
