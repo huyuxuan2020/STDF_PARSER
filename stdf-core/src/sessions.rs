@@ -1623,8 +1623,10 @@ fn parse_float(value: &str) -> Option<f64> {
 }
 
 /// STDF "inverted" SI prefix table: a positive scaling exponent denotes a small
-/// unit (milli/micro/...), a negative one a large unit (kilo/mega/...). The relation
-/// is `stored = base * 10^scale`, hence `base = stored * 10^(-scale)`.
+/// unit (milli/micro/...), a negative one a large unit (kilo/mega/...). RESULT,
+/// LO_LIMIT and HI_LIMIT are stored in base SI units; the exponent is a display
+/// hint, so the shown value is `stored * 10^scale` under the prefixed unit
+/// (e.g. 0.161 V at scale 3 shows as "161 mV"; 32000 Hz at scale -3 as "32 KHz").
 fn scale_prefix(scale: i32) -> &'static str {
     match scale {
         -12 => "T",
@@ -1646,9 +1648,18 @@ fn parse_scale(value: &str) -> i32 {
     value.trim().parse::<i32>().unwrap_or(0)
 }
 
-/// Convert a stored value to its base-unit magnitude (for limit comparison).
+/// Convert a stored value to a scale-normalized magnitude for limit comparison.
+/// Result and limit share the same exponent (limit scales default to the result
+/// scale), so this factor cancels and the verdict is unaffected by its direction.
 fn to_base(stored: f64, scale: i32) -> f64 {
     stored * 10f64.powi(-scale)
+}
+
+/// Express a stored base-unit value in the column's display scale: the shown
+/// number is `stored * 10^scale`, matching the SI prefix on the column's unit
+/// (0.161 V at scale 3 -> 161 "mV"; 32000 Hz at scale -3 -> 32 "KHz").
+fn to_display(stored: f64, scale: i32) -> f64 {
+    stored * 10f64.powi(scale)
 }
 
 /// Render a value with ~10 significant digits, trimming floating-point noise and
@@ -1666,17 +1677,14 @@ fn format_num(value: f64) -> String {
     format!("{}", rounded)
 }
 
-/// Render a stored limit in the column's result scale. When the limit and result
-/// share a scale (the common case) the original string is kept verbatim, avoiding
-/// any floating-point reformatting.
-fn display_limit(raw: &str, from_scale: i32, to_scale: i32) -> String {
+/// Render a stored base-unit limit in the column's display scale (`value * 10^scale`)
+/// so it matches the SI prefix on the column's unit. Scale 0 keeps the original
+/// string verbatim, avoiding any floating-point reformatting.
+fn display_limit(raw: &str, scale: i32) -> String {
     match parse_float(raw) {
         None => String::new(),
-        Some(value) if from_scale == to_scale => {
-            let _ = value;
-            raw.to_string()
-        }
-        Some(value) => format_num(value * 10f64.powi(to_scale - from_scale)),
+        Some(_) if scale == 0 => raw.to_string(),
+        Some(value) => format_num(to_display(value, scale)),
     }
 }
 
@@ -1748,8 +1756,8 @@ fn resolve_column(
             record_type: record_type.to_string(),
             test_num,
             test_name,
-            low_limit: display_limit(&lo_raw, llm_scal, res_scal),
-            high_limit: display_limit(&hi_raw, hlm_scal, res_scal),
+            low_limit: display_limit(&lo_raw, res_scal),
+            high_limit: display_limit(&hi_raw, res_scal),
             unit,
             pmr_indices,
         },
@@ -1763,17 +1771,22 @@ fn resolve_column(
 
 fn build_ptr_cell(fields: &[RecordField], meta: &ColumnMeta) -> TestItemCell {
     let result = field_value(fields, "RESULT");
-    let status = match parse_float(&result) {
+    let parsed = parse_float(&result);
+    let status = match parsed {
         Some(value) => judge(to_base(value, meta.res_scal), meta.low_base, meta.high_base),
         None => String::new(),
     };
+    let value = if result.is_empty() {
+        field_value(fields, "TEST_FLG")
+    } else {
+        match parsed {
+            Some(v) if meta.res_scal != 0 => format_num(to_display(v, meta.res_scal)),
+            _ => result,
+        }
+    };
     TestItemCell {
         test_num: field_value(fields, "TEST_NUM").parse::<u32>().unwrap_or(0),
-        value: if result.is_empty() {
-            field_value(fields, "TEST_FLG")
-        } else {
-            result
-        },
+        value,
         status,
     }
 }
@@ -1812,9 +1825,21 @@ fn build_mpr_cell(fields: &[RecordField], meta: &ColumnMeta) -> TestItemCell {
     } else {
         "P".to_string()
     };
+    let value = if meta.res_scal == 0 {
+        results.join(", ")
+    } else {
+        results
+            .iter()
+            .map(|raw| match parse_float(raw) {
+                Some(v) => format_num(to_display(v, meta.res_scal)),
+                None => raw.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     TestItemCell {
         test_num,
-        value: results.join(", "),
+        value,
         status,
     }
 }
@@ -2666,12 +2691,17 @@ mod tests {
         assert_eq!(parse_scale(""), 0);
         assert_eq!(parse_scale("oops"), 0);
 
-        // stored = base * 10^scale, so base = stored * 10^-scale; milli => scale +3.
+        // Stored values are base SI units; displayed = stored * 10^scale.
+        // 0.161 V at milli (+3) -> 161 mV; 32000 Hz at kilo (-3) -> 32 KHz.
+        assert!((to_display(0.161, 3) - 161.0).abs() < 1e-9);
+        assert!((to_display(32000.0, -3) - 32.0).abs() < 1e-9);
+
+        // to_base only normalizes for limit comparison (cancels against the limit scale).
         assert!((to_base(2.3, 3) - 0.0023).abs() < 1e-12);
 
-        // Same scale keeps the original string; a differing scale renormalizes.
-        assert_eq!(display_limit("1.0", 0, 0), "1.0");
-        assert_eq!(display_limit("0.005", 0, 3), "5");
+        // display_limit renders a base limit in the column scale; scale 0 is verbatim.
+        assert_eq!(display_limit("1.0", 0), "1.0");
+        assert_eq!(display_limit("0.05", 3), "50");
 
         // Pass/fail is judged on base units; no limit means no verdict.
         assert_eq!(judge(1.05, Some(1.0), Some(1.2)), "P");
