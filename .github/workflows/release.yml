@@ -1,13 +1,22 @@
 name: Release (auto-update)
 
 # 正式发版：推一个 v* tag 即可同时构建 macOS + Windows，
-# 自动用更新私钥签名、生成 latest.json、创建并发布 GitHub Release。
+# 自动用更新私钥签名、生成 latest.json，并发布 GitHub Release。
 # 用户端 App 启动时会读取 Release 里的 latest.json 来检查更新。
 #
 #   git tag v0.2.0
 #   git push origin v0.2.0
 #
 # 注意：tauri.conf.json 里的 version 要先改成与 tag 一致（去掉前缀 v）。
+#
+# 发布顺序（避免「包还没传完、版本却已经能被检测到」的竞态）：
+#   1) create-release —— 先建一个【草稿】Release。草稿不会被
+#      `releases/latest` 命中，所以此时所有用户仍只看到旧版本。
+#   2) build-tauri    —— macOS / Windows 并行构建、签名，把安装包和
+#      latest.json 上传到这个草稿 Release。
+#   3) publish-release —— 两个平台都成功后，才把 Release 取消草稿、
+#      正式发布。此刻 latest.json 与所有安装包一并对外可见，
+#      用户检测到更新时安装包必定已存在，不会再下载 404。
 on:
   push:
     tags:
@@ -19,8 +28,51 @@ on:
         description: "要发布的 tag（如 v0.2.0）"
         required: true
 
+env:
+  TAG_NAME: ${{ github.event.inputs.tag || github.ref_name }}
+
 jobs:
-  release:
+  # ── 1) 先建草稿 Release，输出 release_id 供后续 job 使用 ──
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.create-release.outputs.result }}
+    steps:
+      - name: Create draft release
+        id: create-release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = process.env.TAG_NAME;
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `STDF Parser ${tag}`,
+              // 面向用户的发布说明。每次发新版前按需更新这段文字。
+              body: [
+                '### ✨ 新功能',
+                '- **自动更新**：软件现在会在启动时自动检查新版本。有更新时会弹窗提示，点一下即可下载并安装，不必再手动下载安装包。',
+                '- 左侧工具栏新增「更新」按钮，可随时手动检查更新。',
+                '',
+                '### 📥 下载',
+                '- **macOS**：下载 `.dmg` 安装。',
+                '- **Windows**：下载 `.exe` 安装。',
+                '',
+                '### 📝 说明',
+                '- 本版本起，后续新版都会通过自动更新推送。',
+                '- 已装本版本的用户，下次发版会自动收到升级提示。',
+              ].join('\n'),
+              draft: true,
+              prerelease: false,
+            });
+            return data.id;
+
+  # ── 2) 并行构建两个平台，上传到上面的草稿 Release ──
+  build-tauri:
+    needs: create-release
     permissions:
       contents: write
     strategy:
@@ -58,7 +110,7 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
-      - name: Build, sign & release
+      - name: Build, sign & upload
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -74,22 +126,28 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         with:
-          tagName: ${{ github.event.inputs.tag || github.ref_name }}
-          releaseName: "STDF Parser ${{ github.event.inputs.tag || github.ref_name }}"
-          # 面向用户的发布说明。每次发新版前按需更新这段文字。
-          releaseBody: |
-            ### ✨ 新功能
-            - **自动更新**：软件现在会在启动时自动检查新版本。有更新时会弹窗提示，点一下即可下载并安装，不必再手动下载安装包。
-            - 左侧工具栏新增「更新」按钮，可随时手动检查更新。
-
-            ### 📥 下载
-            - **macOS**：下载 `.dmg` 安装。
-            - **Windows**：下载 `.exe` 安装。
-
-            ### 📝 说明
-            - 本版本起，后续新版都会通过自动更新推送。
-            - 已装本版本的用户，下次发版会自动收到升级提示。
-          releaseDraft: false
-          prerelease: false
+          # 上传到上面的草稿 Release（不再各自创建 Release，避免竞态）。
+          releaseId: ${{ needs.create-release.outputs.release_id }}
           includeUpdaterJson: true
           args: ${{ matrix.args }}
+
+  # ── 3) 两个平台都成功后，才正式发布（取消草稿）──
+  publish-release:
+    needs: [create-release, build-tauri]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release
+        uses: actions/github-script@v7
+        env:
+          release_id: ${{ needs.create-release.outputs.release_id }}
+        with:
+          script: |
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: Number(process.env.release_id),
+              draft: false,
+              prerelease: false,
+            });

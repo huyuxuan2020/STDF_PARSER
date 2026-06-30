@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { Download, Loader2, RefreshCw, X } from "lucide-react";
@@ -20,6 +20,107 @@ const BTN_SECONDARY = `${BTN_BASE} whitespace-nowrap border border-border-strong
 
 // Only run inside the Tauri webview; the global is injected by the runtime.
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+/* ------------------------------------------------------------------ *
+ * Release notes are Markdown (the GitHub release body). They ship a   *
+ * small, controlled subset — headings, bullet lists, **bold** and     *
+ * `code` — so we render that subset inline rather than pulling in a    *
+ * full Markdown dependency. Anything unrecognized falls through as     *
+ * plain text.                                                          *
+ * ------------------------------------------------------------------ */
+
+// Render inline **bold** and `code` spans within a single line of text.
+function renderInline(text: string, keyPrefix: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  const pattern = /\*\*(.+?)\*\*|`([^`]+)`/g;
+  let last = 0;
+  let token = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > last) {
+      nodes.push(<span key={`${keyPrefix}-t${token}`}>{text.slice(last, match.index)}</span>);
+    }
+    if (match[1] !== undefined) {
+      nodes.push(
+        <strong key={`${keyPrefix}-b${token}`} className="font-semibold text-foreground">
+          {match[1]}
+        </strong>
+      );
+    } else if (match[2] !== undefined) {
+      nodes.push(
+        <code
+          key={`${keyPrefix}-c${token}`}
+          className="rounded bg-border/60 px-1 py-0.5 font-mono text-[11px] text-foreground"
+        >
+          {match[2]}
+        </code>
+      );
+    }
+    last = match.index + match[0].length;
+    token += 1;
+  }
+  if (last < text.length) {
+    nodes.push(<span key={`${keyPrefix}-t${token}`}>{text.slice(last)}</span>);
+  }
+  return nodes;
+}
+
+function ReleaseNotes({ body }: { body: string }) {
+  const lines = body.replace(/\r\n/g, "\n").split("\n");
+  const blocks: ReactNode[] = [];
+  let bullets: string[] = [];
+  let key = 0;
+
+  const flushBullets = () => {
+    if (bullets.length === 0) return;
+    const items = bullets;
+    bullets = [];
+    blocks.push(
+      <ul key={`ul-${key++}`} className="flex list-none flex-col gap-1">
+        {items.map((item, i) => (
+          <li key={i} className="flex gap-2 text-foreground">
+            <span aria-hidden="true" className="select-none text-primary">
+              •
+            </span>
+            <span className="min-w-0">{renderInline(item, `li-${key}-${i}`)}</span>
+          </li>
+        ))}
+      </ul>
+    );
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (line === "") {
+      flushBullets();
+      continue;
+    }
+    const heading = /^#{1,6}\s+(.*)$/.exec(line);
+    if (heading) {
+      flushBullets();
+      blocks.push(
+        <p key={`h-${key++}`} className="mt-1 font-semibold text-foreground first:mt-0">
+          {renderInline(heading[1], `h-${key}`)}
+        </p>
+      );
+      continue;
+    }
+    const bullet = /^[-*]\s+(.*)$/.exec(line);
+    if (bullet) {
+      bullets.push(bullet[1]);
+      continue;
+    }
+    flushBullets();
+    blocks.push(
+      <p key={`p-${key++}`} className="text-muted-foreground">
+        {renderInline(line, `p-${key}`)}
+      </p>
+    );
+  }
+  flushBullets();
+
+  return <div className="flex flex-col gap-2 text-xs leading-relaxed text-foreground">{blocks}</div>;
+}
 
 type Phase =
   | { kind: "idle" }
@@ -178,9 +279,9 @@ export function UpdateChecker() {
                     。
                   </p>
                   {phase.update.body && (
-                    <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
-                      {phase.update.body}
-                    </pre>
+                    <div className="max-h-48 overflow-auto rounded-md border border-border bg-muted/40 px-3 py-2.5">
+                      <ReleaseNotes body={phase.update.body} />
+                    </div>
                   )}
                 </div>
               )}
