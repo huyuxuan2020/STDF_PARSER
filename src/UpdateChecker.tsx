@@ -21,6 +21,73 @@ const BTN_SECONDARY = `${BTN_BASE} whitespace-nowrap border border-border-strong
 // Only run inside the Tauri webview; the global is injected by the runtime.
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+const RELEASES_API = "https://api.github.com/repos/huyuxuan2020/STDF_PARSER/releases?per_page=30";
+
+/**
+ * Parse a semver tag ("v0.1.2", "0.1.2") to a comparable tuple. Non-numeric
+ * segments read as 0, so exotic tags sort at the low end rather than throw.
+ */
+function parseVersion(raw: string): number[] {
+  return raw
+    .replace(/^v/, "")
+    .split(".")
+    .map((n) => {
+      const v = parseInt(n, 10);
+      return Number.isFinite(v) ? v : 0;
+    });
+}
+
+function compareVersion(a: string, b: string): number {
+  const pa = parseVersion(a);
+  const pb = parseVersion(b);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+type GhRelease = {
+  tag_name: string;
+  body: string | null;
+  draft: boolean;
+  prerelease: boolean;
+};
+
+/**
+ * Combine release notes for every published version in (fromVersion, toVersion].
+ * Used to catch the user up when they skipped several releases in a row.
+ * Falls back to null on any fetch/parse failure — the caller can then use the
+ * single-version body from the updater plugin.
+ */
+async function fetchCombinedNotes(
+  fromVersion: string,
+  toVersion: string
+): Promise<string | null> {
+  try {
+    const res = await fetch(RELEASES_API);
+    if (!res.ok) return null;
+    const releases = (await res.json()) as GhRelease[];
+    const relevant = releases
+      .filter((r) => !r.draft && !r.prerelease && r.body && r.body.trim() !== "")
+      .filter(
+        (r) =>
+          compareVersion(r.tag_name, fromVersion) > 0 &&
+          compareVersion(r.tag_name, toVersion) <= 0
+      )
+      .sort((a, b) => compareVersion(b.tag_name, a.tag_name));
+    if (relevant.length === 0) return null;
+    // A single-release window matches the plugin's own body — no gain, and
+    // avoids a redundant "## v0.1.2" header on top.
+    if (relevant.length === 1) return relevant[0].body!.trim();
+    return relevant
+      .map((r) => `## v${r.tag_name.replace(/^v/, "")}\n\n${r.body!.trim()}`)
+      .join("\n\n---\n\n");
+  } catch {
+    return null;
+  }
+}
+
 /* ------------------------------------------------------------------ *
  * Release notes are Markdown (the GitHub release body). They ship a   *
  * small, controlled subset — headings, bullet lists, **bold** and     *
@@ -95,6 +162,13 @@ function ReleaseNotes({ body }: { body: string }) {
       flushBullets();
       continue;
     }
+    // Horizontal rule: `---` or `***`. Used to separate versions when the
+    // notes body was combined from multiple releases.
+    if (/^(-{3,}|\*{3,})$/.test(line)) {
+      flushBullets();
+      blocks.push(<hr key={`hr-${key++}`} className="my-1 border-border" />);
+      continue;
+    }
     const heading = /^#{1,6}\s+(.*)$/.exec(line);
     if (heading) {
       flushBullets();
@@ -125,18 +199,26 @@ function ReleaseNotes({ body }: { body: string }) {
 type Phase =
   | { kind: "idle" }
   | { kind: "checking" }
-  | { kind: "available"; update: Update }
+  | { kind: "available"; update: Update; notes: string }
   | { kind: "downloading"; pct: number | null }
   | { kind: "installing" }
   | { kind: "ready" }
   | { kind: "uptodate" }
   | { kind: "error"; message: string };
 
+type PendingUpdate = { update: Update; notes: string };
+
 export function UpdateChecker() {
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
   // Tracks whether the user triggered the check, so the silent startup check
   // can stay quiet when already up to date but a manual click still reports it.
   const [manual, setManual] = useState(false);
+  // Stashed update from the silent startup check. When set, the rail button
+  // shows a red dot — no dialog, no auto-download. Clicking the button then
+  // opens the dialog with this update instead of running a fresh check. The
+  // `notes` field is a combined body across every skipped version (empty
+  // string if the enrichment fetch failed, in which case update.body is used).
+  const [pendingUpdate, setPendingUpdate] = useState<PendingUpdate | null>(null);
   // Once the user clicks the rail button, skip the pending silent check —
   // otherwise it races the click and flips `manual` back to false mid-check,
   // hiding the dialog while the button spins on the second in-flight check.
@@ -153,13 +235,41 @@ export function UpdateChecker() {
     setPhase({ kind: "checking" });
     try {
       const update = await check();
+      // The user's manual click may have arrived while check() was in flight;
+      // let that run own the visible state instead of this silent one.
+      if (!isManual && manualTaken.current) return;
       if (update) {
-        setPhase({ kind: "available", update });
-      } else {
+        // Enrich the notes with every version between the installed one and
+        // the target — the user may have skipped several releases. If this
+        // call fails (rate limit, offline), fall back to the plugin's own
+        // single-version body from latest.json.
+        const combined = update.currentVersion
+          ? await fetchCombinedNotes(update.currentVersion, update.version)
+          : null;
+        // Same guard as above for a click that landed during the API call.
+        if (!isManual && manualTaken.current) return;
+        const notes = combined ?? update.body ?? "";
+        if (isManual) {
+          setPhase({ kind: "available", update, notes });
+        } else {
+          // Silent: surface the update via the red dot on the rail button
+          // and stay out of the way until the user clicks.
+          setPendingUpdate({ update, notes });
+          setPhase({ kind: "idle" });
+        }
+      } else if (isManual) {
         setPhase({ kind: "uptodate" });
+      } else {
+        // Silent + no update: stay quiet.
+        setPhase({ kind: "idle" });
       }
     } catch (err) {
-      setPhase({ kind: "error", message: String(err) });
+      if (isManual) {
+        setPhase({ kind: "error", message: String(err) });
+      } else {
+        // Silent errors stay silent (no network, offline, etc.).
+        setPhase({ kind: "idle" });
+      }
     }
   }
 
@@ -170,9 +280,24 @@ export function UpdateChecker() {
     return () => window.clearTimeout(timer);
   }, []);
 
+  // Clicking the rail button: if a silent check already found an update,
+  // just open the dialog with that update; otherwise kick off a fresh check.
+  function handleManualClick() {
+    if (pendingUpdate) {
+      manualTaken.current = true;
+      setManual(true);
+      setPhase({ kind: "available", update: pendingUpdate.update, notes: pendingUpdate.notes });
+      return;
+    }
+    void runCheck(true);
+  }
+
   async function downloadAndInstall(update: Update) {
     let total = 0;
     let received = 0;
+    // User committed to installing; clear the red-dot indicator so it
+    // doesn't linger after they pick "稍后重启".
+    setPendingUpdate(null);
     setPhase({ kind: "downloading", pct: null });
     try {
       await update.downloadAndInstall((event) => {
@@ -218,11 +343,11 @@ export function UpdateChecker() {
     <>
       <button
         type="button"
-        aria-label="检查更新"
-        title="检查更新"
+        aria-label={pendingUpdate ? "有新版本可用" : "检查更新"}
+        title={pendingUpdate ? `有新版本 v${pendingUpdate.update.version}` : "检查更新"}
         disabled={checking || phase.kind === "downloading" || phase.kind === "installing"}
-        onClick={() => void runCheck(true)}
-        className={`${RAIL_ITEM} ${RAIL_ITEM_IDLE} disabled:opacity-50`}
+        onClick={handleManualClick}
+        className={`relative ${RAIL_ITEM} ${RAIL_ITEM_IDLE} disabled:opacity-50`}
       >
         {checking ? (
           <Loader2 size={19} className="animate-spin" aria-hidden="true" />
@@ -230,6 +355,12 @@ export function UpdateChecker() {
           <RefreshCw size={19} aria-hidden="true" />
         )}
         <span>更新</span>
+        {pendingUpdate && !checking && (
+          <span
+            aria-hidden="true"
+            className="absolute top-1.5 right-2 h-2.5 w-2.5 rounded-full bg-danger"
+          />
+        )}
       </button>
 
       {showModal && (
@@ -287,9 +418,9 @@ export function UpdateChecker() {
                     )}
                     。
                   </p>
-                  {phase.update.body && (
+                  {phase.notes && (
                     <div className="max-h-48 overflow-auto rounded-md border border-border bg-muted/40 px-3 py-2.5">
-                      <ReleaseNotes body={phase.update.body} />
+                      <ReleaseNotes body={phase.notes} />
                     </div>
                   )}
                 </div>
