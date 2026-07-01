@@ -88,6 +88,40 @@ async function fetchCombinedNotes(
   }
 }
 
+/**
+ * Best-effort classifier for update-check failures caused by no network
+ * (offline, DNS, firewall, timeout). We can't reliably distinguish from
+ * a string message across Tauri/reqwest/OS variants, so err on the side
+ * of "looks like a connection problem" — the friendly copy is safe even
+ * when we're wrong, and never masks a real bug in the updater config.
+ */
+function isLikelyOfflineError(raw: string): boolean {
+  const s = raw.toLowerCase();
+  return [
+    "network",
+    "connection",
+    "connect ",
+    "connect(",
+    "dns",
+    "resolve",
+    "timeout",
+    "timed out",
+    "offline",
+    "unreachable",
+    "no such host",
+    "reqwest",
+    "io error",
+    "could not connect",
+    "failed to send",
+    "sending request",
+    "error sending",
+    "certificate",
+    "tls",
+    "socket",
+    "nodename",
+  ].some((needle) => s.includes(needle));
+}
+
 /* ------------------------------------------------------------------ *
  * Release notes are Markdown (the GitHub release body). They ship a   *
  * small, controlled subset — headings, bullet lists, **bold** and     *
@@ -455,9 +489,19 @@ export function UpdateChecker() {
                 <p>更新已安装,重启后生效。</p>
               )}
 
-              {phase.kind === "error" && (
-                <p className="text-danger">检查更新失败:{phase.message}</p>
-              )}
+              {phase.kind === "error" &&
+                (isLikelyOfflineError(phase.message) ? (
+                  <div className="flex flex-col gap-1.5">
+                    <p className="text-muted-foreground">
+                      当前无法连接到更新服务器，请检查网络后重试。
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      离线也不影响 STDF 解析等本地功能，可以正常继续使用。
+                    </p>
+                  </div>
+                ) : (
+                  <p className="text-danger">检查更新失败：{phase.message}</p>
+                ))}
             </div>
 
             <div className="flex items-center justify-end gap-2 border-t border-border px-4 py-3">
