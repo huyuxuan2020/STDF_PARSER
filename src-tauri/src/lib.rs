@@ -1,8 +1,9 @@
 use stdf_core::parser::{ParseErrorEvent, ParseProgress};
 use stdf_core::sessions::{
-    RecordField, RecordGroup, RecordSummaryPage, SearchResultPage, SessionManager,
+    RecordField, RecordGroup, RecordSummaryPage, SearchProgress, SearchResultPage, SessionManager,
     SessionSnapshot, TestItemColumnLite, TestItemPage, TestItemViewSnapshot,
 };
+use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, State};
 
 #[tauri::command]
@@ -122,15 +123,30 @@ fn get_record_fields(
     manager.get_record_fields(&session_id, &record_id)
 }
 
-#[tauri::command]
+// `(async)` runs this sync CPU-bound handler on a spawned tokio task instead
+// of the WebKit main thread — the search loop otherwise blocks the UI for the
+// full 30-60s scan, freezing the cursor and starving progress callbacks.
+#[tauri::command(async)]
 fn search_fields(
     session_id: String,
     query: String,
     page: usize,
     page_size: usize,
+    on_progress: Channel<SearchProgress>,
     manager: State<'_, SessionManager>,
 ) -> Result<SearchResultPage, String> {
-    manager.search_fields(&session_id, &query, page, page_size)
+    // Report progress via a Tauri v2 Channel scoped to this invoke rather than
+    // a global emit/listen event bus — the channel is bound to the caller's
+    // Promise, so ordering is guaranteed and there is no window where the JS
+    // side "hasn't subscribed yet".
+    let sid = session_id.clone();
+    manager.search_fields(&session_id, &query, page, page_size, move |scanned, total| {
+        let _ = on_progress.send(SearchProgress {
+            session_id: sid.clone(),
+            scanned,
+            total,
+        });
+    })
 }
 
 pub fn run() {

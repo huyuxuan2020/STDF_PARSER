@@ -143,6 +143,12 @@ export interface ParseProgress {
   total_bytes: number;
 }
 
+export interface SearchProgress {
+  session_id: string;
+  scanned: number;
+  total: number;
+}
+
 export interface ParseErrorEvent {
   session_id: string;
   message: string;
@@ -184,7 +190,8 @@ export interface StdfApi {
     sessionId: string,
     query: string,
     page: number,
-    pageSize: number
+    pageSize: number,
+    onProgress?: (progress: SearchProgress) => void
   ): Promise<SearchResultPage>;
   onProgress(handler: (progress: ParseProgress) => void): Promise<() => void>;
   onRecordBatch(handler: (event: RecordBatchEvent) => void): Promise<() => void>;

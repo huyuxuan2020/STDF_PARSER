@@ -185,6 +185,13 @@ export default function App({ api = tauriApi }: AppProps) {
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searchTotal, setSearchTotal] = useState(0);
   const [searching, setSearching] = useState(false);
+  // { scanned, total } while a search is running so SearchView can show a
+  // determinate progress bar. Null before the first tick lands or after it
+  // completes. `session_id` on the event is validated against the active
+  // session before we accept the numbers.
+  const [searchProgress, setSearchProgress] = useState<{ scanned: number; total: number } | null>(
+    null
+  );
   const [keyFields, setKeyFields] = useState<Record<string, RecordField[]>>({});
   const [snapshot, setSnapshot] = useState<SessionSnapshot | null>(null);
   const [tiColumns, setTiColumns] = useState<TestItemColumn[]>([]);
@@ -390,6 +397,7 @@ export default function App({ api = tauriApi }: AppProps) {
       setSearchResults([]);
       setSearchTotal(0);
       setSearching(false);
+      setSearchProgress(null);
       return;
     }
     // Require >= 2 chars: a 1-char query over a huge file matches almost everything and is slow.
@@ -397,21 +405,32 @@ export default function App({ api = tauriApi }: AppProps) {
       setSearchResults([]);
       setSearchTotal(0);
       setSearching(false);
+      setSearchProgress(null);
       return;
     }
     let active = true;
     setSearching(true);
+    setSearchProgress(null);
     const timer = window.setTimeout(() => {
       api
-        .searchFields(session.session_id, trimmed, 0, PAGE_SIZE)
+        .searchFields(session.session_id, trimmed, 0, PAGE_SIZE, (p) => {
+          // Progress ticks arrive on this invoke's dedicated Channel — bail
+          // if the caller has moved on to a newer query.
+          if (!active) return;
+          setSearchProgress({ scanned: p.scanned, total: p.total });
+        })
         .then((page) => {
           if (!active) return; // ignore stale responses from older queries
           setSearchResults(page.results);
           setSearchTotal(page.total);
           setSearching(false);
+          setSearchProgress(null);
         })
         .catch(() => {
-          if (active) setSearching(false);
+          if (active) {
+            setSearching(false);
+            setSearchProgress(null);
+          }
         });
     }, 350);
     return () => {
@@ -782,6 +801,7 @@ export default function App({ api = tauriApi }: AppProps) {
                 searchResults={searchResults}
                 searchTotal={searchTotal}
                 searching={searching}
+                searchProgress={searchProgress}
                 parseComplete={session.status === "complete"}
               />
             )}
@@ -1317,6 +1337,7 @@ function SearchView({
   searchResults,
   searchTotal,
   searching,
+  searchProgress,
   parseComplete
 }: {
   query: string;
@@ -1324,16 +1345,27 @@ function SearchView({
   searchResults: SearchResult[];
   searchTotal: number;
   searching: boolean;
+  searchProgress: { scanned: number; total: number } | null;
   parseComplete: boolean;
 }) {
   const trimmed = query.trim();
+  const pct =
+    searchProgress && searchProgress.total > 0
+      ? Math.min(100, Math.round((searchProgress.scanned / searchProgress.total) * 100))
+      : null;
   return (
     <section className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-[18px]" aria-label="搜索">
       <div className="flex items-center justify-between gap-3">
         <div>
           <span className={EYEBROW}>Search</span>
           <strong className="block text-sm font-semibold text-foreground">
-            {searching ? "搜索中…" : trimmed.length >= 2 ? `${searchTotal.toLocaleString()} 个结果` : "全文搜索"}
+            {searching
+              ? pct != null
+                ? `搜索中… ${pct}%`
+                : "搜索中…"
+              : trimmed.length >= 2
+                ? `${searchTotal.toLocaleString()} 个结果`
+                : "全文搜索"}
           </strong>
         </div>
       </div>
@@ -1350,6 +1382,29 @@ function SearchView({
           placeholder="搜索 record type / 字段名 / 字段值（至少 2 个字符）"
         />
       </label>
+      {searching && (
+        <div className="flex flex-col gap-1.5">
+          <div
+            className="h-1.5 w-full overflow-hidden rounded-full bg-muted"
+            role="progressbar"
+            aria-valuenow={pct ?? undefined}
+            aria-valuemin={0}
+            aria-valuemax={100}
+          >
+            <div
+              className={`h-full bg-primary transition-[width] duration-150 ${
+                pct == null ? "w-1/3 animate-pulse" : ""
+              }`}
+              style={pct != null ? { width: `${pct}%` } : undefined}
+            />
+          </div>
+          {searchProgress && searchProgress.total > 0 && (
+            <span className="text-right text-[11px] tabular-nums text-muted-foreground">
+              {searchProgress.scanned.toLocaleString()} / {searchProgress.total.toLocaleString()} 条记录
+            </span>
+          )}
+        </div>
+      )}
       {!parseComplete ? (
         <EmptyState
           title="等待解析完成后搜索"

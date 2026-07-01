@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -10,6 +10,7 @@ import type {
   RecordField,
   RecordGroup,
   RecordSummaryPage,
+  SearchProgress,
   SearchResultPage,
   SessionSnapshot,
   TestItemViewSnapshot,
@@ -98,12 +99,23 @@ export const tauriApi: StdfApi = {
     return invoke<RecordField[]>("get_record_fields", { sessionId, recordId });
   },
 
-  searchFields(sessionId: string, query: string, page: number, pageSize: number) {
+  searchFields(
+    sessionId: string,
+    query: string,
+    page: number,
+    pageSize: number,
+    onProgress?: (progress: SearchProgress) => void
+  ) {
+    // Tauri v2 Channel: progress is delivered on THIS invoke's dedicated
+    // callback pipe, so there is no listen-side race with the invoke fire.
+    const channel = new Channel<SearchProgress>();
+    if (onProgress) channel.onmessage = onProgress;
     return invoke<SearchResultPage>("search_fields", {
       sessionId,
       query,
       page,
-      pageSize
+      pageSize,
+      onProgress: channel
     });
   },
 

@@ -251,6 +251,13 @@ pub struct SearchResultPage {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SearchProgress {
+    pub session_id: String,
+    pub scanned: usize,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RecordBatchEvent {
     pub session_id: String,
     pub records: Vec<RecordSummary>,
@@ -682,9 +689,18 @@ impl SessionManager {
         query: &str,
         page: usize,
         page_size: usize,
+        mut on_progress: impl FnMut(usize, usize),
     ) -> Result<SearchResultPage, String> {
         let conn = self.open_db(session_id)?;
         let needle = query.to_ascii_lowercase();
+        // Fetch total row count up-front so the frontend can render a
+        // determinate progress bar. COUNT(*) on rowid is cheap in SQLite.
+        let total_rows: usize = conn
+            .query_row("SELECT COUNT(*) FROM records", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|error| error.to_string())? as usize;
+        on_progress(0, total_rows);
         let mut stmt = conn
             .prepare(
                 "SELECT id, record_type, idx, rec_offset, rec_length, summary, status, fields_json \
@@ -697,6 +713,15 @@ impl SessionManager {
             })
             .map_err(|error| error.to_string())?;
         let mut results = Vec::new();
+        // Throttle progress events by wall-clock time, not by row count. On
+        // huge files a row-based cap still fires many times per second and
+        // saturates the main-thread IPC queue that WebKit needs for input.
+        // 200ms == 5 events/sec is smooth enough for a progress bar and
+        // leaves the UI thread free to keep the cursor responsive.
+        use std::time::{Duration, Instant};
+        const EMIT_INTERVAL: Duration = Duration::from_millis(200);
+        let mut scanned: usize = 0;
+        let mut last_emit = Instant::now();
         for row in rows {
             let (summary, fields_blob) = row.map_err(|error| error.to_string())?;
             let fields = decode_fields_blob(&fields_blob).unwrap_or_default();
@@ -712,7 +737,14 @@ impl SessionManager {
                     });
                 }
             }
+            scanned += 1;
+            if last_emit.elapsed() >= EMIT_INTERVAL {
+                on_progress(scanned, total_rows);
+                last_emit = Instant::now();
+            }
         }
+        // Final tick so the bar always reaches 100% before the payload lands.
+        on_progress(scanned, total_rows);
         let total = results.len();
         Ok(SearchResultPage {
             results: paginate(results, page, page_size),
@@ -2245,7 +2277,7 @@ mod tests {
             .get_record_fields(&session.session_id, &record.id)
             .expect("fields");
         let search_total = manager
-            .search_fields(&session.session_id, "VDD_STREAM", 0, 10)
+            .search_fields(&session.session_id, "VDD_STREAM", 0, 10, |_, _| {})
             .expect("search")
             .total;
 
@@ -2383,7 +2415,7 @@ mod tests {
         assert_eq!(page.records.len(), 25);
         assert_eq!(page.total, 80);
         let search = manager
-            .search_fields(&session.session_id, "STDF_VER", 0, 10)
+            .search_fields(&session.session_id, "STDF_VER", 0, 10, |_, _| {})
             .expect("search");
         assert_eq!(search.total, 80);
 
@@ -2428,7 +2460,7 @@ mod tests {
         assert!(completed, "parser should complete");
 
         let search = manager
-            .search_fields(&session.session_id, "VDD_CORE", 0, 10)
+            .search_fields(&session.session_id, "VDD_CORE", 0, 10, |_, _| {})
             .expect("search");
         assert_eq!(search.total, 1);
         assert_eq!(search.results[0].field.name, "TEST_TXT");
