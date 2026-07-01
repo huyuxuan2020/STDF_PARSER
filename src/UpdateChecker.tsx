@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { Download, Loader2, RefreshCw, X } from "lucide-react";
@@ -137,9 +137,18 @@ export function UpdateChecker() {
   // Tracks whether the user triggered the check, so the silent startup check
   // can stay quiet when already up to date but a manual click still reports it.
   const [manual, setManual] = useState(false);
+  // Once the user clicks the rail button, skip the pending silent check —
+  // otherwise it races the click and flips `manual` back to false mid-check,
+  // hiding the dialog while the button spins on the second in-flight check.
+  const manualTaken = useRef(false);
 
   async function runCheck(isManual: boolean) {
     if (!inTauri) return;
+    if (isManual) {
+      manualTaken.current = true;
+    } else if (manualTaken.current) {
+      return;
+    }
     setManual(isManual);
     setPhase({ kind: "checking" });
     try {
