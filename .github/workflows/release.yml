@@ -40,23 +40,26 @@ jobs:
     outputs:
       release_id: ${{ steps.create-release.outputs.result }}
     steps:
+      # 需要 checkout 才能读到仓库根的 RELEASE_NOTES.md。
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Create draft release
         id: create-release
         uses: actions/github-script@v7
         with:
           script: |
+            const fs = require('fs');
             const tag = process.env.TAG_NAME;
+            // 面向用户的发布说明：写在仓库根的 RELEASE_NOTES.md。
+            // 每次发版前更新这个文件即可，不用再改 workflow。
+            const body = fs.readFileSync('RELEASE_NOTES.md', 'utf8').trim();
             const { data } = await github.rest.repos.createRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
               tag_name: tag,
               name: `STDF Parser ${tag}`,
-              // 面向用户的发布说明。每次发新版前按需更新这段文字。
-              body: [
-                '### ✨ 新功能',
-                '- **自动更新**：软件现在会在启动时自动检查新版本。有更新时会弹窗提示，点一下即可下载并安装，不必再手动下载安装包。',
-                '- 左侧工具栏新增「更新」按钮，可随时手动检查更新。',
-              ].join('\n'),
+              body,
               draft: true,
               prerelease: false,
             });
