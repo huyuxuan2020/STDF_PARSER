@@ -1,5 +1,6 @@
 import {
   AlertCircle,
+  ArrowLeftRight,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
@@ -763,6 +764,11 @@ export default function App({ api = tauriApi }: AppProps) {
                 }}
                 onOpenFilter={() => setTiFilterOpen(true)}
                 onLoadMore={loadMoreTestRows}
+                onJumpToRecord={(recordType, position) => {
+                  setSelectedGroup(recordType);
+                  setCursor(position);
+                  setNav("records");
+                }}
               />
               {tiFilterOpen && (
                 <TestItemFilterDialog
@@ -1023,10 +1029,18 @@ function OverviewView({
   groups: RecordGroup[];
   onOpenRecordType(recordType: string): void;
 }) {
-  // CP files carry wafer records (WIR/WRR); otherwise treat as FT.
-  const isCp = groups.some(
+  // Auto-detect: CP files carry wafer records (WIR/WRR); otherwise FT. The
+  // heuristic sometimes gets it wrong (test flows without WIR, or FT files
+  // that inherit WIR from a preceding CP), so the user can override the
+  // badge with a click. The override resets when the file changes.
+  const autoIsCp = groups.some(
     (group) => (group.record_type === "WIR" || group.record_type === "WRR") && group.count > 0
   );
+  const [override, setOverride] = useState<"cp" | "ft" | null>(null);
+  useEffect(() => {
+    setOverride(null);
+  }, [session.session_id]);
+  const isCp = override ? override === "cp" : autoIsCp;
   const complete = session.status === "complete";
   const present = new Set(groups.filter((group) => group.count > 0).map((group) => group.record_type));
   const rows = ONEDATA_KEY_FIELDS.filter((spec) => {
@@ -1053,9 +1067,19 @@ function OverviewView({
       <section className="flex min-h-0 min-w-0 flex-1 flex-col rounded-xl border border-border bg-card p-[18px]">
         <div className="mb-3 flex min-w-0 items-center justify-between gap-4">
           <span className={EYEBROW}>关键字段</span>
-          <span className="inline-flex shrink-0 items-center rounded-full border border-primary-soft bg-primary-soft px-2.5 py-0.5 text-xs font-medium text-primary">
+          <button
+            type="button"
+            onClick={() => setOverride(isCp ? "ft" : "cp")}
+            title={
+              override
+                ? `已手动切换为 ${isCp ? "CP" : "FT"}（自动识别为 ${autoIsCp ? "CP" : "FT"}），点击切换`
+                : `自动识别为 ${isCp ? "CP" : "FT"}，点击切换`
+            }
+            className="inline-flex shrink-0 items-center gap-1 rounded-full border border-primary-soft bg-primary-soft px-2.5 py-0.5 text-xs font-medium text-primary transition hover:bg-primary hover:text-primary-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
             {isCp ? "CP" : "FT"}
-          </span>
+            <ArrowLeftRight size={11} aria-hidden="true" />
+          </button>
         </div>
         <div className={TABLE_SCROLL}>
           <table className={DATA_TABLE}>
@@ -1576,7 +1600,8 @@ function TestItemsView({
   onColPageChange,
   onColSizeChange,
   onOpenFilter,
-  onLoadMore
+  onLoadMore,
+  onJumpToRecord
 }: {
   session: ParseSession;
   loaded: boolean;
@@ -1598,7 +1623,35 @@ function TestItemsView({
   onColSizeChange: (size: number) => void;
   onOpenFilter: () => void;
   onLoadMore: () => void;
+  onJumpToRecord: (recordType: string, position: number) => void;
 }) {
+  // Custom right-click menu on test-value cells so we can offer a "跳转到源记录"
+  // action alongside "复制" (browser's default menu wouldn't have the jump).
+  // Cmd/Ctrl-C on a text selection still uses native copy, so that path is
+  // preserved for users who don't reach for the right-click menu.
+  const [cellMenu, setCellMenu] = useState<{
+    x: number;
+    y: number;
+    value: string;
+    recordType: string;
+    recordPosition: number | undefined;
+  } | null>(null);
+  useEffect(() => {
+    if (!cellMenu) return;
+    const close = () => setCellMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    // Any mousedown, scroll, or Escape dismisses the menu.
+    window.addEventListener("mousedown", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [cellMenu]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const handleScroll = () => {
     const el = scrollRef.current;
@@ -1769,6 +1822,16 @@ function TestItemsView({
                             key={`${row.part_id}:${row.site_num}:${column.record_type}:${column.test_num}`}
                             className={`${TD} align-middle text-center ${status === "F" ? "bg-danger-soft" : ""}`}
                             style={{ width: TEST_COL_WIDTH, minWidth: TEST_COL_WIDTH, maxWidth: TEST_COL_WIDTH }}
+                            onContextMenu={(e) => {
+                              e.preventDefault();
+                              setCellMenu({
+                                x: e.clientX,
+                                y: e.clientY,
+                                value: cell?.value ?? "",
+                                recordType: column.record_type,
+                                recordPosition: cell?.record_position
+                              });
+                            }}
                           >
                             <span
                               title={cell?.value || undefined}
@@ -1790,6 +1853,43 @@ function TestItemsView({
               )}
             </div>
           )}
+        </div>
+      )}
+      {cellMenu && (
+        <div
+          role="menu"
+          className="fixed z-50 min-w-[160px] rounded-md border border-border-strong bg-card py-1 text-sm shadow-lg"
+          style={{ left: cellMenu.x, top: cellMenu.y }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            disabled={cellMenu.recordPosition === undefined}
+            onClick={() => {
+              if (cellMenu.recordPosition !== undefined) {
+                onJumpToRecord(cellMenu.recordType, cellMenu.recordPosition);
+              }
+              setCellMenu(null);
+            }}
+            className="block w-full px-3 py-1.5 text-left hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            跳转到 {cellMenu.recordType} 记录
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={!cellMenu.value}
+            onClick={() => {
+              if (cellMenu.value) {
+                void navigator.clipboard.writeText(cellMenu.value);
+              }
+              setCellMenu(null);
+            }}
+            className="block w-full px-3 py-1.5 text-left hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            复制值
+          </button>
         </div>
       )}
     </section>
@@ -2011,7 +2111,21 @@ function FieldsTable({ fields }: { fields: RecordField[] }) {
           {fields.map((field) => (
             <tr key={field.name}>
               <td className={`${TD} ${MONO}`}>{field.name}</td>
-              <td className={`${TD} ${MONO}`}>{displayValue(field.name, field.value)}</td>
+              <td className={`${TD} ${MONO}`}>
+                {field.inherited_value !== undefined ? (
+                  <span
+                    className="italic text-muted-foreground"
+                    title="STDF v4 允许该字段在同一 TEST_NUM 后续 PTR/MPR 中省略，值继承自首条记录"
+                  >
+                    {displayValue(field.name, field.inherited_value)}
+                    <span className="ml-1.5 rounded-sm bg-primary-soft px-1 py-px text-[10px] font-medium not-italic text-primary">
+                      继承
+                    </span>
+                  </span>
+                ) : (
+                  displayValue(field.name, field.value)
+                )}
+              </td>
               <td className={TD}>{field.description || "未提供"}</td>
             </tr>
           ))}

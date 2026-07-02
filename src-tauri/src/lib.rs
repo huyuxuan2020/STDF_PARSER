@@ -1,7 +1,7 @@
 use stdf_core::parser::{ParseErrorEvent, ParseProgress};
 use stdf_core::sessions::{
-    RecordField, RecordGroup, RecordSummaryPage, SearchProgress, SearchResultPage, SessionManager,
-    SessionSnapshot, TestItemColumnLite, TestItemPage, TestItemViewSnapshot,
+    EnrichedField, RecordGroup, RecordSummaryPage, SearchProgress, SearchResultPage,
+    SessionManager, SessionSnapshot, TestItemColumnLite, TestItemPage, TestItemViewSnapshot,
 };
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, State};
@@ -119,7 +119,7 @@ fn get_record_fields(
     session_id: String,
     record_id: String,
     manager: State<'_, SessionManager>,
-) -> Result<Vec<RecordField>, String> {
+) -> Result<Vec<EnrichedField>, String> {
     manager.get_record_fields(&session_id, &record_id)
 }
 

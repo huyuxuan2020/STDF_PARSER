@@ -39,6 +39,11 @@ export interface RecordField {
   description: string;
   offset?: number;
   length?: number;
+  // For PTR/MPR records whose optional-tail fields (RES_SCAL, UNITS, LO_LIMIT,
+  // HI_LIMIT, ...) are omitted in this record but inherit from the first PTR/
+  // MPR of the same TEST_NUM per STDF v4 §7.1. The FieldDetailPanel surfaces
+  // it as a "继承自首条 PTR" hint next to the empty value.
+  inherited_value?: string;
 }
 
 export interface FirstRecordSnapshot {
@@ -70,6 +75,9 @@ export interface TestItemCell {
   test_num: number;
   value: string;
   status: string;
+  // 0-based position of the source PTR/MPR/FTR record within its group,
+  // used to jump straight to that record in the Records view.
+  record_position?: number;
 }
 
 export interface TestItemPartRow {

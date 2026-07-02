@@ -121,6 +121,12 @@ pub struct TestItemCell {
     pub test_num: u32,
     pub value: String,
     pub status: String,
+    /// Position of the source record within its record-type group (0-based).
+    /// Used by the frontend to jump from a test-item cell to the exact PTR/
+    /// MPR/FTR record row in the Records view. `None` when no record fed
+    /// this cell (e.g. a placeholder for a missing test on this part).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_position: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -217,6 +223,45 @@ struct TestItemAccumulator {
     open_parts: HashMap<(String, String), PendingPartContext>,
     part_rows: HashMap<(String, String), TestItemPartRow>,
     part_order: Vec<(String, String)>,
+    /// Per-record-type counter used to stamp the position each PTR/MPR/FTR
+    /// occupies within `get_records(group=...)`. Incremented in parse order,
+    /// which matches SQLite's rowid ordering the records view queries by.
+    record_type_positions: HashMap<String, usize>,
+    /// STDF v4 lets a PTR/MPR omit scale/limit/unit fields when they match
+    /// the first record for the same TEST_NUM. This map remembers the raw
+    /// values from that first record so the field-detail view can surface
+    /// them as "继承自首条 PTR" hints on subsequent records.
+    inheritable_defaults: HashMap<(String, u32), HashMap<String, String>>,
+}
+
+/// Field names PTR/MPR may omit and inherit from the first record of the
+/// same TEST_NUM. STDF v4 §7.1 and §7.2 — the "optional data" tail after
+/// TEST_TXT/ALARM_ID. C_*FMT / LO_SPEC / HI_SPEC are included because they
+/// share the same inheritance rule even though most files omit them.
+const INHERITABLE_FIELD_NAMES: &[&str] = &[
+    "OPT_FLAG",
+    "RES_SCAL",
+    "LLM_SCAL",
+    "HLM_SCAL",
+    "LO_LIMIT",
+    "HI_LIMIT",
+    "UNITS",
+    "C_RESFMT",
+    "C_LLMFMT",
+    "C_HLMFMT",
+    "LO_SPEC",
+    "HI_SPEC",
+];
+
+/// Wrapper returned by `get_record_fields`. `inherited_value` is populated
+/// only when this record omitted the field and a first-record value exists
+/// for the same TEST_NUM — see [`INHERITABLE_FIELD_NAMES`].
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EnrichedField {
+    #[serde(flatten)]
+    pub field: RecordField,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inherited_value: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -671,16 +716,53 @@ impl SessionManager {
         &self,
         session_id: &str,
         record_id: &str,
-    ) -> Result<Vec<RecordField>, String> {
+    ) -> Result<Vec<EnrichedField>, String> {
         let conn = self.open_db(session_id)?;
-        let fields_blob: Vec<u8> = conn
+        let (record_type, fields_blob): (String, Vec<u8>) = conn
             .query_row(
-                "SELECT fields_json FROM records WHERE id = ?1",
+                "SELECT record_type, fields_json FROM records WHERE id = ?1",
                 params![record_id],
-                |row| row.get(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
             )
             .map_err(|_| "record 不存在".to_string())?;
-        decode_fields_blob(&fields_blob).map_err(|error| error.to_string())
+        let fields = decode_fields_blob(&fields_blob).map_err(|error| error.to_string())?;
+        // For PTR/MPR, look up the first-record defaults keyed by TEST_NUM so
+        // omitted RES_SCAL/UNITS/LO_LIMIT/... show what they effectively are.
+        let inherited = if matches!(record_type.as_str(), "PTR" | "MPR") {
+            let test_num = field_value(&fields, "TEST_NUM")
+                .parse::<u32>()
+                .unwrap_or(0);
+            self.sessions
+                .lock()
+                .ok()
+                .and_then(|guard| {
+                    guard
+                        .get(session_id)
+                        .and_then(|s| {
+                            s.test_items
+                                .inheritable_defaults
+                                .get(&(record_type.clone(), test_num))
+                                .cloned()
+                        })
+                })
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+        Ok(fields
+            .into_iter()
+            .map(|field| {
+                let inherited_value = if field.value.trim().is_empty() {
+                    inherited.get(field.name.as_ref()).cloned()
+                } else {
+                    None
+                };
+                EnrichedField {
+                    field,
+                    inherited_value,
+                }
+            })
+            .collect())
     }
 
     pub fn search_fields(
@@ -1003,6 +1085,19 @@ fn update_test_item_accumulator(
             // scaling). Later records for the same test usually omit those, so we
             // resolve and cache them only once.
             if !acc.columns_by_key.contains_key(&key) {
+                // Snapshot the raw inheritable field values here — later records
+                // that omit these fields will surface them as "继承自首条 PTR"
+                // hints in the field-detail view.
+                let mut defaults: HashMap<String, String> = HashMap::new();
+                for name in INHERITABLE_FIELD_NAMES {
+                    let v = field_value(fields, name);
+                    if !v.is_empty() {
+                        defaults.insert((*name).to_string(), v);
+                    }
+                }
+                if !defaults.is_empty() {
+                    acc.inheritable_defaults.insert(key.clone(), defaults);
+                }
                 let test_name =
                     first_non_empty(fields, &["TEST_TXT", "TEST_NAM", "SEQ_NAME", "VECT_NAM"]);
                 let pmr_indices = first_non_empty_array(fields, &["RTN_INDX", "PGM_INDX"]);
@@ -1013,11 +1108,24 @@ fn update_test_item_accumulator(
                 acc.column_meta.insert(key.clone(), meta);
             }
             let meta = acc.column_meta.get(&key).copied().unwrap_or_default();
-            let cell = match record_type {
+            // Stamp the cell with its 0-based position within `record_type`'s
+            // group so the frontend can jump straight to this record in the
+            // Records view. Counter increments in parse order (== rowid order).
+            let position = {
+                let counter = acc
+                    .record_type_positions
+                    .entry(record_type.to_string())
+                    .or_insert(0);
+                let p = *counter;
+                *counter += 1;
+                p
+            };
+            let mut cell = match record_type {
                 "PTR" => build_ptr_cell(fields, &meta),
                 "MPR" => build_mpr_cell(fields, &meta),
                 _ => build_ftr_cell(fields),
             };
+            cell.record_position = Some(position);
 
             let site_key = site_key(fields);
             let entry = acc.open_parts.entry(site_key).or_default();
@@ -1544,6 +1652,7 @@ fn build_test_item_page(
                         test_num: col.test_num,
                         value: String::new(),
                         status: String::new(),
+                        record_position: None,
                     })
                 })
                 .collect(),
@@ -1820,6 +1929,7 @@ fn build_ptr_cell(fields: &[RecordField], meta: &ColumnMeta) -> TestItemCell {
         test_num: field_value(fields, "TEST_NUM").parse::<u32>().unwrap_or(0),
         value,
         status,
+        record_position: None,
     }
 }
 
@@ -1834,6 +1944,7 @@ fn build_mpr_cell(fields: &[RecordField], meta: &ColumnMeta) -> TestItemCell {
             test_num,
             value: field_value(fields, "TEST_FLG"),
             status: String::new(),
+            record_position: None,
         };
     }
     let mut judged = false;
@@ -1873,6 +1984,7 @@ fn build_mpr_cell(fields: &[RecordField], meta: &ColumnMeta) -> TestItemCell {
         test_num,
         value,
         status,
+        record_position: None,
     }
 }
 
@@ -1883,6 +1995,7 @@ fn build_ftr_cell(fields: &[RecordField]) -> TestItemCell {
         test_num: field_value(fields, "TEST_NUM").parse::<u32>().unwrap_or(0),
         value: flag,
         status: status.to_string(),
+        record_position: None,
     }
 }
 
@@ -1901,6 +2014,7 @@ fn materialize_results(
                     test_num: column.test_num,
                     value: String::new(),
                     status: String::new(),
+                    record_position: None,
                 })
             })
         })
@@ -2239,7 +2353,7 @@ mod tests {
 
     struct FixtureSessionResult {
         groups: Vec<RecordGroup>,
-        fields: Vec<RecordField>,
+        fields: Vec<EnrichedField>,
         search_total: usize,
     }
 
@@ -2888,6 +3002,7 @@ mod tests {
                     test_num: 100,
                     value: "1.5".to_string(),
                     status: "P".to_string(),
+                    record_position: None,
                 }],
             },
         );
