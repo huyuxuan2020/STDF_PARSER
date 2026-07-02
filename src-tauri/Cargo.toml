@@ -1,6 +1,6 @@
 [package]
 name = "stdf-viewer-mac"
-version = "0.1.2"
+version = "0.1.3"
 description = "Mac STDF field browser"
 authors = []
 edition = "2021"
