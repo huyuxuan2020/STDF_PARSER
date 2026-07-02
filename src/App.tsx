@@ -1670,16 +1670,23 @@ function TestItemsView({
             {loaded
               ? `共 ${colTotal.toLocaleString()} 个测试项 · ${rowTotal.toLocaleString()} 个 Part/Site 行`
               : session.status === "complete"
-                ? "加载测试项…"
+                ? "正在汇总测试项…"
                 : "等待解析完成"}
           </strong>
         </div>
       </div>
       {!loaded ? (
-        <EmptyState
-          title={session.status === "complete" ? "加载测试项视图…" : "等待解析完成"}
-          body="测试项页只在解析完成后开放，用于汇总 PART_ID、SITE、bin 名称/PF 以及换算后的 PTR / FTR / MPR 测试列。"
-        />
+        session.status === "complete" ? (
+          <EmptyState
+            title="正在汇总测试项…"
+            body="按 Part × 测试列展开整份文件，大文件首次打开需要几秒；期间其他页面可以正常使用。"
+          />
+        ) : (
+          <EmptyState
+            title="等待解析完成"
+            body="测试项页在解析完成后开放，用于按 Part × 测试列查看 PTR / MPR / FTR 值。"
+          />
+        )
       ) : (
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-border bg-card">
           {/* Filters */}

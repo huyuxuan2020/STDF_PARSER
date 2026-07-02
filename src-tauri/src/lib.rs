@@ -47,7 +47,11 @@ fn get_session_snapshot(
     manager.get_session_snapshot(&session_id)
 }
 
-#[tauri::command]
+// `(async)` on the test-item commands: they materialize the whole part matrix
+// (up to 500 rows × 200 cols per page, plus a pmr_lookup clone) which can hold
+// the WebKit main thread for a few seconds on big files. Dispatch on a tokio
+// task instead so the mouse stays responsive during the wait.
+#[tauri::command(async)]
 fn get_test_item_view(
     session_id: String,
     manager: State<'_, SessionManager>,
@@ -55,7 +59,7 @@ fn get_test_item_view(
     manager.get_test_item_view(&session_id)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 fn get_test_item_page(
     session_id: String,
@@ -78,7 +82,7 @@ fn get_test_item_page(
     )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_test_item_columns(
     session_id: String,
     manager: State<'_, SessionManager>,
@@ -86,7 +90,7 @@ fn get_test_item_columns(
     manager.get_test_item_columns(&session_id)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn export_test_item_csv(
     session_id: String,
     path: String,
@@ -95,7 +99,7 @@ fn export_test_item_csv(
     manager.export_test_item_csv(&session_id, &path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_record_groups(
     session_id: String,
     manager: State<'_, SessionManager>,
@@ -103,7 +107,7 @@ fn get_record_groups(
     manager.get_record_groups(&session_id)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_records(
     session_id: String,
     group: String,
@@ -114,7 +118,7 @@ fn get_records(
     manager.get_records(&session_id, &group, page, page_size)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_record_fields(
     session_id: String,
     record_id: String,
