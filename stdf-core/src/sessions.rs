@@ -19,6 +19,10 @@ use std::{
 use uuid::Uuid;
 
 use flate2::read::ZlibDecoder;
+// FxHashMap on the per-record maps: SipHash showed up in parse profiles at
+// 26M records × several map touches each; Fx is a keyed-DoS-free context
+// (local temp index), so the cheaper hash is a straight win.
+use rustc_hash::FxHashMap;
 use rusqlite::{params, Connection, OptionalExtension};
 
 const SQLITE_COMMIT_BATCH_SIZE: usize = 50_000;
@@ -35,7 +39,7 @@ const RECORD_INSERT_SQL: &str = "INSERT INTO records \
 
 /// One parsed record on its way to the SQLite writer thread.
 struct RecordRow {
-    record_type: String,
+    record_type: &'static str,
     idx: i64,
     group_idx: i64,
     offset: i64,
@@ -240,7 +244,7 @@ struct PendingPartContext {
     hbin_num: String,
     hbin_name: String,
     hbin_pf: String,
-    results: HashMap<(String, u32), TestItemCell>,
+    results: FxHashMap<(String, u32), TestItemCell>,
 }
 
 /// Official bin counts from HBR/SBR records. HEAD_NUM=255 marks the tester's
@@ -264,32 +268,32 @@ impl DeclaredBinCounts {
 
 #[derive(Clone, Default)]
 struct TestItemAccumulator {
-    columns_by_key: HashMap<(String, u32), TestItemColumn>,
-    column_meta: HashMap<(String, u32), ColumnMeta>,
+    columns_by_key: FxHashMap<(String, u32), TestItemColumn>,
+    column_meta: FxHashMap<(String, u32), ColumnMeta>,
     column_order: Vec<(String, u32)>,
-    pmr_lookup: HashMap<String, TestItemPmrEntry>,
-    hbin_names: HashMap<String, String>,
-    hbin_pf: HashMap<String, String>,
-    sbin_names: HashMap<String, String>,
-    sbin_pf: HashMap<String, String>,
-    hbin_declared: HashMap<String, DeclaredBinCounts>,
-    sbin_declared: HashMap<String, DeclaredBinCounts>,
+    pmr_lookup: FxHashMap<String, TestItemPmrEntry>,
+    hbin_names: FxHashMap<String, String>,
+    hbin_pf: FxHashMap<String, String>,
+    sbin_names: FxHashMap<String, String>,
+    sbin_pf: FxHashMap<String, String>,
+    hbin_declared: FxHashMap<String, DeclaredBinCounts>,
+    sbin_declared: FxHashMap<String, DeclaredBinCounts>,
     /// Last-touchdown (sbin, hbin) per die identity — X/Y coordinates when the
     /// file carries them (CP), else PART_ID:site. Retested dies overwrite their
     /// earlier touchdown, so counting this map yields per-die final results.
-    die_bins: HashMap<String, (String, String)>,
-    open_parts: HashMap<(String, String), PendingPartContext>,
-    part_rows: HashMap<(String, String), TestItemPartRow>,
+    die_bins: FxHashMap<String, (String, String)>,
+    open_parts: FxHashMap<(String, String), PendingPartContext>,
+    part_rows: FxHashMap<(String, String), TestItemPartRow>,
     part_order: Vec<(String, String)>,
     /// Per-record-type counter used to stamp the position each PTR/MPR/FTR
     /// occupies within `get_records(group=...)`. Incremented in parse order,
     /// which matches SQLite's rowid ordering the records view queries by.
-    record_type_positions: HashMap<String, usize>,
+    record_type_positions: FxHashMap<&'static str, usize>,
     /// STDF v4 lets a PTR/MPR omit scale/limit/unit fields when they match
     /// the first record for the same TEST_NUM. This map remembers the raw
     /// values from that first record so the field-detail view can surface
     /// them as "继承自首条 PTR" hints on subsequent records.
-    inheritable_defaults: HashMap<(String, u32), HashMap<String, String>>,
+    inheritable_defaults: FxHashMap<(String, u32), HashMap<String, String>>,
 }
 
 /// Field names PTR/MPR may omit and inherit from the first record of the
@@ -504,11 +508,11 @@ impl SessionManager {
             };
 
             let mut index = 0_usize;
-            let mut first_record_type: Option<String> = None;
+            let mut first_record_type: Option<&'static str> = None;
             // Per-record-type position counters (parse order). Stored as
             // `group_idx` so record pages seek by (record_type, group_idx)
             // instead of walking an OFFSET.
-            let mut group_counters: HashMap<String, usize> = HashMap::new();
+            let mut group_counters: FxHashMap<&'static str, usize> = FxHashMap::default();
             let mut last_progress_bytes = 0_u64;
             let mut last_snapshot_bytes = 0_u64;
 
@@ -572,7 +576,7 @@ impl SessionManager {
                             return false;
                         }
                         if first_record_type.is_none() {
-                            first_record_type = Some(record.record_type.clone());
+                            first_record_type = Some(record.record_type);
                         }
                         // Snapshot bookkeeping and the test-item accumulator share
                         // one lock acquisition — this runs once per record.
@@ -592,7 +596,7 @@ impl SessionManager {
                         let fields_blob = encode_fields_blob(&record);
                         let group_idx = {
                             let counter = group_counters
-                                .entry(record.record_type.clone())
+                                .entry(record.record_type)
                                 .or_insert(0);
                             let position = *counter;
                             *counter += 1;
@@ -601,7 +605,7 @@ impl SessionManager {
                         // Blocks only when the writer falls a full queue behind
                         // (backpressure), which keeps peak memory bounded.
                         let _ = row_tx.send(RecordRow {
-                            record_type: record.record_type.clone(),
+                            record_type: record.record_type,
                             idx: index as i64,
                             group_idx: group_idx as i64,
                             offset: record.offset as i64,
@@ -668,10 +672,10 @@ impl SessionManager {
             if !cancelled {
                 if index == 0 {
                     warnings.push("文件为空或未解析到任何标准 record。".to_string());
-                } else if first_record_type.as_deref() != Some("FAR") {
+                } else if first_record_type != Some("FAR") {
                     warnings.push(format!(
                         "文件未以 FAR 记录开头（首条为 {}），非标准 STDF；已按现有内容解析。",
-                        first_record_type.clone().unwrap_or_else(|| "未知".to_string())
+                        first_record_type.unwrap_or("未知")
                     ));
                 }
                 if let Err(ParserError::TruncatedPayload { offset, expected }) = &result {
@@ -1287,7 +1291,7 @@ fn apply_record_to_session(
     };
     let changed =
         update_session_snapshot(&mut state.snapshot, session_id, record, idx, bytes_read, total_bytes);
-    update_test_item_accumulator(&mut state.test_items, &record.record_type, idx, &record.fields);
+    update_test_item_accumulator(&mut state.test_items, record.record_type, idx, &record.fields);
     changed
 }
 
@@ -1310,17 +1314,17 @@ fn update_session_snapshot(
         group.count += 1;
     } else {
         snapshot.groups.push(RecordGroup {
-            record_type: record.record_type.clone(),
+            record_type: record.record_type.to_string(),
             count: 1,
         });
         changed = true;
     }
 
-    if !snapshot.first_records.contains_key(&record.record_type) {
+    if !snapshot.first_records.contains_key(record.record_type) {
         // Full summaries (with their formatted id) are built only for the
         // handful of first-of-type records, never in the per-record hot path.
         snapshot.first_records.insert(
-            record.record_type.clone(),
+            record.record_type.to_string(),
             FirstRecordSnapshot {
                 record: record_summary(session_id, idx, record),
                 fields: record.fields.to_vec(),
@@ -1329,12 +1333,12 @@ fn update_session_snapshot(
         changed = true;
     }
 
-    if is_key_record(&record.record_type)
-        && !snapshot.key_fields.contains_key(&record.record_type)
+    if is_key_record(record.record_type)
+        && !snapshot.key_fields.contains_key(record.record_type)
     {
         snapshot
             .key_fields
-            .insert(record.record_type.clone(), record.fields.to_vec());
+            .insert(record.record_type.to_string(), record.fields.to_vec());
         changed = true;
     }
     changed
@@ -1342,7 +1346,7 @@ fn update_session_snapshot(
 
 fn update_test_item_accumulator(
     acc: &mut TestItemAccumulator,
-    record_type: &str,
+    record_type: &'static str,
     idx: usize,
     fields: &[RecordField],
 ) {
@@ -1351,12 +1355,12 @@ fn update_test_item_accumulator(
             let pmr_indx = field_value(fields, "PMR_INDX");
             if !pmr_indx.is_empty() {
                 acc.pmr_lookup.insert(
-                    pmr_indx,
+                    pmr_indx.to_string(),
                     TestItemPmrEntry {
-                        phy_nam: field_value(fields, "PHY_NAM"),
-                        log_nam: field_value(fields, "LOG_NAM"),
-                        head_num: field_value(fields, "HEAD_NUM"),
-                        site_num: field_value(fields, "SITE_NUM"),
+                        phy_nam: field_value(fields, "PHY_NAM").to_string(),
+                        log_nam: field_value(fields, "LOG_NAM").to_string(),
+                        head_num: field_value(fields, "HEAD_NUM").to_string(),
+                        site_num: field_value(fields, "SITE_NUM").to_string(),
                     },
                 );
             }
@@ -1364,8 +1368,8 @@ fn update_test_item_accumulator(
         "PIR" => {
             let site_key = site_key(fields);
             let entry = acc.open_parts.entry(site_key).or_default();
-            entry.head_num = field_value(fields, "HEAD_NUM");
-            entry.site_num = field_value(fields, "SITE_NUM");
+            entry.head_num = field_value(fields, "HEAD_NUM").to_string();
+            entry.site_num = field_value(fields, "SITE_NUM").to_string();
             if entry.site_nums.is_empty() && !entry.site_num.is_empty() {
                 entry.site_nums.push(entry.site_num.clone());
             }
@@ -1374,11 +1378,11 @@ fn update_test_item_accumulator(
             let key = field_value(fields, "HBIN_NUM");
             if !key.is_empty() {
                 acc.hbin_names
-                    .insert(key.clone(), field_value(fields, "HBIN_NAM"));
+                    .insert(key.to_string(), field_value(fields, "HBIN_NAM").to_string());
                 acc.hbin_pf
-                    .insert(key.clone(), field_value(fields, "HBIN_PF"));
+                    .insert(key.to_string(), field_value(fields, "HBIN_PF").to_string());
                 let count = field_value(fields, "HBIN_CNT").parse::<u64>().unwrap_or(0);
-                let declared = acc.hbin_declared.entry(key).or_default();
+                let declared = acc.hbin_declared.entry(key.to_string()).or_default();
                 if field_value(fields, "HEAD_NUM") == "255" {
                     declared.summary = Some(count);
                 } else {
@@ -1390,11 +1394,11 @@ fn update_test_item_accumulator(
             let key = field_value(fields, "SBIN_NUM");
             if !key.is_empty() {
                 acc.sbin_names
-                    .insert(key.clone(), field_value(fields, "SBIN_NAM"));
+                    .insert(key.to_string(), field_value(fields, "SBIN_NAM").to_string());
                 acc.sbin_pf
-                    .insert(key.clone(), field_value(fields, "SBIN_PF"));
+                    .insert(key.to_string(), field_value(fields, "SBIN_PF").to_string());
                 let count = field_value(fields, "SBIN_CNT").parse::<u64>().unwrap_or(0);
-                let declared = acc.sbin_declared.entry(key).or_default();
+                let declared = acc.sbin_declared.entry(key.to_string()).or_default();
                 if field_value(fields, "HEAD_NUM") == "255" {
                     declared.summary = Some(count);
                 } else {
@@ -1418,7 +1422,7 @@ fn update_test_item_accumulator(
                 for name in INHERITABLE_FIELD_NAMES {
                     let v = field_value(fields, name);
                     if !v.is_empty() {
-                        defaults.insert((*name).to_string(), v);
+                        defaults.insert((*name).to_string(), v.to_string());
                     }
                 }
                 if !defaults.is_empty() {
@@ -1428,7 +1432,7 @@ fn update_test_item_accumulator(
                     first_non_empty(fields, &["TEST_TXT", "TEST_NAM", "SEQ_NAME", "VECT_NAM"]);
                 let pmr_indices = first_non_empty_array(fields, &["RTN_INDX", "PGM_INDX"]);
                 let (column, meta) =
-                    resolve_column(record_type, test_num, test_name, pmr_indices, fields);
+                    resolve_column(record_type, test_num, test_name.to_string(), pmr_indices, fields);
                 acc.column_order.push(key.clone());
                 acc.columns_by_key.insert(key.clone(), column);
                 acc.column_meta.insert(key.clone(), meta);
@@ -1440,7 +1444,7 @@ fn update_test_item_accumulator(
             let position = {
                 let counter = acc
                     .record_type_positions
-                    .entry(record_type.to_string())
+                    .entry(record_type)
                     .or_insert(0);
                 let p = *counter;
                 *counter += 1;
@@ -1456,10 +1460,10 @@ fn update_test_item_accumulator(
             let site_key = site_key(fields);
             let entry = acc.open_parts.entry(site_key).or_default();
             if entry.head_num.is_empty() {
-                entry.head_num = field_value(fields, "HEAD_NUM");
+                entry.head_num = field_value(fields, "HEAD_NUM").to_string();
             }
             if entry.site_num.is_empty() {
-                entry.site_num = field_value(fields, "SITE_NUM");
+                entry.site_num = field_value(fields, "SITE_NUM").to_string();
             }
             if entry.site_nums.is_empty() && !entry.site_num.is_empty() {
                 entry.site_nums.push(entry.site_num.clone());
@@ -1469,8 +1473,8 @@ fn update_test_item_accumulator(
         "PRR" => {
             let site_key = site_key(fields);
             let mut pending = acc.open_parts.remove(&site_key).unwrap_or_default();
-            let site_num = field_value(fields, "SITE_NUM");
-            let head_num = field_value(fields, "HEAD_NUM");
+            let site_num = field_value(fields, "SITE_NUM").to_string();
+            let head_num = field_value(fields, "HEAD_NUM").to_string();
             if pending.head_num.is_empty() {
                 pending.head_num = head_num.clone();
             }
@@ -1480,8 +1484,8 @@ fn update_test_item_accumulator(
             if pending.site_nums.is_empty() && !pending.site_num.is_empty() {
                 pending.site_nums.push(pending.site_num.clone());
             }
-            let sbin_num = field_value(fields, "SOFT_BIN");
-            let hbin_num = field_value(fields, "HARD_BIN");
+            let sbin_num = field_value(fields, "SOFT_BIN").to_string();
+            let hbin_num = field_value(fields, "HARD_BIN").to_string();
             // Track final bins per die: X/Y is the die identity on wafer files
             // (retests reappear at the same coordinates under a fresh PART_ID);
             // -32768 is the STDF "no coordinate" sentinel.
@@ -1507,13 +1511,13 @@ fn update_test_item_accumulator(
             pending.hbin_num = hbin_num.clone();
             pending.hbin_name = acc.hbin_names.get(&hbin_num).cloned().unwrap_or_default();
             pending.hbin_pf = acc.hbin_pf.get(&hbin_num).cloned().unwrap_or_default();
-            pending.test_t = field_value(fields, "TEST_T");
-            pending.part_txt = field_value(fields, "PART_TXT");
+            pending.test_t = field_value(fields, "TEST_T").to_string();
+            pending.part_txt = field_value(fields, "PART_TXT").to_string();
             let part_id = first_non_empty(fields, &["PART_ID"]);
             let part_id = if part_id.is_empty() {
                 format!("{}:{}:{}", head_num, site_num, idx)
             } else {
-                part_id
+                part_id.to_string()
             };
             let key = (part_id.clone(), site_num.clone());
             let mut row_entry = acc.part_rows.remove(&key).unwrap_or_else(|| {
@@ -1579,7 +1583,7 @@ fn site_matches(row: &TestItemPartRow, site: &str) -> bool {
 
 /// Look up a bin name/PF by number, preferring the (now-complete) HBR/SBR map and
 /// falling back to whatever was captured on the row at parse time.
-fn bin_lookup(map: &HashMap<String, String>, key: &str, fallback: &str) -> String {
+fn bin_lookup(map: &FxHashMap<String, String>, key: &str, fallback: &str) -> String {
     map.get(key)
         .filter(|value| !value.is_empty())
         .cloned()
@@ -1592,7 +1596,7 @@ fn key_field(snapshot: &SessionSnapshot, record: &str, field: &str) -> String {
         .key_fields
         .get(record)
         .and_then(|fields| fields.iter().find(|item| item.name == field))
-        .map(|item| item.value.clone())
+        .map(|item| item.value.to_string())
         .unwrap_or_default()
 }
 
@@ -1636,7 +1640,7 @@ fn bin_num_order(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// Whether a bin is a "pass" bin: the bin pass/fail flag (case-insensitive) when
 /// present, else the convention that bin number 1 is the pass bin.
-fn bin_passed(pf_map: &HashMap<String, String>, num: &str, stored_pf: &str) -> bool {
+fn bin_passed(pf_map: &FxHashMap<String, String>, num: &str, stored_pf: &str) -> bool {
     let pf = bin_lookup(pf_map, num, stored_pf);
     let pf = pf.trim();
     if pf.eq_ignore_ascii_case("P") {
@@ -1687,8 +1691,8 @@ fn format_duration(secs: i64) -> String {
 /// them (they already account for retests), else computed from the final
 /// result of each die (see `TestItemAccumulator::die_bins`).
 fn resolve_bin_counts(
-    declared: &HashMap<String, DeclaredBinCounts>,
-    die_bins: &HashMap<String, (String, String)>,
+    declared: &FxHashMap<String, DeclaredBinCounts>,
+    die_bins: &FxHashMap<String, (String, String)>,
     pick: impl Fn(&(String, String)) -> &String,
 ) -> HashMap<String, usize> {
     if !declared.is_empty() {
@@ -1717,8 +1721,8 @@ fn build_bin_summary(
     let hbin_counts = resolve_bin_counts(&acc.hbin_declared, &acc.die_bins, |(_, hbin)| hbin);
 
     let to_stats = |counts: &HashMap<String, usize>,
-                    names: &HashMap<String, String>,
-                    pf: &HashMap<String, String>| {
+                    names: &FxHashMap<String, String>,
+                    pf: &FxHashMap<String, String>| {
         let mut order: Vec<&String> = counts.keys().collect();
         order.sort_by(|a, b| bin_num_order(a, b));
         order
@@ -1734,7 +1738,7 @@ fn build_bin_summary(
     let sbins = to_stats(&sbin_counts, &acc.sbin_names, &acc.sbin_pf);
     let hbins = to_stats(&hbin_counts, &acc.hbin_names, &acc.hbin_pf);
 
-    let passed = |counts: &HashMap<String, usize>, pf: &HashMap<String, String>| {
+    let passed = |counts: &HashMap<String, usize>, pf: &FxHashMap<String, String>| {
         counts
             .iter()
             .filter(|(num, _)| bin_passed(pf, num, ""))
@@ -2072,22 +2076,25 @@ fn is_key_record(record_type: &str) -> bool {
     )
 }
 
-fn field_value(fields: &[RecordField], name: &str) -> String {
+// Borrowed lookups on purpose: these run several times per record on the
+// parse hot path, and the previous clone-per-call showed up as allocator time
+// on million-record files. Callers own only what they actually store.
+fn field_value<'a>(fields: &'a [RecordField], name: &str) -> &'a str {
     fields
         .iter()
         .find(|field| field.name == name)
-        .map(|field| field.value.clone())
-        .unwrap_or_default()
+        .map(|field| field.value.as_str())
+        .unwrap_or("")
 }
 
-fn first_non_empty(fields: &[RecordField], names: &[&str]) -> String {
+fn first_non_empty<'a>(fields: &'a [RecordField], names: &[&str]) -> &'a str {
     for name in names {
         let value = field_value(fields, name);
         if !value.is_empty() {
             return value;
         }
     }
-    String::new()
+    ""
 }
 
 fn first_non_empty_array(fields: &[RecordField], names: &[&str]) -> Vec<String> {
@@ -2119,8 +2126,8 @@ fn field_values_from_array(fields: &[RecordField], name: &str) -> Vec<String> {
 
 fn site_key(fields: &[RecordField]) -> (String, String) {
     (
-        field_value(fields, "HEAD_NUM"),
-        field_value(fields, "SITE_NUM"),
+        field_value(fields, "HEAD_NUM").to_string(),
+        field_value(fields, "SITE_NUM").to_string(),
     )
 }
 
@@ -2277,17 +2284,17 @@ fn resolve_column(
 
 fn build_ptr_cell(fields: &[RecordField], meta: &ColumnMeta) -> TestItemCell {
     let result = field_value(fields, "RESULT");
-    let parsed = parse_float(&result);
+    let parsed = parse_float(result);
     let status = match parsed {
         Some(value) => judge(to_base(value, meta.res_scal), meta.low_base, meta.high_base),
         None => String::new(),
     };
     let value = if result.is_empty() {
-        field_value(fields, "TEST_FLG")
+        field_value(fields, "TEST_FLG").to_string()
     } else {
         match parsed {
             Some(v) if meta.res_scal != 0 => format_num(to_display(v, meta.res_scal)),
-            _ => result,
+            _ => result.to_string(),
         }
     };
     TestItemCell {
@@ -2304,7 +2311,7 @@ fn build_mpr_cell(fields: &[RecordField], meta: &ColumnMeta) -> TestItemCell {
     let results = field_values_from_array(fields, "RTN_RSLT");
     if results.is_empty() {
         return TestItemCell {
-            value: field_value(fields, "TEST_FLG"),
+            value: field_value(fields, "TEST_FLG").to_string(),
             status: String::new(),
             record_position: None,
         };
@@ -2353,17 +2360,17 @@ fn build_ftr_cell(fields: &[RecordField]) -> TestItemCell {
     let flag = field_value(fields, "TEST_FLG");
     let status = if flag.contains("0b00000000") { "P" } else { "F" };
     TestItemCell {
-        value: flag,
+        value: flag.to_string(),
         status: status.to_string(),
         record_position: None,
     }
 }
 
 fn materialize_results(
-    columns_by_key: &HashMap<(String, u32), TestItemColumn>,
+    columns_by_key: &FxHashMap<(String, u32), TestItemColumn>,
     column_order: &[(String, u32)],
     column_limit: usize,
-    results: &HashMap<(String, u32), TestItemCell>,
+    results: &FxHashMap<(String, u32), TestItemCell>,
 ) -> Vec<TestItemCell> {
     column_order
         .iter()
@@ -2434,7 +2441,7 @@ fn decode_gbf2_fields(fields_blob: &[u8]) -> Result<Vec<RecordField>, String> {
         fields.push(RecordField {
             name: Cow::Borrowed(spec.name),
             field_type: Cow::Borrowed(spec.field_type),
-            value,
+            value: value.into(),
             description: Cow::Borrowed(spec.description),
             offset: None,
             length: None,
@@ -2489,7 +2496,7 @@ fn decode_fields_blob(fields_blob: &[u8]) -> Result<Vec<RecordField>, String> {
                     )) => RecordField {
                         name: Cow::Owned(name),
                         field_type: Cow::Owned(field_type),
-                        value,
+                        value: value.into(),
                         description: Cow::Owned(description),
                         offset,
                         length,
@@ -2521,7 +2528,7 @@ fn decode_gbf1_fields(fields_blob: &[u8]) -> Result<Vec<RecordField>, String> {
         fields.push(RecordField {
             name: Cow::Owned(name),
             field_type: Cow::Owned(field_type),
-            value,
+            value: value.into(),
             description: Cow::Owned(description),
             offset: (raw_offset != u64::MAX).then_some(raw_offset),
             length: (raw_length != u16::MAX).then_some(raw_length),
@@ -2690,7 +2697,7 @@ fn incomplete_zip_message(path: &Path) -> Option<String> {
 fn record_summary(session_id: &str, index: usize, record: &ParsedRecord) -> RecordSummary {
     RecordSummary {
         id: format!("{session_id}:{index}"),
-        record_type: record.record_type.clone(),
+        record_type: record.record_type.to_string(),
         index,
         offset: record.offset,
         length: record.length,
@@ -2884,7 +2891,7 @@ mod tests {
         assert_eq!(
             parsed
                 .iter()
-                .map(|item| item.record_type.as_str())
+                .map(|item| item.record_type)
                 .collect::<Vec<_>>(),
             vec!["FAR", "PIR", "PTR", "PRR"]
         );

@@ -1,3 +1,4 @@
+use compact_str::{format_compact, CompactString};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::borrow::Cow;
 use std::io::{self, Read};
@@ -19,7 +20,9 @@ pub struct ParseErrorEvent {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ParsedRecord {
-    pub record_type: String,
+    /// Static name from the REC_TYP/REC_SUB table — `&'static str` on purpose:
+    /// a per-record `String` was one of the top allocations on 26M-record files.
+    pub record_type: &'static str,
     /// Raw STDF REC_TYP/REC_SUB pair — identifies the static field spec this
     /// record was parsed with (used by the values-only field storage).
     pub rec_typ: u8,
@@ -34,7 +37,10 @@ pub struct ParsedRecord {
 pub struct ParsedField {
     pub name: Cow<'static, str>,
     pub field_type: Cow<'static, str>,
-    pub value: String,
+    /// CompactString: values ≤24 bytes live inline. Most STDF field values are
+    /// short numbers/flags, and a String each made the allocator the top parse
+    /// cost (~20 fields per PTR × 26M records). Serializes exactly like String.
+    pub value: CompactString,
     pub description: Cow<'static, str>,
     pub offset: Option<u64>,
     pub length: Option<u16>,
@@ -59,7 +65,7 @@ impl<'de> Deserialize<'de> for ParsedField {
         Ok(Self {
             name: Cow::Owned(field.name),
             field_type: Cow::Owned(field.field_type),
-            value: field.value,
+            value: field.value.into(),
             description: Cow::Owned(field.description),
             offset: field.offset,
             length: field.length,
@@ -90,6 +96,10 @@ pub fn parse_reader<R: Read>(
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<(), ParserError> {
     let mut offset = 0_u64;
+    // One payload buffer reused across records — a fresh Vec per record made
+    // the allocator a top cost on million-record files. Fields copy what they
+    // keep into owned values, so nothing borrows past the iteration.
+    let mut payload = Vec::<u8>::new();
     loop {
         let mut header = [0_u8; 4];
         match reader.read_exact(&mut header) {
@@ -101,19 +111,22 @@ pub fn parse_reader<R: Read>(
         let length = u16::from_le_bytes([header[0], header[1]]);
         let rec_typ = header[2];
         let rec_sub = header[3];
-        let mut payload = vec![0_u8; length as usize];
+        let len = length as usize;
+        if payload.len() < len {
+            payload.resize(len, 0);
+        }
         let payload_start = offset + 4;
-        if let Err(error) = reader.read_exact(&mut payload) {
+        if let Err(error) = reader.read_exact(&mut payload[..len]) {
             if error.kind() == io::ErrorKind::UnexpectedEof {
                 return Err(ParserError::TruncatedPayload {
                     offset,
-                    expected: length as usize,
+                    expected: len,
                 });
             }
             return Err(ParserError::Io(error));
         }
 
-        let record = parse_record(rec_typ, rec_sub, offset, length, payload_start, &payload);
+        let record = parse_record(rec_typ, rec_sub, offset, length, payload_start, &payload[..len]);
         offset += 4 + u64::from(length);
         if !on_record(record) {
             break;
@@ -131,7 +144,7 @@ fn parse_record(
     payload_start: u64,
     payload: &[u8],
 ) -> ParsedRecord {
-    let record_type = record_name(rec_typ, rec_sub).to_string();
+    let record_type = record_name(rec_typ, rec_sub);
     let mut cursor = FieldCursor::new(payload_start, payload);
     let (fields, has_required_error) = if matches!((rec_typ, rec_sub), (50, 10) | (50, 30)) {
         (Vec::new(), false)
@@ -162,7 +175,7 @@ fn raw_preview_field(payload_start: u64, length: u16, payload: &[u8]) -> Vec<Par
     vec![ParsedField {
         name: Cow::Borrowed("RAW_BYTES"),
         field_type: Cow::Borrowed("BLOB"),
-        value: hex_preview(payload),
+        value: hex_preview(payload).into(),
         description: Cow::Borrowed("默认不展开的 record 原始 payload 预览"),
         offset: Some(payload_start),
         length: Some(length),
@@ -603,6 +616,21 @@ pub fn decode_dtr_text(payload: &[u8]) -> String {
     String::from_utf8_lossy(&rest[..end]).to_string()
 }
 
+/// Integer Display via itoa: byte-identical output to `to_string()` without
+/// the fmt machinery, landing in an inline CompactString — zero heap traffic.
+fn itoa_string(value: impl itoa::Integer) -> CompactString {
+    CompactString::from(itoa::Buffer::new().format(value))
+}
+
+/// Lossy UTF-8 into a CompactString: the borrowed (valid-UTF-8) fast path
+/// inlines short values without touching the heap.
+fn lossy_compact(bytes: &[u8]) -> CompactString {
+    match String::from_utf8_lossy(bytes) {
+        Cow::Borrowed(text) => CompactString::from(text),
+        Cow::Owned(text) => CompactString::from(text),
+    }
+}
+
 fn hex_preview(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -705,55 +733,55 @@ impl<'a> FieldCursor<'a> {
 
     fn u1(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
         self.fixed(name, field_type, description, 1, |bytes| {
-            bytes[0].to_string()
+            itoa_string(bytes[0])
         })
     }
 
     fn u2(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
         self.fixed(name, field_type, description, 2, |bytes| {
-            u16::from_le_bytes([bytes[0], bytes[1]]).to_string()
+            itoa_string(u16::from_le_bytes([bytes[0], bytes[1]]))
         })
     }
 
     fn u4(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
         self.fixed(name, field_type, description, 4, |bytes| {
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).to_string()
+            itoa_string(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
         })
     }
 
     fn i1(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
         self.fixed(name, field_type, description, 1, |bytes| {
-            (bytes[0] as i8).to_string()
+            itoa_string(bytes[0] as i8)
         })
     }
 
     fn i2(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
         self.fixed(name, field_type, description, 2, |bytes| {
-            i16::from_le_bytes([bytes[0], bytes[1]]).to_string()
+            itoa_string(i16::from_le_bytes([bytes[0], bytes[1]]))
         })
     }
 
     fn i4(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
         self.fixed(name, field_type, description, 4, |bytes| {
-            i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).to_string()
+            itoa_string(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
         })
     }
 
     fn r4(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
         self.fixed(name, field_type, description, 4, |bytes| {
-            f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).to_string()
+            // fmt Display on purpose (not ryu): output must stay byte-identical
+            // to the previous to_string() ("1", not "1.0"; no exponent form).
+            format_compact!("{}", f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
         })
     }
 
     fn c1(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
-        self.fixed(name, field_type, description, 1, |bytes| {
-            String::from_utf8_lossy(bytes).to_string()
-        })
+        self.fixed(name, field_type, description, 1, |bytes| lossy_compact(bytes))
     }
 
     fn b1(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
         self.fixed(name, field_type, description, 1, |bytes| {
-            format!("0b{:08b}", bytes[0])
+            format_compact!("0b{:08b}", bytes[0])
         })
     }
 
@@ -773,7 +801,7 @@ impl<'a> FieldCursor<'a> {
         ParsedField {
             name: Cow::Borrowed(name),
             field_type: Cow::Borrowed(field_type),
-            value: String::from_utf8_lossy(&self.payload[value_start..value_end]).to_string(),
+            value: lossy_compact(&self.payload[value_start..value_end]),
             description: Cow::Borrowed(description),
             offset: Some(self.payload_start + start as u64),
             length: Some((value_end - start) as u16),
@@ -796,7 +824,7 @@ impl<'a> FieldCursor<'a> {
         ParsedField {
             name: Cow::Borrowed(name),
             field_type: Cow::Borrowed(field_type),
-            value: bytes_summary(&self.payload[value_start..value_end], len),
+            value: bytes_summary(&self.payload[value_start..value_end], len).into(),
             description: Cow::Borrowed(description),
             offset: Some(self.payload_start + start as u64),
             length: Some((value_end - start) as u16),
@@ -824,7 +852,7 @@ impl<'a> FieldCursor<'a> {
         ParsedField {
             name: Cow::Borrowed(name),
             field_type: Cow::Borrowed(field_type),
-            value: format!(
+            value: format_compact!(
                 "bits={}, bytes={}, preview={}",
                 bit_count,
                 byte_count,
@@ -867,7 +895,7 @@ impl<'a> FieldCursor<'a> {
         ParsedField {
             name: Cow::Borrowed(name),
             field_type: Cow::Owned(field_type),
-            value: array_summary(count, values),
+            value: array_summary(count, values).into(),
             description: Cow::Borrowed(description),
             offset: Some(self.payload_start + start as u64),
             length: Some(total_len as u16),
@@ -904,7 +932,7 @@ impl<'a> FieldCursor<'a> {
         ParsedField {
             name: Cow::Borrowed(name),
             field_type: Cow::Owned(field_type),
-            value: array_summary(count, values.into_iter().take(16).collect()),
+            value: array_summary(count, values.into_iter().take(16).collect()).into(),
             description: Cow::Borrowed(description),
             offset: Some(self.payload_start + start as u64),
             length: Some((self.cursor - start) as u16),
@@ -942,7 +970,7 @@ impl<'a> FieldCursor<'a> {
         ParsedField {
             name: Cow::Borrowed(name),
             field_type: Cow::Owned(field_type),
-            value: array_summary(count, values.into_iter().take(16).collect()),
+            value: array_summary(count, values.into_iter().take(16).collect()).into(),
             description: Cow::Borrowed(description),
             offset: Some(self.payload_start + start as u64),
             length: Some(byte_count as u16),
@@ -959,7 +987,7 @@ impl<'a> FieldCursor<'a> {
         ParsedField {
             name: name.into(),
             field_type: field_type.into(),
-            value: "count=0, preview=[]".to_string(),
+            value: CompactString::const_new("count=0, preview=[]"),
             description: description.into(),
             offset: Some(self.payload_start + start as u64),
             length: Some(0),
@@ -972,7 +1000,7 @@ impl<'a> FieldCursor<'a> {
         field_type: &'static str,
         description: &'static str,
         len: usize,
-        read: impl Fn(&[u8]) -> String,
+        read: impl Fn(&[u8]) -> CompactString,
     ) -> ParsedField {
         let start = self.cursor;
         let end = start + len;
@@ -1003,7 +1031,7 @@ impl<'a> FieldCursor<'a> {
         ParsedField {
             name: name.into(),
             field_type: field_type.into(),
-            value: "".to_string(),
+            value: CompactString::default(),
             description: description.into(),
             offset: None,
             length: None,
@@ -1273,7 +1301,7 @@ mod tests {
                 {
                     raw_standard_records += 1;
                 }
-                *counts.entry(record.record_type).or_insert(0) += 1;
+                *counts.entry(record.record_type.to_string()).or_insert(0) += 1;
                 true
             },
             |_, _| {},

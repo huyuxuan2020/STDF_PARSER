@@ -6,6 +6,13 @@ edition = "2021"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+# Hot-path perf: itoa formats integer field values without the fmt machinery;
+# rustc-hash replaces SipHash on the per-record accumulator maps; compact_str
+# keeps field values ≤24 bytes inline on the stack (a PTR carries ~20 short
+# values, which made String allocation the top parse cost).
+itoa = "1"
+rustc-hash = "2"
+compact_str = { version = "0.9", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
