@@ -1907,7 +1907,7 @@ function TestItemsView({
                     {LEFT_COLS.map((col) => (
                       <th
                         key={col.key}
-                        className="overflow-hidden whitespace-nowrap bg-muted px-2.5 py-2 text-left align-bottom text-[11px] font-semibold text-foreground"
+                        className="overflow-hidden whitespace-nowrap bg-muted px-2.5 py-2 text-center align-middle text-[11px] font-semibold text-foreground"
                       >
                         {col.label}
                       </th>
@@ -1945,7 +1945,7 @@ function TestItemsView({
                       {LEFT_COLS.map((col) => (
                         <td
                           key={col.key}
-                          className={`${MONO} overflow-hidden whitespace-nowrap px-2.5 py-0 text-left align-middle text-foreground`}
+                          className={`${MONO} overflow-hidden whitespace-nowrap px-2.5 py-0 text-center align-middle text-foreground`}
                           title={col.title?.(row)}
                         >
                           {col.render ? (
