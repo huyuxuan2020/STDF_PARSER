@@ -1918,8 +1918,9 @@ function TestItemsView({
                           {column.test_name || `#${column.test_num}`}
                         </span>
                         {/* Limits only — the record type and test number live in the
-                            click-to-open detail card. */}
-                        <span className="mt-0.5 block truncate font-mono text-[10px] tabular-nums text-muted-foreground">
+                            click-to-open detail card. Centered to line up with the
+                            centered values below. */}
+                        <span className="mt-0.5 block truncate text-center font-mono text-[10px] tabular-nums text-muted-foreground">
                           {columnMetaLine(column)}
                         </span>
                       </th>
