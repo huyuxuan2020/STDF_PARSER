@@ -1,7 +1,7 @@
 use stdf_core::parser::{ParseErrorEvent, ParseProgress};
 use stdf_core::sessions::{
     EnrichedField, RecordGroup, RecordSummaryPage, SearchProgress, SearchResultPage,
-    SessionManager, SessionSnapshot, TestItemColumnLite, TestItemPage, TestItemViewSnapshot,
+    SessionManager, SessionSnapshot, TestItemColumnLite, TestItemPage,
 };
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, State};
@@ -18,9 +18,6 @@ fn open_stdf(
         }
         stdf_core::sessions::SessionEvent::Snapshot(snapshot) => {
             let _ = app.emit("session-snapshot", snapshot);
-        }
-        stdf_core::sessions::SessionEvent::RecordBatch(batch) => {
-            let _ = app.emit("record-batch", batch);
         }
         stdf_core::sessions::SessionEvent::Complete(session_id) => {
             let _ = app.emit("parse-complete", session_id);
@@ -47,18 +44,9 @@ fn get_session_snapshot(
     manager.get_session_snapshot(&session_id)
 }
 
-// `(async)` on the test-item commands: they materialize the whole part matrix
-// (up to 500 rows × 200 cols per page, plus a pmr_lookup clone) which can hold
-// the WebKit main thread for a few seconds on big files. Dispatch on a tokio
-// task instead so the mouse stays responsive during the wait.
-#[tauri::command(async)]
-fn get_test_item_view(
-    session_id: String,
-    manager: State<'_, SessionManager>,
-) -> Result<TestItemViewSnapshot, String> {
-    manager.get_test_item_view(&session_id)
-}
-
+// `(async)` on the test-item commands: they materialize a page of the part
+// matrix (up to 500 rows × 1000 cols), which is enough work that dispatching
+// on a tokio task keeps the WebKit main thread and the mouse responsive.
 #[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 fn get_test_item_page(
@@ -165,7 +153,6 @@ pub fn run() {
             open_stdf,
             cancel_parse,
             get_session_snapshot,
-            get_test_item_view,
             get_test_item_page,
             get_test_item_columns,
             export_test_item_csv,

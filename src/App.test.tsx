@@ -63,6 +63,117 @@ describe("App", () => {
     expect(screen.getByText("SCAN_OK")).toBeInTheDocument();
   });
 
+  it("virtualizes the test-item matrix instead of mounting every cell", async () => {
+    const ROWS = 200;
+    const COLS = 60;
+    const columns = Array.from({ length: COLS }, (_, index) => ({
+      record_type: "PTR",
+      test_num: 1000 + index,
+      test_name: `T_${index}`,
+      low_limit: "0",
+      high_limit: "1",
+      unit: "V",
+      pmr_indices: []
+    }));
+    const rows = Array.from({ length: ROWS }, (_, r) => ({
+      part_id: `P-${r}`,
+      site_num: "1",
+      site_nums: ["1"],
+      head_num: "1",
+      sbin_num: "1",
+      sbin_name: "PASS",
+      sbin_pf: "P",
+      hbin_num: "1",
+      hbin_name: "GOOD",
+      hbin_pf: "P",
+      test_t: "10",
+      part_txt: "",
+      results: columns.map((_, c) => ({ value: `${r}.${c}`, status: "P" }))
+    }));
+    const api = createMockApi({
+      getTestItemPage: async () => ({
+        session_id: "session-1",
+        columns,
+        rows,
+        total_columns: COLS,
+        total_rows: ROWS,
+        row_offset: 0,
+        col_offset: 0,
+        pmr_count: 0,
+        has_bin_pf: true,
+        status: "complete"
+      })
+    });
+    const user = userEvent.setup();
+
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
+    await screen.findByRole("main", { name: "文件摘要" });
+    act(() => {
+      api.emitComplete("session-1");
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "测试项" })).not.toBeDisabled());
+    await user.click(screen.getByRole("button", { name: "测试项" }));
+
+    expect(await screen.findByText("P-0")).toBeInTheDocument();
+    // Only the scroll window (plus overscan) may be mounted — a full mount
+    // would be 200 × (10 + 60) = 14,000 cells and is what makes big files lag.
+    const table = screen.getByRole("table", { name: "测试项矩阵" });
+    expect(table.querySelectorAll("td").length).toBeLessThan(3000);
+    // The row counter still reports the full loaded set.
+    expect(screen.getByText(/已加载 200/)).toBeInTheDocument();
+  });
+
+  it("serves the test-item page from cache when re-entering the tab", async () => {
+    const api = createMockApi();
+    const getTestItemPage = vi.spyOn(api, "getTestItemPage");
+    const user = userEvent.setup();
+
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
+    await screen.findByRole("main", { name: "文件摘要" });
+    act(() => {
+      api.emitComplete("session-1");
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "测试项" })).not.toBeDisabled());
+
+    await user.click(screen.getByRole("button", { name: "测试项" }));
+    expect(await screen.findByText("PART-1")).toBeInTheDocument();
+    expect(getTestItemPage).toHaveBeenCalledTimes(1);
+
+    // Leave and come back: the already-loaded window must not be re-fetched
+    // (an 8MB IPC page + full table remount on every tab switch otherwise).
+    await user.click(screen.getByRole("button", { name: "概览" }));
+    await screen.findByRole("main", { name: "文件摘要" });
+    await user.click(screen.getByRole("button", { name: "测试项" }));
+    expect(await screen.findByText("PART-1")).toBeInTheDocument();
+    expect(getTestItemPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("loads the full column list only when the filter dialog opens", async () => {
+    const api = createMockApi();
+    const getTestItemColumns = vi.spyOn(api, "getTestItemColumns");
+    const user = userEvent.setup();
+
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
+    await screen.findByRole("main", { name: "文件摘要" });
+    act(() => {
+      api.emitComplete("session-1");
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "测试项" })).not.toBeDisabled());
+    await user.click(screen.getByRole("button", { name: "测试项" }));
+    await screen.findByText("PART-1");
+
+    // The identity list can be several MB on big files — fetch it for the
+    // dialog, not on tab entry.
+    expect(getTestItemColumns).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: /筛选测试项/ }));
+    expect(await screen.findByRole("dialog", { name: "筛选测试项" })).toBeInTheDocument();
+    await waitFor(() => expect(getTestItemColumns).toHaveBeenCalledTimes(1));
+  });
+
   it("keeps the test-item nav gated until parsing completes", async () => {
     const api = createMockApi({
       getSessionSnapshot: async () => ({

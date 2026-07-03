@@ -20,10 +20,13 @@ pub struct ParseErrorEvent {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ParsedRecord {
     pub record_type: String,
+    /// Raw STDF REC_TYP/REC_SUB pair — identifies the static field spec this
+    /// record was parsed with (used by the values-only field storage).
+    pub rec_typ: u8,
+    pub rec_sub: u8,
     pub offset: u64,
     pub length: u16,
     pub fields: Vec<ParsedField>,
-    pub summary: String,
     pub status: RecordStatus,
 }
 
@@ -144,19 +147,13 @@ fn parse_record(
     } else {
         RecordStatus::Parsed
     };
-    let summary = fields
-        .iter()
-        .filter(|field| !field.value.is_empty())
-        .take(3)
-        .map(|field| format!("{}={}", field.name, field.value))
-        .collect::<Vec<_>>()
-        .join(", ");
     ParsedRecord {
         record_type,
+        rec_typ,
+        rec_sub,
         offset,
         length,
         fields,
-        summary,
         status,
     }
 }
@@ -173,10 +170,10 @@ fn raw_preview_field(payload_start: u64, length: u16, payload: &[u8]) -> Vec<Par
 }
 
 #[derive(Clone, Copy)]
-struct FieldSpec {
-    name: &'static str,
-    field_type: &'static str,
-    description: &'static str,
+pub(crate) struct FieldSpec {
+    pub(crate) name: &'static str,
+    pub(crate) field_type: &'static str,
+    pub(crate) description: &'static str,
     kind: FieldKind,
     required: bool,
 }
@@ -536,7 +533,7 @@ static FTR_FIELDS: &[FieldSpec] = &[
 
 static BPS_FIELDS: &[FieldSpec] = &[field!(? "SEQ_NAME", "C*n", "程序段名称", FieldKind::Cn)];
 static EPS_FIELDS: &[FieldSpec] = &[];
-fn record_specs(rec_typ: u8, rec_sub: u8) -> Option<&'static [FieldSpec]> {
+pub(crate) fn record_specs(rec_typ: u8, rec_sub: u8) -> Option<&'static [FieldSpec]> {
     match (rec_typ, rec_sub) {
         (0, 10) => Some(FAR_FIELDS),
         (0, 20) => Some(ATR_FIELDS),

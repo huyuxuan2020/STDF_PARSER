@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -19,12 +19,30 @@ use std::{
 use uuid::Uuid;
 
 use flate2::read::ZlibDecoder;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
-const RECORD_BATCH_SIZE: usize = 5_000;
 const SQLITE_COMMIT_BATCH_SIZE: usize = 50_000;
 const PROGRESS_STEP_BYTES: u64 = 8 * 1_048_576;
 const PARSE_BUFFER_SIZE: usize = 8 * 1_024 * 1_024;
+/// Bound of the parse→SQLite-writer channel. Deep enough to ride out a batch
+/// COMMIT flush (~50k rows) without stalling the parse thread; at ~200 bytes a
+/// row the peak buffer stays around 15 MB.
+const WRITE_QUEUE_DEPTH: usize = 65_536;
+
+const RECORD_INSERT_SQL: &str = "INSERT INTO records \
+    (record_type, idx, group_idx, rec_offset, rec_length, status, fields_json) \
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+
+/// One parsed record on its way to the SQLite writer thread.
+struct RecordRow {
+    record_type: String,
+    idx: i64,
+    group_idx: i64,
+    offset: i64,
+    length: i64,
+    status: &'static str,
+    blob: Vec<u8>,
+}
 // Upper bound on distinct test-item columns held in memory per session. Columns
 // are paginated in the UI, so this is a safety cap (each part's result vector and
 // the column universe scale with it) rather than a display limit. Note it only
@@ -64,7 +82,6 @@ pub struct RecordSummary {
     pub index: usize,
     pub offset: u64,
     pub length: u16,
-    pub summary: String,
     pub status: RecordStatus,
 }
 
@@ -116,9 +133,10 @@ struct ColumnMeta {
     high_base: Option<f64>,
 }
 
+/// One matrix cell. Cells are positional — `TestItemPartRow.results[i]` belongs to
+/// `columns[i]` of the same page/snapshot — so the cell carries no test identity.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TestItemCell {
-    pub test_num: u32,
     pub value: String,
     pub status: String,
     /// Position of the source record within its record-type group (0-based).
@@ -154,17 +172,6 @@ pub struct TestItemPmrEntry {
     pub site_num: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct TestItemViewSnapshot {
-    pub session_id: String,
-    pub columns: Vec<TestItemColumn>,
-    pub rows: Vec<TestItemPartRow>,
-    pub total_columns: usize,
-    pub total_rows: usize,
-    pub pmr_lookup: HashMap<String, TestItemPmrEntry>,
-    pub status: ParseStatus,
-}
-
 /// A windowed slice of the test-item matrix: `rows[r].results` is projected to the
 /// same order as `columns`, so the frontend renders only the requested page of
 /// rows × columns regardless of how large the full matrix is.
@@ -177,7 +184,9 @@ pub struct TestItemPage {
     pub total_rows: usize,
     pub row_offset: usize,
     pub col_offset: usize,
-    pub pmr_lookup: HashMap<String, TestItemPmrEntry>,
+    /// Size of the session's PMR lookup. The UI only shows a count pill, so the
+    /// map itself (potentially thousands of entries) never crosses the IPC bridge.
+    pub pmr_count: usize,
     /// Whether the file's HBR/SBR carry a pass/fail flag. When false, pass/fail
     /// (PASSFG / export yield) falls back to the "soft bin 1 = pass" convention.
     pub has_bin_pf: bool,
@@ -302,17 +311,10 @@ pub struct SearchProgress {
     pub total: usize,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct RecordBatchEvent {
-    pub session_id: String,
-    pub records: Vec<RecordSummary>,
-}
-
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Progress(ParseProgress),
     Snapshot(SessionSnapshot),
-    RecordBatch(RecordBatchEvent),
     Complete(String),
     /// Non-fatal warning about an abnormal-but-parseable file (empty / no FAR / truncated tail).
     Warning(ParseErrorEvent),
@@ -331,6 +333,11 @@ struct SessionState {
     cancel_flag: Arc<AtomicBool>,
     snapshot: SessionSnapshot,
     test_items: TestItemAccumulator,
+    /// Lazily-opened read connection shared by the short record queries
+    /// (page/fields/groups), so arrow-keying doesn't reopen SQLite per press
+    /// and the page cache stays warm. Long scans (search) still open their own
+    /// connection so they never block these — see `open_db`.
+    read_conn: Arc<Mutex<Option<Connection>>>,
 }
 
 impl SessionManager {
@@ -388,6 +395,20 @@ impl SessionManager {
             status: ParseStatus::Running,
         };
         let cancel_flag = Arc::new(AtomicBool::new(false));
+        // The viewer shows one file at a time: opening a new file evicts every
+        // previous session — cancel its parse, drop the in-memory accumulator,
+        // and delete its on-disk index. Without this every opened file leaked
+        // a multi-GB database (and its matrix accumulator) until the NEXT app
+        // launch, since startup cleanup was the only reclamation. Unlinking is
+        // safe even if the old parse/writer still holds the file open — the
+        // space is reclaimed when the last handle closes.
+        {
+            let mut guard = self.sessions.lock().map_err(|_| "session lock poisoned")?;
+            for (_, old) in guard.drain() {
+                old.cancel_flag.store(true, Ordering::SeqCst);
+                let _ = std::fs::remove_file(&old.db_path);
+            }
+        }
         self.sessions
             .lock()
             .map_err(|_| "session lock poisoned")?
@@ -399,6 +420,7 @@ impl SessionManager {
                     cancel_flag: Arc::clone(&cancel_flag),
                     snapshot,
                     test_items: TestItemAccumulator::default(),
+                    read_conn: Arc::new(Mutex::new(None)),
                 },
             );
 
@@ -425,27 +447,63 @@ impl SessionManager {
 
             let mut index = 0_usize;
             let mut first_record_type: Option<String> = None;
-            let mut pending_batch = Vec::with_capacity(RECORD_BATCH_SIZE);
+            // Per-record-type position counters (parse order). Stored as
+            // `group_idx` so record pages seek by (record_type, group_idx)
+            // instead of walking an OFFSET.
+            let mut group_counters: HashMap<String, usize> = HashMap::new();
             let mut last_progress_bytes = 0_u64;
-            let mut records_since_commit = 0_usize;
             let mut last_snapshot_bytes = 0_u64;
-            let _ = conn.execute_batch("BEGIN;");
-            let mut insert = match conn.prepare(
-                "INSERT INTO records \
-                 (id, record_type, idx, rec_offset, rec_length, summary, status, fields_json) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            ) {
-                Ok(stmt) => stmt,
-                Err(error) => {
-                    let _ = conn.execute_batch("COMMIT;");
-                    on_event(SessionEvent::Error(ParseErrorEvent {
-                        session_id: session_id.clone(),
-                        message: error.to_string(),
-                        offset: None,
-                    }));
+
+            // Validate the insert against the fresh schema up front so a broken
+            // schema still aborts the parse with an error event (per-row insert
+            // errors stay best-effort, as before).
+            if let Err(error) = conn.prepare(RECORD_INSERT_SQL).map(drop) {
+                on_event(SessionEvent::Error(ParseErrorEvent {
+                    session_id: session_id.clone(),
+                    message: error.to_string(),
+                    offset: None,
+                }));
+                return;
+            }
+
+            // SQLite writing runs on its own thread: profiling showed the bulk
+            // load's page flushing (pwrite) eating ~half the parse thread, so
+            // parsing and disk writes now overlap. The bounded channel keeps
+            // memory in check; a single writer preserves insertion order, which
+            // get_record_fields' rowid == idx + 1 seek relies on.
+            let (row_tx, row_rx) = mpsc::sync_channel::<RecordRow>(WRITE_QUEUE_DEPTH);
+            let writer = thread::spawn(move || {
+                let _ = conn.execute_batch("BEGIN;");
+                let Ok(mut insert) = conn.prepare(RECORD_INSERT_SQL) else {
+                    for _ in row_rx {}
                     return;
+                };
+                let mut since_commit = 0_usize;
+                for row in row_rx {
+                    let _ = insert.execute(params![
+                        row.record_type,
+                        row.idx,
+                        row.group_idx,
+                        row.offset,
+                        row.length,
+                        row.status,
+                        row.blob,
+                    ]);
+                    since_commit += 1;
+                    if since_commit >= SQLITE_COMMIT_BATCH_SIZE {
+                        let _ = conn.execute_batch("COMMIT; BEGIN;");
+                        since_commit = 0;
+                    }
                 }
-            };
+                drop(insert);
+                let _ = conn.execute_batch("COMMIT;");
+                // Composite index: record pages seek straight to (type, position)
+                // instead of OFFSET-walking millions of index entries.
+                let _ = conn.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS idx_records_type_pos ON records (record_type, group_idx);",
+                );
+            });
+
             let result = with_input_reader(&path_buf, metadata.len(), |reader, parse_total| {
                 let mut reader = BufReader::with_capacity(PARSE_BUFFER_SIZE, reader);
                 parse_reader(
@@ -458,51 +516,42 @@ impl SessionManager {
                         if first_record_type.is_none() {
                             first_record_type = Some(record.record_type.clone());
                         }
-                        let summary = record_summary(&session_id, index, &record);
-                        let snapshot_changed = update_session_snapshot(
+                        // Snapshot bookkeeping and the test-item accumulator share
+                        // one lock acquisition — this runs once per record.
+                        let snapshot_changed = apply_record_to_session(
                             &sessions,
                             &session_id,
-                            &summary,
-                            &record.fields,
+                            &record,
+                            index,
                             record.offset + 4 + u64::from(record.length),
                             parse_total,
-                        );
-                        update_test_item_accumulator(
-                            &sessions,
-                            &session_id,
-                            &summary.record_type,
-                            index,
-                            &record.fields,
                         );
                         if snapshot_changed {
                             if let Some(snapshot) = get_snapshot_clone(&sessions, &session_id) {
                                 on_event(SessionEvent::Snapshot(snapshot));
                             }
                         }
-                        let fields_blob = encode_fields_blob(&record.fields);
-                        let _ = insert.execute(params![
-                            summary.id,
-                            summary.record_type,
-                            index as i64,
-                            summary.offset as i64,
-                            summary.length as i64,
-                            summary.summary,
-                            status_str(&summary.status),
-                            fields_blob,
-                        ]);
+                        let fields_blob = encode_fields_blob(&record);
+                        let group_idx = {
+                            let counter = group_counters
+                                .entry(record.record_type.clone())
+                                .or_insert(0);
+                            let position = *counter;
+                            *counter += 1;
+                            position
+                        };
+                        // Blocks only when the writer falls a full queue behind
+                        // (backpressure), which keeps peak memory bounded.
+                        let _ = row_tx.send(RecordRow {
+                            record_type: record.record_type.clone(),
+                            idx: index as i64,
+                            group_idx: group_idx as i64,
+                            offset: record.offset as i64,
+                            length: record.length as i64,
+                            status: status_str(&record.status),
+                            blob: fields_blob,
+                        });
                         index += 1;
-                        records_since_commit += 1;
-                        pending_batch.push(summary);
-                        if pending_batch.len() >= RECORD_BATCH_SIZE {
-                            on_event(SessionEvent::RecordBatch(RecordBatchEvent {
-                                session_id: session_id.clone(),
-                                records: std::mem::take(&mut pending_batch),
-                            }));
-                        }
-                        if records_since_commit >= SQLITE_COMMIT_BATCH_SIZE {
-                            let _ = conn.execute_batch("COMMIT; BEGIN;");
-                            records_since_commit = 0;
-                        }
                         true
                     },
                     |bytes_read, total_bytes| {
@@ -534,10 +583,10 @@ impl SessionManager {
                     },
                 )
             });
-            let _ = conn.execute_batch("COMMIT;");
-            let _ = conn.execute_batch(
-                "CREATE INDEX IF NOT EXISTS idx_records_type ON records (record_type);",
-            );
+            // Close the channel so the writer drains, commits, and builds the
+            // index; records must be fully queryable before Complete fires.
+            drop(row_tx);
+            let _ = writer.join();
 
             let result = match result {
                 Ok(result) => result,
@@ -550,13 +599,6 @@ impl SessionManager {
                     return;
                 }
             };
-
-            if !pending_batch.is_empty() {
-                on_event(SessionEvent::RecordBatch(RecordBatchEvent {
-                    session_id: session_id.clone(),
-                    records: pending_batch,
-                }));
-            }
 
             let cancelled = cancel_flag.load(Ordering::SeqCst);
             // A truncated tail (incomplete touchdown record) is NOT fatal — keep what parsed.
@@ -643,6 +685,8 @@ impl SessionManager {
             .clone())
     }
 
+    /// Open a fresh connection. Used by long-running scans (search) so they
+    /// never hold the shared read connection hostage for 30-60s.
     fn open_db(&self, session_id: &str) -> Result<Connection, String> {
         let db_path = {
             let guard = self.sessions.lock().map_err(|_| "session lock poisoned")?;
@@ -655,24 +699,59 @@ impl SessionManager {
         Connection::open(&db_path).map_err(|error| error.to_string())
     }
 
-    pub fn get_record_groups(&self, session_id: &str) -> Result<Vec<RecordGroup>, String> {
-        let conn = self.open_db(session_id)?;
-        let mut stmt = conn
-            .prepare("SELECT record_type, COUNT(*) FROM records GROUP BY record_type ORDER BY MIN(rowid)")
-            .map_err(|error| error.to_string())?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(RecordGroup {
-                    record_type: row.get::<_, String>(0)?,
-                    count: row.get::<_, i64>(1)? as usize,
-                })
-            })
-            .map_err(|error| error.to_string())?;
-        let mut groups = Vec::new();
-        for row in rows {
-            groups.push(row.map_err(|error| error.to_string())?);
+    /// Run a short query on the session's cached read connection (opened on
+    /// first use). The global sessions lock is released before touching
+    /// SQLite, so queries never stall the parse thread.
+    fn with_read_conn<T>(
+        &self,
+        session_id: &str,
+        f: impl FnOnce(&Connection) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let (db_path, cell) = {
+            let guard = self.sessions.lock().map_err(|_| "session lock poisoned")?;
+            let state = guard
+                .get(session_id)
+                .ok_or_else(|| "解析会话不存在".to_string())?;
+            (state.db_path.clone(), Arc::clone(&state.read_conn))
+        };
+        let mut slot = cell.lock().map_err(|_| "read connection lock poisoned")?;
+        if slot.is_none() {
+            *slot = Some(Connection::open(&db_path).map_err(|error| error.to_string())?);
         }
-        Ok(groups)
+        f(slot.as_ref().expect("connection initialized above"))
+    }
+
+    pub fn get_record_groups(&self, session_id: &str) -> Result<Vec<RecordGroup>, String> {
+        // The snapshot maintains live per-type counts in first-appearance order
+        // (same order as GROUP BY ... ORDER BY MIN(rowid)). Once parsing is
+        // done they are final, so a full-table GROUP BY would be pure waste.
+        {
+            let guard = self.sessions.lock().map_err(|_| "session lock poisoned")?;
+            let state = guard
+                .get(session_id)
+                .ok_or_else(|| "解析会话不存在".to_string())?;
+            if matches!(state.snapshot.status, ParseStatus::Complete) {
+                return Ok(state.snapshot.groups.clone());
+            }
+        }
+        self.with_read_conn(session_id, |conn| {
+            let mut stmt = conn
+                .prepare("SELECT record_type, COUNT(*) FROM records GROUP BY record_type ORDER BY MIN(rowid)")
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(RecordGroup {
+                        record_type: row.get::<_, String>(0)?,
+                        count: row.get::<_, i64>(1)? as usize,
+                    })
+                })
+                .map_err(|error| error.to_string())?;
+            let mut groups = Vec::new();
+            for row in rows {
+                groups.push(row.map_err(|error| error.to_string())?);
+            }
+            Ok(groups)
+        })
     }
 
     pub fn get_records(
@@ -682,33 +761,63 @@ impl SessionManager {
         page: usize,
         page_size: usize,
     ) -> Result<RecordSummaryPage, String> {
-        let conn = self.open_db(session_id)?;
-        let total: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM records WHERE record_type = ?1",
-                params![group],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, record_type, idx, rec_offset, rec_length, summary, status FROM records \
-                 WHERE record_type = ?1 ORDER BY rowid LIMIT ?2 OFFSET ?3",
-            )
-            .map_err(|error| error.to_string())?;
-        let offset = page.saturating_mul(page_size) as i64;
-        let rows = stmt
-            .query_map(params![group, page_size as i64, offset], row_to_summary)
-            .map_err(|error| error.to_string())?;
-        let mut records = Vec::new();
-        for row in rows {
-            records.push(row.map_err(|error| error.to_string())?);
-        }
-        Ok(RecordSummaryPage {
-            records,
-            total: total as usize,
-            page,
-            page_size,
+        // Once parsing completes the per-type totals are final in the snapshot;
+        // re-running COUNT(*) per page flip would index-scan the whole group.
+        let cached_total: Option<usize> = {
+            let guard = self.sessions.lock().map_err(|_| "session lock poisoned")?;
+            let state = guard
+                .get(session_id)
+                .ok_or_else(|| "解析会话不存在".to_string())?;
+            if matches!(state.snapshot.status, ParseStatus::Complete) {
+                Some(
+                    state
+                        .snapshot
+                        .groups
+                        .iter()
+                        .find(|g| g.record_type == group)
+                        .map(|g| g.count)
+                        .unwrap_or(0),
+                )
+            } else {
+                None
+            }
+        };
+        self.with_read_conn(session_id, |conn| {
+            let total: usize = match cached_total {
+                Some(total) => total,
+                None => conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM records WHERE record_type = ?1",
+                        params![group],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(|error| error.to_string())? as usize,
+            };
+            // Keyset pagination: group_idx is the record's position within its
+            // type (parse order), so the composite index seeks straight to the
+            // page instead of OFFSET-walking every earlier entry.
+            let mut stmt = conn
+                .prepare(
+                    "SELECT record_type, idx, rec_offset, rec_length, status FROM records \
+                     WHERE record_type = ?1 AND group_idx >= ?2 ORDER BY group_idx LIMIT ?3",
+                )
+                .map_err(|error| error.to_string())?;
+            let start = page.saturating_mul(page_size) as i64;
+            let rows = stmt
+                .query_map(params![group, start, page_size as i64], |row| {
+                    row_to_summary(session_id, row)
+                })
+                .map_err(|error| error.to_string())?;
+            let mut records = Vec::new();
+            for row in rows {
+                records.push(row.map_err(|error| error.to_string())?);
+            }
+            Ok(RecordSummaryPage {
+                records,
+                total,
+                page,
+                page_size,
+            })
         })
     }
 
@@ -717,14 +826,37 @@ impl SessionManager {
         session_id: &str,
         record_id: &str,
     ) -> Result<Vec<EnrichedField>, String> {
-        let conn = self.open_db(session_id)?;
-        let (record_type, fields_blob): (String, Vec<u8>) = conn
-            .query_row(
-                "SELECT record_type, fields_json FROM records WHERE id = ?1",
-                params![record_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
-            .map_err(|_| "record 不存在".to_string())?;
+        let (record_type, fields_blob): (String, Vec<u8>) =
+            self.with_read_conn(session_id, |conn| {
+                // Record ids are "{session}:{parse_index}" and rows are inserted
+                // in parse order into a fresh table by a single writer, so
+                // rowid == parse_index + 1. Seek by rowid (O(log n)) and verify
+                // the stored idx matches — a full scan here made every
+                // arrow-key field lookup take seconds on multi-GB files.
+                record_id
+                    .rsplit(':')
+                    .next()
+                    .and_then(|tail| tail.parse::<i64>().ok())
+                    .and_then(|parse_index| {
+                        conn.query_row(
+                            "SELECT record_type, fields_json, idx FROM records WHERE rowid = ?1",
+                            params![parse_index + 1],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, Vec<u8>>(1)?,
+                                    row.get::<_, i64>(2)?,
+                                ))
+                            },
+                        )
+                        .optional()
+                        .ok()
+                        .flatten()
+                        .filter(|(_, _, idx)| *idx == parse_index)
+                    })
+                    .map(|(record_type, blob, _)| (record_type, blob))
+                    .ok_or_else(|| "record 不存在".to_string())
+            })?;
         let fields = decode_fields_blob(&fields_blob).map_err(|error| error.to_string())?;
         // For PTR/MPR, look up the first-record defaults keyed by TEST_NUM so
         // omitted RES_SCAL/UNITS/LO_LIMIT/... show what they effectively are.
@@ -785,13 +917,13 @@ impl SessionManager {
         on_progress(0, total_rows);
         let mut stmt = conn
             .prepare(
-                "SELECT id, record_type, idx, rec_offset, rec_length, summary, status, fields_json \
+                "SELECT record_type, idx, rec_offset, rec_length, status, fields_json \
                  FROM records ORDER BY rowid",
             )
             .map_err(|error| error.to_string())?;
         let rows = stmt
             .query_map([], |row| {
-                Ok((row_to_summary(row)?, row.get::<_, Vec<u8>>(7)?))
+                Ok((row_to_summary(session_id, row)?, row.get::<_, Vec<u8>>(5)?))
             })
             .map_err(|error| error.to_string())?;
         let mut results = Vec::new();
@@ -834,18 +966,6 @@ impl SessionManager {
             page,
             page_size,
         })
-    }
-
-    pub fn get_test_item_view(&self, session_id: &str) -> Result<TestItemViewSnapshot, String> {
-        let guard = self.sessions.lock().map_err(|_| "session lock poisoned")?;
-        let state = guard
-            .get(session_id)
-            .ok_or_else(|| "解析会话不存在".to_string())?;
-        Ok(build_test_item_snapshot(
-            session_id,
-            &state.test_items,
-            &state.snapshot.status,
-        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -928,26 +1048,35 @@ fn create_session_db(db_path: &Path) -> Result<(), String> {
     }
     let _ = std::fs::remove_file(db_path);
     let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+    // page_size must precede the first CREATE TABLE. 8K pages halve the pwrite
+    // syscall count for the multi-GB bulk load (profiling showed page flushing
+    // dominating the parse thread).
+    // The record id ("{session}:{idx}") is NOT stored — it is derived from idx
+    // at query time; storing it added ~45 redundant bytes to every row.
     conn.execute_batch(
-        "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; \
+        "PRAGMA page_size=8192; \
+         PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; \
          PRAGMA temp_store=MEMORY; PRAGMA cache_size=-262144; \
          CREATE TABLE records (\
-            id TEXT, record_type TEXT, idx INTEGER, rec_offset INTEGER, rec_length INTEGER, \
-            summary TEXT, status TEXT, fields_json BLOB);",
+            record_type TEXT, idx INTEGER, group_idx INTEGER, \
+            rec_offset INTEGER, rec_length INTEGER, \
+            status TEXT, fields_json BLOB);",
     )
     .map_err(|error| error.to_string())?;
     Ok(())
 }
 
-fn row_to_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordSummary> {
+/// Columns: record_type, idx, rec_offset, rec_length, status. The record id is
+/// synthesized from the session id + parse index (it is not stored).
+fn row_to_summary(session_id: &str, row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordSummary> {
+    let index = row.get::<_, i64>(1)? as usize;
     Ok(RecordSummary {
-        id: row.get(0)?,
-        record_type: row.get(1)?,
-        index: row.get::<_, i64>(2)? as usize,
-        offset: row.get::<_, i64>(3)? as u64,
-        length: row.get::<_, i64>(4)? as u16,
-        summary: row.get(5)?,
-        status: status_from_str(&row.get::<_, String>(6)?),
+        id: format!("{session_id}:{index}"),
+        record_type: row.get(0)?,
+        index,
+        offset: row.get::<_, i64>(2)? as u64,
+        length: row.get::<_, i64>(3)? as u16,
+        status: status_from_str(&row.get::<_, String>(4)?),
     })
 }
 
@@ -967,11 +1096,14 @@ fn status_from_str(value: &str) -> RecordStatus {
     }
 }
 
-fn update_session_snapshot(
+/// Per-record session-state update. Groups/first-record/key-field bookkeeping and
+/// the test-item accumulator are applied under a single lock acquisition — this
+/// runs once per record, so the lock traffic matters on multi-million-record files.
+fn apply_record_to_session(
     sessions: &Arc<Mutex<HashMap<String, SessionState>>>,
     session_id: &str,
-    summary: &RecordSummary,
-    fields: &[RecordField],
+    record: &ParsedRecord,
+    idx: usize,
     bytes_read: u64,
     total_bytes: u64,
 ) -> bool {
@@ -981,61 +1113,67 @@ fn update_session_snapshot(
     let Some(state) = guard.get_mut(session_id) else {
         return false;
     };
+    let changed =
+        update_session_snapshot(&mut state.snapshot, session_id, record, idx, bytes_read, total_bytes);
+    update_test_item_accumulator(&mut state.test_items, &record.record_type, idx, &record.fields);
+    changed
+}
+
+fn update_session_snapshot(
+    snapshot: &mut SessionSnapshot,
+    session_id: &str,
+    record: &ParsedRecord,
+    idx: usize,
+    bytes_read: u64,
+    total_bytes: u64,
+) -> bool {
     let mut changed = false;
-    state.snapshot.bytes_read = bytes_read;
-    state.snapshot.total_bytes = total_bytes;
-    if let Some(group) = state
-        .snapshot
+    snapshot.bytes_read = bytes_read;
+    snapshot.total_bytes = total_bytes;
+    if let Some(group) = snapshot
         .groups
         .iter_mut()
-        .find(|group| group.record_type == summary.record_type)
+        .find(|group| group.record_type == record.record_type)
     {
         group.count += 1;
     } else {
-        state.snapshot.groups.push(RecordGroup {
-            record_type: summary.record_type.clone(),
+        snapshot.groups.push(RecordGroup {
+            record_type: record.record_type.clone(),
             count: 1,
         });
         changed = true;
     }
 
-    if !state.snapshot.first_records.contains_key(&summary.record_type) {
-        state.snapshot.first_records.insert(
-            summary.record_type.clone(),
+    if !snapshot.first_records.contains_key(&record.record_type) {
+        // Full summaries (with their formatted id) are built only for the
+        // handful of first-of-type records, never in the per-record hot path.
+        snapshot.first_records.insert(
+            record.record_type.clone(),
             FirstRecordSnapshot {
-                record: summary.clone(),
-                fields: fields.to_vec(),
+                record: record_summary(session_id, idx, record),
+                fields: record.fields.to_vec(),
             },
         );
         changed = true;
     }
 
-    if is_key_record(&summary.record_type)
-        && !state.snapshot.key_fields.contains_key(&summary.record_type)
+    if is_key_record(&record.record_type)
+        && !snapshot.key_fields.contains_key(&record.record_type)
     {
-        state
-            .snapshot
+        snapshot
             .key_fields
-            .insert(summary.record_type.clone(), fields.to_vec());
+            .insert(record.record_type.clone(), record.fields.to_vec());
         changed = true;
     }
     changed
 }
 
 fn update_test_item_accumulator(
-    sessions: &Arc<Mutex<HashMap<String, SessionState>>>,
-    session_id: &str,
+    acc: &mut TestItemAccumulator,
     record_type: &str,
     idx: usize,
     fields: &[RecordField],
 ) {
-    let Ok(mut guard) = sessions.lock() else {
-        return;
-    };
-    let Some(state) = guard.get_mut(session_id) else {
-        return;
-    };
-    let acc = &mut state.test_items;
     match record_type {
         "PMR" => {
             let pmr_indx = field_value(fields, "PMR_INDX");
@@ -1211,36 +1349,6 @@ fn update_test_item_accumulator(
             acc.part_rows.insert(key, row_entry);
         }
         _ => {}
-    }
-}
-
-fn build_test_item_snapshot(
-    session_id: &str,
-    acc: &TestItemAccumulator,
-    status: &ParseStatus,
-) -> TestItemViewSnapshot {
-    let total_columns = acc.column_order.len();
-    let total_rows = acc.part_order.len();
-    let columns = acc
-        .column_order
-        .iter()
-        .take(TEST_ITEM_COLUMN_LIMIT)
-        .filter_map(|key| acc.columns_by_key.get(key).cloned())
-        .collect::<Vec<_>>();
-    let rows = acc
-        .part_order
-        .iter()
-        .filter_map(|key| acc.part_rows.get(key).cloned())
-        .collect::<Vec<_>>();
-
-    TestItemViewSnapshot {
-        session_id: session_id.to_string(),
-        columns,
-        rows,
-        total_columns,
-        total_rows,
-        pmr_lookup: acc.pmr_lookup.clone(),
-        status: status.clone(),
     }
 }
 
@@ -1647,9 +1755,8 @@ fn build_test_item_page(
             // Project each row's results onto the requested column window.
             results: page_cols
                 .iter()
-                .map(|(pos, col)| {
+                .map(|(pos, _)| {
                     row.results.get(*pos).cloned().unwrap_or_else(|| TestItemCell {
-                        test_num: col.test_num,
                         value: String::new(),
                         status: String::new(),
                         record_position: None,
@@ -1673,7 +1780,7 @@ fn build_test_item_page(
         total_rows,
         row_offset,
         col_offset,
-        pmr_lookup: acc.pmr_lookup.clone(),
+        pmr_count: acc.pmr_lookup.len(),
         has_bin_pf,
         status: status.clone(),
     }
@@ -1926,7 +2033,6 @@ fn build_ptr_cell(fields: &[RecordField], meta: &ColumnMeta) -> TestItemCell {
         }
     };
     TestItemCell {
-        test_num: field_value(fields, "TEST_NUM").parse::<u32>().unwrap_or(0),
         value,
         status,
         record_position: None,
@@ -1937,11 +2043,9 @@ fn build_ptr_cell(fields: &[RecordField], meta: &ColumnMeta) -> TestItemCell {
 /// and the verdict fails if any pin falls outside the shared limits. The result
 /// array is capped at 16 elements upstream in the parser.
 fn build_mpr_cell(fields: &[RecordField], meta: &ColumnMeta) -> TestItemCell {
-    let test_num = field_value(fields, "TEST_NUM").parse::<u32>().unwrap_or(0);
     let results = field_values_from_array(fields, "RTN_RSLT");
     if results.is_empty() {
         return TestItemCell {
-            test_num,
             value: field_value(fields, "TEST_FLG"),
             status: String::new(),
             record_position: None,
@@ -1981,7 +2085,6 @@ fn build_mpr_cell(fields: &[RecordField], meta: &ColumnMeta) -> TestItemCell {
             .join(", ")
     };
     TestItemCell {
-        test_num,
         value,
         status,
         record_position: None,
@@ -1992,7 +2095,6 @@ fn build_ftr_cell(fields: &[RecordField]) -> TestItemCell {
     let flag = field_value(fields, "TEST_FLG");
     let status = if flag.contains("0b00000000") { "P" } else { "F" };
     TestItemCell {
-        test_num: field_value(fields, "TEST_NUM").parse::<u32>().unwrap_or(0),
         value: flag,
         status: status.to_string(),
         record_position: None,
@@ -2008,20 +2110,83 @@ fn materialize_results(
     column_order
         .iter()
         .take(column_limit)
-        .filter_map(|key| {
-            columns_by_key.get(key).map(|column| {
-                results.get(key).cloned().unwrap_or(TestItemCell {
-                    test_num: column.test_num,
-                    value: String::new(),
-                    status: String::new(),
-                    record_position: None,
-                })
+        .filter(|key| columns_by_key.contains_key(*key))
+        .map(|key| {
+            results.get(key).cloned().unwrap_or(TestItemCell {
+                value: String::new(),
+                status: String::new(),
+                record_position: None,
             })
         })
         .collect()
 }
 
-fn encode_fields_blob(fields: &[RecordField]) -> Vec<u8> {
+/// Encode a record's fields for the session index. Field names, types and
+/// descriptions are static per record layout, so for spec-aligned records
+/// (the overwhelmingly common case) only the VALUES are stored, plus the
+/// REC_TYP/REC_SUB pair identifying the layout — decode rebuilds the rest
+/// from the parser's spec table. Storing full copies per record blew a 3.2GB
+/// STDF up into a 35GB index and made the bulk load write-bound.
+/// Spec-less records (UNKNOWN raw previews) and any spec mismatch fall back
+/// to the legacy full-copy format.
+fn encode_fields_blob(record: &ParsedRecord) -> Vec<u8> {
+    if let Some(specs) = crate::parser::record_specs(record.rec_typ, record.rec_sub) {
+        let aligned = record.fields.len() <= specs.len()
+            && record
+                .fields
+                .iter()
+                .zip(specs)
+                .all(|(field, spec)| field.name == spec.name);
+        if aligned {
+            let mut blob = Vec::with_capacity(10 + record.fields.len() * 12);
+            blob.extend_from_slice(b"GBF2");
+            blob.push(record.rec_typ);
+            blob.push(record.rec_sub);
+            blob.extend_from_slice(&(record.fields.len() as u32).to_le_bytes());
+            for field in &record.fields {
+                write_blob_str(&mut blob, &field.value);
+            }
+            return blob;
+        }
+    }
+    encode_gbf1_fields(&record.fields)
+}
+
+fn decode_gbf2_fields(fields_blob: &[u8]) -> Result<Vec<RecordField>, String> {
+    if fields_blob.len() < 10 {
+        return Err("GBF2 blob 头不完整".to_string());
+    }
+    let rec_typ = fields_blob[4];
+    let rec_sub = fields_blob[5];
+    let specs = crate::parser::record_specs(rec_typ, rec_sub)
+        .ok_or_else(|| format!("未知记录布局 ({rec_typ},{rec_sub})"))?;
+    let count = u32::from_le_bytes([
+        fields_blob[6],
+        fields_blob[7],
+        fields_blob[8],
+        fields_blob[9],
+    ]) as usize;
+    if count > specs.len() {
+        return Err("GBF2 字段数超出布局定义".to_string());
+    }
+    let mut cursor = 10_usize;
+    let mut fields = Vec::with_capacity(count);
+    for spec in specs.iter().take(count) {
+        let value = read_blob_string(fields_blob, &mut cursor)?;
+        fields.push(RecordField {
+            name: Cow::Borrowed(spec.name),
+            field_type: Cow::Borrowed(spec.field_type),
+            value,
+            description: Cow::Borrowed(spec.description),
+            offset: None,
+            length: None,
+        });
+    }
+    Ok(fields)
+}
+
+/// Legacy full-copy encoding: every field carries its own name/type/description.
+fn encode_gbf1_fields(fields: &[RecordField]) -> Vec<u8> {
     let mut blob = Vec::with_capacity(fields.len().saturating_mul(40));
     blob.extend_from_slice(b"GBF1");
     blob.extend_from_slice(&(fields.len() as u32).to_le_bytes());
@@ -2037,6 +2202,9 @@ fn encode_fields_blob(fields: &[RecordField]) -> Vec<u8> {
 }
 
 fn decode_fields_blob(fields_blob: &[u8]) -> Result<Vec<RecordField>, String> {
+    if fields_blob.starts_with(b"GBF2") {
+        return decode_gbf2_fields(fields_blob);
+    }
     if fields_blob.starts_with(b"GBF1") {
         return decode_gbf1_fields(fields_blob);
     }
@@ -2268,7 +2436,6 @@ fn record_summary(session_id: &str, index: usize, record: &ParsedRecord) -> Reco
         index,
         offset: record.offset,
         length: record.length,
-        summary: record.summary.clone(),
         status: record.status.clone(),
     }
 }
@@ -2465,8 +2632,8 @@ mod tests {
         );
         assert_eq!(parsed[0].fields[1].name, "STDF_VER");
         assert_eq!(parsed[0].fields[1].description, "STDF 版本");
-        assert!(parsed[2].summary.contains("TEST_NUM=100"));
-        assert!(parsed[3].summary.contains("HEAD_NUM=1"));
+        assert_eq!(field_value(&parsed[2].fields, "TEST_NUM"), "100");
+        assert_eq!(field_value(&parsed[3].fields, "HEAD_NUM"), "1");
     }
 
     #[test]
@@ -2753,8 +2920,8 @@ mod tests {
         assert!(completed, "parser should complete");
 
         let view = manager
-            .get_test_item_view(&session.session_id)
-            .expect("test item view");
+            .get_test_item_page(&session.session_id, 0, 100, 0, 100, &[], "")
+            .expect("test item page");
         assert_eq!(view.columns.len(), 2);
         assert_eq!(
             view.columns
@@ -2780,7 +2947,17 @@ mod tests {
         assert_eq!(view.rows[0].results.len(), 2);
         assert_eq!(view.rows[0].results[0].status, "P");
         assert_eq!(view.rows[0].results[1].status, "P");
-        assert_eq!(view.pmr_lookup.get("1").map(|entry| entry.phy_nam.as_str()), Some("PIN1"));
+        assert_eq!(view.pmr_count, 1);
+        // PMR contents (pin names) stay in the accumulator for future use —
+        // verify the parse populated them even though pages only ship a count.
+        {
+            let guard = manager.sessions.lock().expect("sessions lock");
+            let state = guard.get(&session.session_id).expect("session state");
+            assert_eq!(
+                state.test_items.pmr_lookup.get("1").map(|e| e.phy_nam.as_str()),
+                Some("PIN1")
+            );
+        }
         assert_eq!(view.status, ParseStatus::Complete);
     }
 
@@ -2813,8 +2990,8 @@ mod tests {
         assert!(completed, "parser should complete");
 
         let view = manager
-            .get_test_item_view(&session.session_id)
-            .expect("test item view");
+            .get_test_item_page(&session.session_id, 0, 100, 0, 100, &[], "")
+            .expect("test item page");
         assert_eq!(view.rows.len(), 2);
         for row in &view.rows {
             assert_eq!(row.sbin_num, "2");
@@ -2921,6 +3098,287 @@ mod tests {
     }
 
     #[test]
+    fn test_item_page_wire_shape_ships_pmr_count_and_no_per_cell_test_num() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("test-items-wire.stdf");
+        std::fs::write(&file_path, build_test_item_fixture()).expect("write fixture");
+
+        let manager = SessionManager::default();
+        let (tx, rx) = mpsc::channel();
+        let session = manager
+            .open_stdf(file_path.to_string_lossy().to_string(), move |event| {
+                let _ = tx.send(event);
+            })
+            .expect("open session");
+        let mut completed = false;
+        for _ in 0..200 {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(SessionEvent::Complete(_)) => {
+                    completed = true;
+                    break;
+                }
+                Ok(SessionEvent::Error(error)) => panic!("unexpected parse error: {error:?}"),
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert!(completed, "parser should complete");
+
+        let page = manager
+            .get_test_item_page(&session.session_id, 0, 50, 0, 50, &[], "")
+            .expect("page");
+        let json = serde_json::to_value(&page).expect("serialize page");
+
+        // The PMR map itself never crosses the IPC bridge — only its size does
+        // (the UI renders just a "N PMR" pill).
+        assert!(json.get("pmr_lookup").is_none(), "pmr_lookup should not be serialized");
+        assert_eq!(
+            json.get("pmr_count").and_then(|v| v.as_u64()),
+            Some(1),
+            "pmr_count should carry the lookup size"
+        );
+
+        // Cells align to `columns` by index, so a per-cell test_num is pure
+        // payload overhead (~20% of a page).
+        let cell = &json["rows"][0]["results"][0];
+        assert!(cell.get("value").is_some(), "cell keeps its value");
+        assert!(cell.get("test_num").is_none(), "cell test_num should not be serialized");
+    }
+
+    #[test]
+    fn records_pagination_is_stable_across_pages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("paging.stdf");
+        let mut bytes = Vec::new();
+        for _ in 0..130 {
+            bytes.extend(record(0, 10, &[2, 4]));
+        }
+        std::fs::write(&file_path, bytes).expect("write fixture");
+
+        let manager = SessionManager::default();
+        let (tx, rx) = mpsc::channel();
+        let session = manager
+            .open_stdf(file_path.to_string_lossy().to_string(), move |event| {
+                let _ = tx.send(event);
+            })
+            .expect("open session");
+        let mut completed = false;
+        for _ in 0..200 {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(SessionEvent::Complete(_)) => {
+                    completed = true;
+                    break;
+                }
+                Ok(SessionEvent::Error(error)) => panic!("unexpected parse error: {error:?}"),
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert!(completed, "parser should complete");
+        let sid = &session.session_id;
+
+        let p0 = manager.get_records(sid, "FAR", 0, 50).expect("page 0");
+        assert_eq!(p0.total, 130);
+        assert_eq!(p0.records.len(), 50);
+        assert_eq!(p0.records[0].index, 0);
+        assert_eq!(p0.records[49].index, 49);
+
+        let p2 = manager.get_records(sid, "FAR", 2, 50).expect("page 2");
+        assert_eq!(p2.total, 130);
+        assert_eq!(p2.records.len(), 30);
+        assert_eq!(p2.records[0].index, 100);
+        assert_eq!(p2.records[29].index, 129);
+
+        // Field detail resolves for a deep record id.
+        let fields = manager
+            .get_record_fields(sid, &p2.records[10].id)
+            .expect("fields");
+        assert_eq!(field_value(&fields_of(&fields), "STDF_VER"), "4");
+
+        // Unknown group → empty page with zero total.
+        let none = manager.get_records(sid, "PTR", 0, 50).expect("empty group");
+        assert_eq!(none.total, 0);
+        assert!(none.records.is_empty());
+
+        // Page past the end → empty but still reports the true total.
+        let past = manager.get_records(sid, "FAR", 9, 50).expect("past end");
+        assert_eq!(past.total, 130);
+        assert!(past.records.is_empty());
+    }
+
+    #[test]
+    fn records_pages_follow_group_order_when_types_interleave() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("interleaved.stdf");
+        std::fs::write(&file_path, build_test_item_fixture()).expect("write fixture");
+
+        let manager = SessionManager::default();
+        let (tx, rx) = mpsc::channel();
+        let session = manager
+            .open_stdf(file_path.to_string_lossy().to_string(), move |event| {
+                let _ = tx.send(event);
+            })
+            .expect("open session");
+        let mut completed = false;
+        for _ in 0..200 {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(SessionEvent::Complete(_)) => {
+                    completed = true;
+                    break;
+                }
+                Ok(SessionEvent::Error(error)) => panic!("unexpected parse error: {error:?}"),
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert!(completed, "parser should complete");
+        let sid = &session.session_id;
+
+        // PTRs sit interleaved between PIR/FTR/PRR records, so their global
+        // indices are not contiguous — pages must still walk them in parse
+        // order with correct global `index` stamps and resolvable ids.
+        let ptrs = manager.get_records(sid, "PTR", 0, 50).expect("ptr page");
+        assert!(ptrs.total >= 2, "fixture should hold at least two PTRs");
+        assert_eq!(ptrs.records.len(), ptrs.total);
+        let indices: Vec<usize> = ptrs.records.iter().map(|r| r.index).collect();
+        let mut sorted = indices.clone();
+        sorted.sort_unstable();
+        assert_eq!(indices, sorted, "parse order == ascending global index");
+        assert!(indices[0] > 0, "PTR is not the first record in the file");
+
+        let fields = manager
+            .get_record_fields(sid, &ptrs.records[ptrs.total - 1].id)
+            .expect("ptr fields");
+        assert!(!field_value(&fields_of(&fields), "TEST_NUM").is_empty());
+    }
+
+    /// Unwrap EnrichedField wrappers back to plain fields for assertions.
+    fn fields_of(fields: &[EnrichedField]) -> Vec<RecordField> {
+        fields.iter().map(|f| f.field.clone()).collect()
+    }
+
+    #[test]
+    fn opening_a_new_file_evicts_previous_sessions_and_their_databases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("evict.stdf");
+        std::fs::write(&file_path, build_test_item_fixture()).expect("write fixture");
+
+        let manager = SessionManager::default();
+        let open_and_wait = |manager: &SessionManager| {
+            let (tx, rx) = mpsc::channel();
+            let session = manager
+                .open_stdf(file_path.to_string_lossy().to_string(), move |event| {
+                    let _ = tx.send(event);
+                })
+                .expect("open session");
+            for _ in 0..200 {
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(SessionEvent::Complete(_)) => return session,
+                    Ok(SessionEvent::Error(error)) => panic!("unexpected parse error: {error:?}"),
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+            panic!("parser should complete");
+        };
+
+        let first = open_and_wait(&manager);
+        let first_db = temp_workspace_dir().join(format!("{}.db", first.session_id));
+        assert!(first_db.exists(), "first session should have an index db");
+
+        // The viewer shows one file at a time — a second open must evict the
+        // first session and delete its database, otherwise every opened file
+        // leaks a multi-GB index until the next app launch.
+        let second = open_and_wait(&manager);
+        assert!(
+            manager.get_session_snapshot(&first.session_id).is_err(),
+            "first session should be evicted"
+        );
+        assert!(!first_db.exists(), "evicted session's database should be deleted");
+        assert!(manager.get_session_snapshot(&second.session_id).is_ok());
+        let second_db = temp_workspace_dir().join(format!("{}.db", second.session_id));
+        assert!(second_db.exists(), "live session keeps its database");
+        // Leave no trace behind for other tests / the shared temp dir.
+        let _ = std::fs::remove_file(second_db);
+    }
+
+    #[test]
+    fn fields_blob_stores_values_only_for_spec_backed_records() {
+        // Parse one real FAR record so the blob comes from the production path.
+        let bytes = record(0, 10, &[2, 4]);
+        let mut cursor = Cursor::new(bytes);
+        let mut parsed = Vec::new();
+        crate::parser::parse_reader(
+            &mut cursor,
+            0,
+            |r| {
+                parsed.push(r);
+                true
+            },
+            |_, _| {},
+        )
+        .expect("parse fixture");
+        let rec = &parsed[0];
+        assert_eq!(rec.record_type, "FAR");
+
+        let blob = encode_fields_blob(rec);
+        let contains = |needle: &[u8]| blob.windows(needle.len()).any(|w| w == needle);
+        // Names/types/descriptions are static per record layout — storing them
+        // per record blew a 3.2GB file up into a 35GB index. Only values (and
+        // which layout to rebuild from) may hit the disk.
+        assert!(!contains("STDF 版本".as_bytes()), "description serialized into blob");
+        assert!(!contains(b"STDF_VER"), "field name serialized into blob");
+
+        let decoded = decode_fields_blob(&blob).expect("decode");
+        assert_eq!(decoded.len(), rec.fields.len());
+        assert_eq!(decoded[1].name, "STDF_VER");
+        assert_eq!(decoded[1].value, "4");
+        assert_eq!(decoded[1].description, "STDF 版本");
+        assert_eq!(decoded[0].name, "CPU_TYPE");
+        assert_eq!(decoded[0].value, "2");
+    }
+
+    #[test]
+    fn record_summaries_ship_no_display_summary_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("records-wire.stdf");
+        std::fs::write(&file_path, build_test_item_fixture()).expect("write fixture");
+
+        let manager = SessionManager::default();
+        let (tx, rx) = mpsc::channel();
+        let session = manager
+            .open_stdf(file_path.to_string_lossy().to_string(), move |event| {
+                let _ = tx.send(event);
+            })
+            .expect("open session");
+        let mut completed = false;
+        for _ in 0..200 {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(SessionEvent::Complete(_)) => {
+                    completed = true;
+                    break;
+                }
+                Ok(SessionEvent::Error(error)) => panic!("unexpected parse error: {error:?}"),
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert!(completed, "parser should complete");
+
+        let page = manager
+            .get_records(&session.session_id, "FAR", 0, 10)
+            .expect("records");
+        assert_eq!(page.total, 1);
+        // The UI never displays a record "summary" preview — building one per
+        // record (format! per field) and shipping it is parse-time waste.
+        let json = serde_json::to_value(&page).expect("serialize");
+        assert!(
+            json["records"][0].get("summary").is_none(),
+            "summary should not exist on the record wire format"
+        );
+    }
+
+    #[test]
     fn test_item_page_resolves_bin_name_pf_from_late_hbr_sbr() {
         // Simulate a part that closed (PRR) before its HBR/SBR were seen — the common
         // case, since bin records sit at the end of the file.
@@ -2999,7 +3457,6 @@ mod tests {
                 test_t: "1500".to_string(),
                 part_txt: String::new(),
                 results: vec![TestItemCell {
-                    test_num: 100,
                     value: "1.5".to_string(),
                     status: "P".to_string(),
                     record_position: None,
@@ -3183,13 +3640,21 @@ mod tests {
         assert_eq!(decoded.field_type, "U*1");
         assert_eq!(decoded.description, "CPU 类型");
 
-        let compact = encode_fields_blob(&parsed[0].fields);
+        let compact = encode_fields_blob(&parsed[0]);
         assert!(
             !compact.starts_with(b"["),
             "fields should be stored as compressed blob"
         );
         let restored = decode_fields_blob(&compact).expect("decode compact fields");
-        assert_eq!(restored, parsed[0].fields);
+        // Values-only storage: static metadata is rebuilt from the spec table;
+        // per-field byte offsets are not persisted (nothing displays them).
+        assert_eq!(restored.len(), parsed[0].fields.len());
+        for (restored, original) in restored.iter().zip(&parsed[0].fields) {
+            assert_eq!(restored.name, original.name);
+            assert_eq!(restored.field_type, original.field_type);
+            assert_eq!(restored.value, original.value);
+            assert_eq!(restored.description, original.description);
+        }
     }
 
     #[test]
@@ -3218,7 +3683,7 @@ mod tests {
     }
 
     #[test]
-    fn session_manager_batches_large_parse_events() {
+    fn session_manager_parses_large_files_with_bounded_events() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file_path = dir.path().join("large.stdf");
         let mut bytes = Vec::new();
@@ -3236,17 +3701,12 @@ mod tests {
             .expect("open session");
 
         let mut completed = false;
-        let mut batch_events = 0;
         let mut progress_events = 0;
         for _ in 0..200 {
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(SessionEvent::Complete(_)) => {
                     completed = true;
                     break;
-                }
-                Ok(SessionEvent::RecordBatch(batch)) => {
-                    batch_events += 1;
-                    assert!(batch.records.len() <= RECORD_BATCH_SIZE);
                 }
                 Ok(SessionEvent::Progress(_)) => {
                     progress_events += 1;
@@ -3265,10 +3725,6 @@ mod tests {
                 .expect("groups")[0]
                 .count,
             2_500
-        );
-        assert!(
-            batch_events <= 4,
-            "expected batched events, got {batch_events}"
         );
         assert!(
             progress_events <= 8,
@@ -3391,22 +3847,24 @@ mod tests {
         assert!(completed, "parser should complete");
 
         let started = std::time::Instant::now();
-        let view = manager
-            .get_test_item_view(&session.session_id)
-            .expect("test item view");
+        let page = manager
+            .get_test_item_page(&session.session_id, 0, 500, 0, 200, &[], "")
+            .expect("test item page");
         let elapsed = started.elapsed();
         eprintln!(
-            "test item view: {:?}, columns={}, rows={}, pmr={}",
+            "test item page: {:?}, columns={}/{}, rows={}/{}, pmr={}",
             elapsed,
-            view.columns.len(),
-            view.rows.len(),
-            view.pmr_lookup.len()
+            page.columns.len(),
+            page.total_columns,
+            page.rows.len(),
+            page.total_rows,
+            page.pmr_count
         );
-        assert!(elapsed < Duration::from_secs(3), "test-item snapshot took {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "test-item page took {elapsed:?}");
         assert!(
-            view.columns.len() <= 500,
-            "test-item snapshot should not force the UI to render {} columns at once",
-            view.columns.len()
+            page.columns.len() <= 500,
+            "a page should not force the UI to render {} columns at once",
+            page.columns.len()
         );
     }
 

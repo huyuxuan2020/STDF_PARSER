@@ -21,7 +21,6 @@ export interface RecordSummary {
   index: number;
   offset: number;
   length: number;
-  summary: string;
   status: "parsed" | "unknown" | "error";
 }
 
@@ -71,8 +70,9 @@ export interface TestItemColumn {
   pmr_indices: string[];
 }
 
+// One matrix cell. Cells are positional — `TestItemPartRow.results[i]` belongs
+// to `columns[i]` of the same page — so the cell carries no test identity.
 export interface TestItemCell {
-  test_num: number;
   value: string;
   status: string;
   // 0-based position of the source PTR/MPR/FTR record within its group,
@@ -96,23 +96,6 @@ export interface TestItemPartRow {
   results: TestItemCell[];
 }
 
-export interface TestItemPmrEntry {
-  phy_nam: string;
-  log_nam: string;
-  head_num: string;
-  site_num: string;
-}
-
-export interface TestItemViewSnapshot {
-  session_id: string;
-  columns: TestItemColumn[];
-  rows: TestItemPartRow[];
-  total_columns: number;
-  total_rows: number;
-  pmr_lookup: Record<string, TestItemPmrEntry>;
-  status: ParseStatus;
-}
-
 export interface TestItemColumnLite {
   key: string;
   record_type: string;
@@ -128,7 +111,9 @@ export interface TestItemPage {
   total_rows: number;
   row_offset: number;
   col_offset: number;
-  pmr_lookup: Record<string, TestItemPmrEntry>;
+  // Size of the session's PMR lookup — the UI only shows a count pill, so the
+  // map itself never crosses the IPC bridge.
+  pmr_count: number;
   has_bin_pf: boolean;
   status: ParseStatus;
 }
@@ -163,17 +148,11 @@ export interface ParseErrorEvent {
   offset?: number;
 }
 
-export interface RecordBatchEvent {
-  session_id: string;
-  records: RecordSummary[];
-}
-
 export interface StdfApi {
   openFile(): Promise<ParseSession | null>;
   openDroppedFile(path: string): Promise<ParseSession>;
   cancelParse(sessionId: string): Promise<void>;
   getSessionSnapshot(sessionId: string): Promise<SessionSnapshot>;
-  getTestItemView(sessionId: string): Promise<TestItemViewSnapshot>;
   getTestItemPage(
     sessionId: string,
     rowOffset: number,
@@ -202,7 +181,6 @@ export interface StdfApi {
     onProgress?: (progress: SearchProgress) => void
   ): Promise<SearchResultPage>;
   onProgress(handler: (progress: ParseProgress) => void): Promise<() => void>;
-  onRecordBatch(handler: (event: RecordBatchEvent) => void): Promise<() => void>;
   onSessionSnapshot(handler: (snapshot: SessionSnapshot) => void): Promise<() => void>;
   onNativeFileDrop(handler: (path: string) => void): Promise<() => void>;
   onParseComplete(handler: (sessionId: string) => void): Promise<() => void>;

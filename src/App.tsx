@@ -19,6 +19,7 @@ import {
   XCircle
 } from "lucide-react";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { computeMatrixWindow } from "./matrixWindow";
 import type {
   ParseErrorEvent,
   ParseProgress,
@@ -214,13 +215,15 @@ export default function App({ api = tauriApi }: AppProps) {
   const [tiHasBinPf, setTiHasBinPf] = useState(true);
   // Bumped whenever the column window / selection changes, to drop stale "load more" responses.
   const tiEpoch = useRef(0);
+  // Serialized [session, colPage, colSize, selection] of the loaded (or in-flight)
+  // window — re-entering the tab with an unchanged key skips the refetch.
+  const tiFetchKeyRef = useRef("");
   const [nav, setNav] = useState<NavSection>("summary");
   const [progress, setProgress] = useState<ParseProgress | null>(null);
   const [error, setError] = useState("");
   const [warning, setWarning] = useState("");
   const [isDragOver, setDragOver] = useState(false);
   const [theme, setTheme] = useState<Theme>(readInitialTheme);
-  const groupRefreshTimer = useRef<number | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const sessionStatusRef = useRef<ParseSession["status"] | null>(null);
 
@@ -256,7 +259,6 @@ export default function App({ api = tauriApi }: AppProps) {
   useEffect(() => {
     let disposed = false;
     let cleanupProgress: (() => void) | undefined;
-    let cleanupBatch: (() => void) | undefined;
     let cleanupSnapshot: (() => void) | undefined;
     let cleanupNativeDrop: (() => void) | undefined;
     let cleanupComplete: (() => void) | undefined;
@@ -274,17 +276,6 @@ export default function App({ api = tauriApi }: AppProps) {
       }
     }).then((cleanup) => {
       cleanupProgress = cleanup;
-    });
-    api.onRecordBatch((event) => {
-      if (
-        !disposed &&
-        sessionIdRef.current === event.session_id &&
-        sessionStatusRef.current === "complete"
-      ) {
-        scheduleGroupRefresh(event.session_id);
-      }
-    }).then((cleanup) => {
-      cleanupBatch = cleanup;
     });
     api.onSessionSnapshot((nextSnapshot) => {
       if (!disposed && sessionIdRef.current === nextSnapshot.session_id) {
@@ -321,15 +312,11 @@ export default function App({ api = tauriApi }: AppProps) {
     return () => {
       disposed = true;
       cleanupProgress?.();
-      cleanupBatch?.();
       cleanupSnapshot?.();
       cleanupNativeDrop?.();
       cleanupComplete?.();
       cleanupError?.();
       cleanupWarning?.();
-      if (groupRefreshTimer.current !== null) {
-        window.clearTimeout(groupRefreshTimer.current);
-      }
     };
   }, [api]);
 
@@ -468,11 +455,19 @@ export default function App({ api = tauriApi }: AppProps) {
   // Load the first batch of rows whenever the column window or filters change.
   // The test-item nav is only reachable after parsing completes, so we gate on
   // nav + session id rather than the (transiently re-emitted) session status.
+  // The fetch key remembers which window is already loaded (or in flight), so
+  // merely re-entering the tab reuses the cached rows instead of re-shipping a
+  // multi-MB page and remounting the table. A new session/window changes the key.
   useEffect(() => {
     const sessionId = session?.session_id;
     if (!sessionId || nav !== "test-items") {
       return;
     }
+    const fetchKey = JSON.stringify([sessionId, tiColPage, tiColSize, tiSelected]);
+    if (tiFetchKeyRef.current === fetchKey) {
+      return;
+    }
+    tiFetchKeyRef.current = fetchKey;
     let active = true;
     tiEpoch.current += 1;
     const epoch = tiEpoch.current;
@@ -492,19 +487,26 @@ export default function App({ api = tauriApi }: AppProps) {
         setTiColTotal(page.total_columns);
         setTiRows(page.rows);
         setTiRowTotal(page.total_rows);
-        setTiPmrCount(Object.keys(page.pmr_lookup).length);
+        setTiPmrCount(page.pmr_count);
         setTiHasBinPf(page.has_bin_pf);
         setTiLoaded(true);
+      })
+      .catch(() => {
+        // Allow a retry on the next tab entry instead of caching the failure.
+        if (tiFetchKeyRef.current === fetchKey) {
+          tiFetchKeyRef.current = "";
+        }
       });
     return () => {
       active = false;
     };
   }, [api, session?.session_id, nav, tiColPage, tiColSize, tiSelected]);
 
-  // Lazily load the full column list (identities only) for the filter dialog.
+  // Load the full column list (identities only) the first time the filter
+  // dialog opens — it can be several MB on big files, so not on tab entry.
   useEffect(() => {
     const sessionId = session?.session_id;
-    if (!sessionId || nav !== "test-items" || tiAllColumns.length > 0) {
+    if (!sessionId || !tiFilterOpen || tiAllColumns.length > 0) {
       return;
     }
     let active = true;
@@ -520,7 +522,7 @@ export default function App({ api = tauriApi }: AppProps) {
     return () => {
       active = false;
     };
-  }, [api, session?.session_id, nav, tiAllColumns.length]);
+  }, [api, session?.session_id, tiFilterOpen, tiAllColumns.length]);
 
   // Append the next batch of rows for infinite scroll. Tagged with the current
   // epoch so a response that arrives after a column/selection change is discarded.
@@ -576,16 +578,6 @@ export default function App({ api = tauriApi }: AppProps) {
     const nextGroups = await api.getRecordGroups(sessionId);
     setGroups(nextGroups);
     setSelectedGroup((current) => current || nextGroups[0]?.record_type || "");
-  }
-
-  function scheduleGroupRefresh(sessionId: string) {
-    if (groupRefreshTimer.current !== null) {
-      return;
-    }
-    groupRefreshTimer.current = window.setTimeout(() => {
-      groupRefreshTimer.current = null;
-      refreshGroups(sessionId);
-    }, 250);
   }
 
   function applySnapshot(nextSnapshot: SessionSnapshot) {
@@ -1537,31 +1529,38 @@ function pfCell(pf: string): ReactNode {
   return <span className={`font-semibold ${tone}`}>{pf}</span>;
 }
 
-// Per-part info columns shown on the left (no longer frozen — the whole table
-// scrolls freely). They auto-fit their content; only the text columns are capped.
+// Per-part info columns shown on the left (not frozen — the whole table scrolls
+// freely). Widths are fixed so the virtualized grid can position cells by pure
+// arithmetic; long values truncate with the full text in a hover tooltip.
 // Bin number / name / PF each get their own column so they are always present —
 // empty cells when the file's HBR/SBR don't carry that field.
 type LeftCol = {
   key: string;
   label: string;
+  width: number;
   get: (row: TestItemPartRow) => string;
   title?: (row: TestItemPartRow) => string | undefined;
   render?: (row: TestItemPartRow) => ReactNode;
-  maxWidth?: number;
 };
 
 const LEFT_COLS: LeftCol[] = [
-  { key: "part_id", label: "PartID", get: (r) => r.part_id || "-", title: (r) => r.part_id || undefined },
-  { key: "site", label: "Site", get: (r) => r.site_num || "-" },
-  { key: "sbin_num", label: "SBIN#", get: (r) => r.sbin_num || "-" },
-  { key: "sbin_name", label: "SBIN Name", get: (r) => r.sbin_name || "-", title: (r) => r.sbin_name || undefined, maxWidth: 160 },
-  { key: "sbin_pf", label: "SBIN PF", get: (r) => r.sbin_pf || "-", render: (r) => pfCell(r.sbin_pf) },
-  { key: "hbin_num", label: "HBIN#", get: (r) => r.hbin_num || "-" },
-  { key: "hbin_name", label: "HBIN Name", get: (r) => r.hbin_name || "-", title: (r) => r.hbin_name || undefined, maxWidth: 160 },
-  { key: "hbin_pf", label: "HBIN PF", get: (r) => r.hbin_pf || "-", render: (r) => pfCell(r.hbin_pf) },
-  { key: "test_t", label: "TEST_T", get: (r) => r.test_t || "-" },
-  { key: "part_txt", label: "PART_TXT", get: (r) => r.part_txt || "-", title: (r) => r.part_txt || undefined, maxWidth: 220 }
+  { key: "part_id", label: "PartID", width: 110, get: (r) => r.part_id || "-", title: (r) => r.part_id || undefined },
+  { key: "site", label: "Site", width: 56, get: (r) => r.site_num || "-" },
+  { key: "sbin_num", label: "SBIN#", width: 64, get: (r) => r.sbin_num || "-" },
+  { key: "sbin_name", label: "SBIN Name", width: 160, get: (r) => r.sbin_name || "-", title: (r) => r.sbin_name || undefined },
+  { key: "sbin_pf", label: "SBIN PF", width: 64, get: (r) => r.sbin_pf || "-", render: (r) => pfCell(r.sbin_pf) },
+  { key: "hbin_num", label: "HBIN#", width: 64, get: (r) => r.hbin_num || "-" },
+  { key: "hbin_name", label: "HBIN Name", width: 160, get: (r) => r.hbin_name || "-", title: (r) => r.hbin_name || undefined },
+  { key: "hbin_pf", label: "HBIN PF", width: 64, get: (r) => r.hbin_pf || "-", render: (r) => pfCell(r.hbin_pf) },
+  { key: "test_t", label: "TEST_T", width: 80, get: (r) => r.test_t || "-" },
+  { key: "part_txt", label: "PART_TXT", width: 200, get: (r) => r.part_txt || "-", title: (r) => r.part_txt || undefined }
 ];
+
+// Total width of the left info block — the horizontal "header offset" for
+// column windowing.
+const TI_LEFT_WIDTH = LEFT_COLS.reduce((sum, col) => sum + col.width, 0);
+// Fixed body-row height (px) — vertical windowing positions rows by this.
+const TI_ROW_H = 40;
 
 // The test-item header is transposed into one row per metadata field, so each of
 // Test Type / Num / Name / Low / High / Unit becomes its own row across all columns.
@@ -1653,13 +1652,75 @@ function TestItemsView({
     };
   }, [cellMenu]);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const theadRef = useRef<HTMLTableSectionElement>(null);
+  // Scroll/viewport metrics driving the render window. Scroll offsets are
+  // bucketized to one row / one column, so scrolling only re-renders when the
+  // window actually shifts a full row/column — no extra throttling needed.
+  const [view, setView] = useState({ top: 0, left: 0, height: 0, width: 0, headerH: 0 });
+
+  const measureView = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const next = {
+      top: Math.floor(el.scrollTop / TI_ROW_H) * TI_ROW_H,
+      left: Math.floor(el.scrollLeft / TEST_COL_WIDTH) * TEST_COL_WIDTH,
+      height: el.clientHeight,
+      width: el.clientWidth,
+      headerH: theadRef.current?.offsetHeight ?? 0
+    };
+    setView((current) =>
+      current.top === next.top &&
+      current.left === next.left &&
+      current.height === next.height &&
+      current.width === next.width &&
+      current.headerH === next.headerH
+        ? current
+        : next
+    );
+  };
+
+  // Capture the real viewport once the table mounts, and follow panel resizes.
+  useEffect(() => {
+    if (!loaded) return;
+    measureView();
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measureView);
+    observer.observe(el);
+    return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
+
   const handleScroll = () => {
+    measureView();
     const el = scrollRef.current;
     if (!el || !hasMore || loadingMore) return;
     if (el.scrollHeight - el.scrollTop - el.clientHeight < 320) {
       onLoadMore();
     }
   };
+
+  // Window of rows/columns actually mounted; the rest is spacer height/width.
+  const win = computeMatrixWindow({
+    scrollTop: view.top,
+    scrollLeft: view.left,
+    viewportHeight: view.height,
+    viewportWidth: view.width,
+    headerHeight: view.headerH,
+    leftWidth: TI_LEFT_WIDTH,
+    rowHeight: TI_ROW_H,
+    colWidth: TEST_COL_WIDTH,
+    rowCount: rows.length,
+    colCount: columns.length
+  });
+  const visibleRows = rows.slice(win.rowStart, win.rowEnd);
+  const visibleCols = columns.slice(win.colStart, win.colEnd);
+  const spacerTop = win.rowStart * TI_ROW_H;
+  const spacerBottom = (rows.length - win.rowEnd) * TI_ROW_H;
+  const spacerLead = win.colStart * TEST_COL_WIDTH;
+  const spacerTrail = (columns.length - win.colEnd) * TEST_COL_WIDTH;
+  // colgroup entries: left info cols + lead spacer + windowed value cols + trail spacer.
+  const fullColSpan = LEFT_COLS.length + visibleCols.length + 2;
 
   return (
     <section className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-[18px]" aria-label="测试项">
@@ -1739,18 +1800,33 @@ function TestItemsView({
             <div className="px-3 py-6 text-[13px] text-muted-foreground">没有匹配筛选条件的测试项或 PART。</div>
           ) : (
             <div ref={scrollRef} onScroll={handleScroll} className="min-h-0 overflow-auto">
+              {/* Virtualized matrix: only the scroll window of rows × columns is
+                  mounted; spacer cells/rows keep the scrollbar geometry identical
+                  to a full render. table-fixed + the colgroup make cell positions
+                  pure arithmetic, so windowing never shifts the layout. */}
               <table
-                className="w-max border-separate border-spacing-0 text-[13px] [&_td]:border-b [&_td]:border-r [&_td]:border-border/80 [&_th]:border-b [&_th]:border-r [&_th]:border-border [&_tbody_tr:hover]:bg-muted/30"
+                className="w-max table-fixed border-separate border-spacing-0 text-[13px] [&_td]:border-b [&_td]:border-r [&_td]:border-border/80 [&_th]:border-b [&_th]:border-r [&_th]:border-border [&_tbody_tr:hover]:bg-muted/30"
                 aria-label="测试项矩阵"
               >
-                <thead>
+                <colgroup>
+                  {LEFT_COLS.map((col) => (
+                    <col key={col.key} style={{ width: col.width }} />
+                  ))}
+                  <col style={{ width: spacerLead }} />
+                  {visibleCols.map((column) => (
+                    <col key={`${column.record_type}:${column.test_num}`} style={{ width: TEST_COL_WIDTH }} />
+                  ))}
+                  <col style={{ width: spacerTrail }} />
+                </colgroup>
+                <thead ref={theadRef}>
                   {/* One row per test-item metadata field (Type / Num / Name / Low / High / Unit). */}
                   {META_ROWS.map((meta) => (
                     <tr key={meta.key}>
                       <th colSpan={LEFT_COLS.length} className={HDR_LABEL}>
                         {meta.label}
                       </th>
-                      {columns.map((column) => {
+                      <th aria-hidden className="!border-0 p-0" />
+                      {visibleCols.map((column) => {
                         const value = meta.value(column);
                         // Test names are long; let that row wrap so the full name shows
                         // instead of being clipped. The other rows stay single-line.
@@ -1761,7 +1837,6 @@ function TestItemsView({
                             className={`${HDR_VALUE} font-normal ${isName ? "text-left" : "text-center"} ${
                               meta.key === "type" ? "text-primary" : ""
                             }`}
-                            style={{ width: TEST_COL_WIDTH, minWidth: TEST_COL_WIDTH, maxWidth: TEST_COL_WIDTH }}
                           >
                             <span
                               className={`${
@@ -1776,41 +1851,43 @@ function TestItemsView({
                           </th>
                         );
                       })}
+                      <th aria-hidden className="!border-0 p-0" />
                     </tr>
                   ))}
                   {/* Header row for the per-part info columns. */}
                   <tr>
                     {LEFT_COLS.map((col) => (
-                      <th
-                        key={col.key}
-                        className={`${HDR_COL} whitespace-nowrap`}
-                        style={col.maxWidth ? { maxWidth: col.maxWidth } : undefined}
-                      >
+                      <th key={col.key} className={`${HDR_COL} overflow-hidden whitespace-nowrap`}>
                         {col.label}
                       </th>
                     ))}
-                    {columns.length > 0 && <th colSpan={columns.length} className="bg-muted" />}
+                    <th colSpan={visibleCols.length + 2} className="bg-muted" />
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map((row) => (
-                    <tr key={`${row.part_id}:${row.site_num}`}>
+                  {spacerTop > 0 && (
+                    <tr aria-hidden style={{ height: spacerTop }}>
+                      <td colSpan={fullColSpan} className="!border-0 p-0" />
+                    </tr>
+                  )}
+                  {visibleRows.map((row) => (
+                    <tr key={`${row.part_id}:${row.site_num}`} style={{ height: TI_ROW_H }}>
                       {LEFT_COLS.map((col) => (
                         <td
                           key={col.key}
-                          className={`${TD} ${MONO} align-middle whitespace-nowrap`}
-                          style={col.maxWidth ? { maxWidth: col.maxWidth } : undefined}
+                          className={`${MONO} overflow-hidden whitespace-nowrap px-2.5 py-0 text-left align-middle text-foreground`}
                           title={col.title?.(row)}
                         >
                           {col.render ? (
                             col.render(row)
                           ) : (
-                            <span className={`block ${col.maxWidth ? "truncate" : ""}`}>{col.get(row)}</span>
+                            <span className="block truncate">{col.get(row)}</span>
                           )}
                         </td>
                       ))}
-                      {columns.map((column, index) => {
-                        const cell = row.results[index];
+                      <td aria-hidden className="!border-0 p-0" />
+                      {visibleCols.map((column, index) => {
+                        const cell = row.results[win.colStart + index];
                         const status = cell?.status;
                         // FTR carries a pass/fail flag rather than a measured value,
                         // so show the verdict; PTR/MPR show the scaled result(s).
@@ -1827,8 +1904,7 @@ function TestItemsView({
                         return (
                           <td
                             key={`${row.part_id}:${row.site_num}:${column.record_type}:${column.test_num}`}
-                            className={`${TD} align-middle text-center ${status === "F" ? "bg-danger-soft" : ""}`}
-                            style={{ width: TEST_COL_WIDTH, minWidth: TEST_COL_WIDTH, maxWidth: TEST_COL_WIDTH }}
+                            className={`overflow-hidden px-2 py-0 text-center align-middle ${status === "F" ? "bg-danger-soft" : ""}`}
                             onContextMenu={(e) => {
                               e.preventDefault();
                               setCellMenu({
@@ -1849,8 +1925,14 @@ function TestItemsView({
                           </td>
                         );
                       })}
+                      <td aria-hidden className="!border-0 p-0" />
                     </tr>
                   ))}
+                  {spacerBottom > 0 && (
+                    <tr aria-hidden style={{ height: spacerBottom }}>
+                      <td colSpan={fullColSpan} className="!border-0 p-0" />
+                    </tr>
+                  )}
                 </tbody>
               </table>
               {hasMore && (

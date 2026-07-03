@@ -6,7 +6,6 @@ import type {
   RecordSummaryPage,
   SearchResultPage,
   SessionSnapshot,
-  TestItemViewSnapshot,
   TestItemPage,
   StdfApi
 } from "../types";
@@ -57,7 +56,6 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
         index: 0,
         offset: 0,
         length: 6,
-        summary: "CPU_TYPE=2, STDF_VER=4",
         status: "parsed"
       }
     ]
@@ -74,7 +72,6 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
         index: 1,
         offset: 6,
         length: 120,
-        summary: "LOT_ID=V29F7, NODE_NAM=T1058",
         status: "parsed"
       }
     ]
@@ -139,7 +136,7 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
     status: "running"
   };
 
-  const testItemView: TestItemViewSnapshot = {
+  const testItemPage: TestItemPage = {
     session_id: "session-1",
     columns: [
       {
@@ -176,30 +173,18 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
         test_t: "50",
         part_txt: "demo part",
         results: [
-          { test_num: 100, value: "1.05", status: "P" },
-          { test_num: 220, value: "0b00000000", status: "P" }
+          { value: "1.05", status: "P" },
+          { value: "0b00000000", status: "P" }
         ]
       }
     ],
     total_columns: 2,
     total_rows: 1,
-    pmr_lookup: {
-      "1": { phy_nam: "PIN1", log_nam: "L1", head_num: "1", site_num: "1" }
-    },
-    status: "complete"
-  };
-
-  const testItemPage: TestItemPage = {
-    session_id: testItemView.session_id,
-    columns: testItemView.columns,
-    rows: testItemView.rows,
-    total_columns: testItemView.total_columns,
-    total_rows: testItemView.total_rows,
     row_offset: 0,
     col_offset: 0,
-    pmr_lookup: testItemView.pmr_lookup,
+    pmr_count: 1,
     has_bin_pf: true,
-    status: testItemView.status
+    status: "complete"
   };
 
   const listeners = {
@@ -213,10 +198,9 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
     openDroppedFile: async () => sessions[0],
     cancelParse: async () => undefined,
     getSessionSnapshot: async () => snapshot,
-    getTestItemView: async () => testItemView,
     getTestItemPage: async () => testItemPage,
     getTestItemColumns: async () =>
-      testItemView.columns.map((column) => ({
+      testItemPage.columns.map((column) => ({
         key: `${column.record_type}:${column.test_num}`,
         record_type: column.record_type,
         test_num: column.test_num,
@@ -239,7 +223,6 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
         listeners.progress = listeners.progress.filter((item) => item !== handler);
       };
     },
-    onRecordBatch: async () => () => undefined,
     onSessionSnapshot: async (handler) => {
       listeners.snapshot.push(handler);
       return () => {

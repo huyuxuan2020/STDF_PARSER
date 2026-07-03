@@ -6,14 +6,12 @@ import type {
   ParseErrorEvent,
   ParseProgress,
   ParseSession,
-  RecordBatchEvent,
   RecordField,
   RecordGroup,
   RecordSummaryPage,
   SearchProgress,
   SearchResultPage,
   SessionSnapshot,
-  TestItemViewSnapshot,
   TestItemPage,
   TestItemColumnLite,
   StdfApi
@@ -41,10 +39,6 @@ export const tauriApi: StdfApi = {
 
   getSessionSnapshot(sessionId: string) {
     return invoke<SessionSnapshot>("get_session_snapshot", { sessionId });
-  },
-
-  getTestItemView(sessionId: string) {
-    return invoke<TestItemViewSnapshot>("get_test_item_view", { sessionId });
   },
 
   getTestItemPage(
@@ -124,13 +118,6 @@ export const tauriApi: StdfApi = {
       return () => undefined;
     }
     return listen<ParseProgress>("parse-progress", (event) => handler(event.payload));
-  },
-
-  async onRecordBatch(handler: (event: RecordBatchEvent) => void) {
-    if (!isTauriRuntime()) {
-      return () => undefined;
-    }
-    return listen<RecordBatchEvent>("record-batch", (event) => handler(event.payload));
   },
 
   async onSessionSnapshot(handler: (snapshot: SessionSnapshot) => void) {
