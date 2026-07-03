@@ -1556,12 +1556,9 @@ const LEFT_COLS: LeftCol[] = [
   { key: "part_txt", label: "PART_TXT", width: 200, get: (r) => r.part_txt || "-", title: (r) => r.part_txt || undefined }
 ];
 
-// Width of the meta-label lane sitting between the part-info block and the
-// value grid ("Test Type" / "Low Limit" / ... labels).
-const TI_GUTTER_W = 88;
-// Total width left of the value grid — the horizontal "header offset" for
-// column windowing (part-info columns + the label lane).
-const TI_LEFT_WIDTH = LEFT_COLS.reduce((sum, col) => sum + col.width, 0) + TI_GUTTER_W;
+// Total width of the part-info block — the horizontal "header offset" for
+// column windowing.
+const TI_LEFT_WIDTH = LEFT_COLS.reduce((sum, col) => sum + col.width, 0);
 // Fixed body-row height (px) — vertical windowing positions rows by this.
 const TI_ROW_H = 40;
 // Auto-fit bounds for value columns.
@@ -1603,23 +1600,15 @@ function fitColumnWidth(column: TestItemColumn, sample: TestItemPartRow[], index
   return Math.min(TI_COL_MAX, Math.max(TI_COL_MIN, Math.ceil(w) + 20));
 }
 
-// The test-item header is transposed into one row per metadata field, so each of
-// Test Type / Num / Name / Low / High / Unit becomes its own row across all columns.
-const META_ROWS: { key: string; label: string; value: (column: TestItemColumn) => string; mono?: boolean }[] = [
-  { key: "type", label: "Test Type", value: (c) => c.record_type },
-  { key: "num", label: "Test Num", value: (c) => String(c.test_num), mono: true },
-  { key: "name", label: "Test Name", value: (c) => c.test_name || "-" },
-  { key: "low", label: "Low Limit", value: (c) => c.low_limit || "-", mono: true },
-  { key: "high", label: "High Limit", value: (c) => c.high_limit || "-", mono: true },
-  { key: "unit", label: "Unit", value: (c) => (c.record_type === "FTR" ? "P/F" : c.unit || "-") }
-];
+// Compact "type num · low~high unit" line under each column's name in the
+// header. The full values live in the click-to-open detail card.
+function columnMetaLine(column: TestItemColumn): string {
+  if (column.record_type === "FTR") return "P/F";
+  const low = column.low_limit || "-";
+  const high = column.high_limit || "-";
+  return `${low} ~ ${high} ${column.unit || ""}`.trim();
+}
 
-// Non-sticky header cell tokens (borders come from the table-level selectors).
-// The meta labels sit on the card background (not a gray slab) so the top-left
-// block reads as row labels for the header matrix, not a dead area.
-const HDR_LABEL = "px-2.5 py-1.5 text-right align-middle text-[11px] font-medium text-muted-foreground bg-card";
-const HDR_VALUE =
-  "px-2 py-1 align-middle text-[11px] text-foreground bg-card cursor-pointer transition-colors hover:bg-primary-soft/60";
 const TEST_COL_WIDTH = 120;
 
 function TestItemsView({
@@ -1788,9 +1777,8 @@ function TestItemsView({
   const spacerBottom = (rows.length - win.rowEnd) * TI_ROW_H;
   const spacerLead = colOffsets[win.colStart] ?? 0;
   const spacerTrail = (colOffsets[columns.length] ?? 0) - (colOffsets[win.colEnd] ?? 0);
-  // colgroup entries: left info cols + label lane + lead spacer + windowed
-  // value cols + trail spacer.
-  const fullColSpan = LEFT_COLS.length + 1 + visibleCols.length + 2;
+  // colgroup entries: left info cols + lead spacer + windowed value cols + trail spacer.
+  const fullColSpan = LEFT_COLS.length + visibleCols.length + 2;
 
   return (
     <section className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-[18px]" aria-label="测试项">
@@ -1882,7 +1870,6 @@ function TestItemsView({
                   {LEFT_COLS.map((col) => (
                     <col key={col.key} style={{ width: col.width }} />
                   ))}
-                  <col style={{ width: TI_GUTTER_W }} />
                   <col style={{ width: spacerLead }} />
                   {visibleCols.map((column, index) => (
                     <col
@@ -1893,54 +1880,37 @@ function TestItemsView({
                   <col style={{ width: spacerTrail }} />
                 </colgroup>
                 <thead ref={theadRef}>
-                  {/* One row per test-item metadata field (Type / Num / Name / Low /
-                      High / Unit). The part-info column headers span all meta rows
-                      vertically (bottom-aligned), so the top-left region holds real
-                      headers instead of a dead slab; the meta labels sit in a narrow
-                      lane right against the value grid. */}
-                  {META_ROWS.map((meta, metaIndex) => (
-                    <tr key={meta.key}>
-                      {metaIndex === 0 &&
-                        LEFT_COLS.map((col) => (
-                          <th
-                            key={col.key}
-                            rowSpan={META_ROWS.length}
-                            className="overflow-hidden whitespace-nowrap bg-card px-2.5 pb-2 text-left align-bottom text-[11px] font-semibold text-foreground"
-                          >
-                            {col.label}
-                          </th>
-                        ))}
-                      <th className={HDR_LABEL}>{meta.label}</th>
-                      <th aria-hidden className="!border-0 p-0" />
-                      {visibleCols.map((column) => {
-                        const value = meta.value(column);
-                        // Test names are long; let that row wrap so the full name shows
-                        // instead of being clipped. The other rows stay single-line.
-                        const isName = meta.key === "name";
-                        return (
-                          <th
-                            key={`${meta.key}:${column.record_type}:${column.test_num}`}
-                            className={`${HDR_VALUE} font-normal ${isName ? "text-left" : "text-center"} ${
-                              meta.key === "type" ? "text-primary" : ""
-                            }`}
-                            title="点击查看完整测试项信息"
-                            onClick={(e) => setColInfo({ x: e.clientX, y: e.clientY, column })}
-                          >
-                            <span
-                              className={`${
-                                isName
-                                  ? "line-clamp-2 [overflow-wrap:anywhere]"
-                                  : "block truncate"
-                              } ${meta.mono ? "font-mono tabular-nums" : ""}`}
-                            >
-                              {value}
-                            </span>
-                          </th>
-                        );
-                      })}
-                      <th aria-hidden className="!border-0 p-0" />
-                    </tr>
-                  ))}
+                  {/* Single unified header row: part-info labels on the left; each
+                      test column shows its name plus a compact "type num · limits"
+                      line. Full metadata opens in the click-to-open detail card. */}
+                  <tr>
+                    {LEFT_COLS.map((col) => (
+                      <th
+                        key={col.key}
+                        className="overflow-hidden whitespace-nowrap bg-muted px-2.5 py-2 text-left align-bottom text-[11px] font-semibold text-foreground"
+                      >
+                        {col.label}
+                      </th>
+                    ))}
+                    <th aria-hidden className="!border-r-0 bg-muted p-0" />
+                    {visibleCols.map((column) => (
+                      <th
+                        key={`${column.record_type}:${column.test_num}`}
+                        className="cursor-pointer bg-muted px-2 py-1.5 text-left align-bottom transition-colors hover:bg-primary-soft/60"
+                        title="点击查看完整测试项信息"
+                        onClick={(e) => setColInfo({ x: e.clientX, y: e.clientY, column })}
+                      >
+                        <span className="line-clamp-2 text-[11px] font-medium leading-snug text-foreground [overflow-wrap:anywhere]">
+                          {column.test_name || `#${column.test_num}`}
+                        </span>
+                        <span className="mt-0.5 block truncate font-mono text-[10px] tabular-nums text-muted-foreground">
+                          <span className="font-semibold text-primary">{column.record_type}</span>{" "}
+                          {column.test_num} · {columnMetaLine(column)}
+                        </span>
+                      </th>
+                    ))}
+                    <th aria-hidden className="!border-r-0 bg-muted p-0" />
+                  </tr>
                 </thead>
                 <tbody>
                   {spacerTop > 0 && (
@@ -1963,8 +1933,6 @@ function TestItemsView({
                           )}
                         </td>
                       ))}
-                      {/* Label-lane gutter: keeps 固定信息 and 数据矩阵 visually apart. */}
-                      <td aria-hidden className="!border-b-0 bg-muted/20 p-0" />
                       <td aria-hidden className="!border-0 p-0" />
                       {visibleCols.map((column, index) => {
                         const cell = row.results[win.colStart + index];
