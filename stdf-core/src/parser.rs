@@ -593,6 +593,16 @@ fn record_name(rec_typ: u8, rec_sub: u8) -> &'static str {
     }
 }
 
+/// Decode a DTR TEXT_DAT payload (Cn: length byte + chars) with the same
+/// tolerance as `FieldCursor::cn` — lossy UTF-8, length clamped to the payload.
+pub fn decode_dtr_text(payload: &[u8]) -> String {
+    let Some((&len, rest)) = payload.split_first() else {
+        return String::new();
+    };
+    let end = (len as usize).min(rest.len());
+    String::from_utf8_lossy(&rest[..end]).to_string()
+}
+
 fn hex_preview(bytes: &[u8]) -> String {
     bytes
         .iter()

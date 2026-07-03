@@ -1,7 +1,7 @@
 use stdf_core::parser::{ParseErrorEvent, ParseProgress};
 use stdf_core::sessions::{
-    BinSummary, EnrichedField, RecordGroup, RecordSummaryPage, SearchProgress, SearchResultPage,
-    SessionManager, SessionSnapshot, TestItemColumnLite, TestItemPage,
+    BinSummary, DtrParseResult, EnrichedField, RecordGroup, RecordSummaryPage, SearchProgress,
+    SearchResultPage, SessionManager, SessionSnapshot, TestItemColumnLite, TestItemPage,
 };
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, State};
@@ -95,6 +95,25 @@ fn export_test_item_csv(
     manager.export_test_item_csv(&session_id, &path)
 }
 
+// `(async)`: both re-read the source file / copy a potentially large txt, so
+// keep them off the WebKit main thread like the other IO-heavy commands.
+#[tauri::command(async)]
+fn parse_dtr_text(
+    session_id: String,
+    manager: State<'_, SessionManager>,
+) -> Result<DtrParseResult, String> {
+    manager.parse_dtr_text(&session_id)
+}
+
+#[tauri::command(async)]
+fn save_dtr_text(
+    session_id: String,
+    path: String,
+    manager: State<'_, SessionManager>,
+) -> Result<(), String> {
+    manager.save_dtr_text(&session_id, &path)
+}
+
 #[tauri::command(async)]
 fn get_record_groups(
     session_id: String,
@@ -165,6 +184,8 @@ pub fn run() {
             get_test_item_columns,
             get_bin_summary,
             export_test_item_csv,
+            parse_dtr_text,
+            save_dtr_text,
             get_record_groups,
             get_records,
             get_record_fields,

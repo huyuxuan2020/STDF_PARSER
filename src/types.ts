@@ -137,6 +137,13 @@ export interface TestItemPage {
   status: ParseStatus;
 }
 
+// Result of the on-demand DTR text extraction: the backend staged a txt with
+// `count` lines (one per DTR record); saveDtrText copies it to a user path.
+export interface DtrParseResult {
+  session_id: string;
+  count: number;
+}
+
 export interface SearchResult {
   record: RecordSummary;
   field: RecordField;
@@ -185,6 +192,9 @@ export interface StdfApi {
   getBinSummary(sessionId: string): Promise<BinSummary>;
   saveCsvDialog(defaultName: string): Promise<string | null>;
   exportTestItemCsv(sessionId: string, path: string): Promise<void>;
+  parseDtrText(sessionId: string): Promise<DtrParseResult>;
+  saveTxtDialog(defaultName: string): Promise<string | null>;
+  saveDtrText(sessionId: string, path: string): Promise<void>;
   getRecordGroups(sessionId: string): Promise<RecordGroup[]>;
   getRecords(
     sessionId: string,

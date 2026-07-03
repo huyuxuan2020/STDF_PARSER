@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::{
     collections::HashMap,
     fs::File,
-    io::{self, BufReader, Read, Seek, SeekFrom},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -360,6 +360,14 @@ pub struct SearchProgress {
     pub total: usize,
 }
 
+/// Result of an on-demand DTR text extraction: how many DTR records were
+/// written (one line each) to the session's temp txt, ready for save_dtr_text.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DtrParseResult {
+    pub session_id: String,
+    pub count: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Progress(ParseProgress),
@@ -453,9 +461,10 @@ impl SessionManager {
         // space is reclaimed when the last handle closes.
         {
             let mut guard = self.sessions.lock().map_err(|_| "session lock poisoned")?;
-            for (_, old) in guard.drain() {
+            for (old_id, old) in guard.drain() {
                 old.cancel_flag.store(true, Ordering::SeqCst);
                 let _ = std::fs::remove_file(&old.db_path);
+                let _ = std::fs::remove_file(dtr_text_path(&old_id));
             }
         }
         self.sessions
@@ -1094,12 +1103,113 @@ impl SessionManager {
         };
         std::fs::write(path, csv).map_err(|error| format!("写入 CSV 失败: {error}"))
     }
+
+    /// Re-scan the session's source file (plain / gz / zip alike) and extract
+    /// every DTR TEXT_DAT into a temp txt, one line per record in file order.
+    /// The txt never crosses the IPC bridge — save_dtr_text copies it to the
+    /// user-chosen destination afterwards.
+    pub fn parse_dtr_text(&self, session_id: &str) -> Result<DtrParseResult, String> {
+        let (file_path, file_size) = {
+            let guard = self.sessions.lock().map_err(|_| "session lock poisoned")?;
+            let state = guard
+                .get(session_id)
+                .ok_or_else(|| "解析会话不存在".to_string())?;
+            (state.session.file_path.clone(), state.session.file_size)
+        };
+        let txt_path = dtr_text_path(session_id);
+        let scan = File::create(&txt_path)
+            .map_err(|error| format!("写入 DTR 文本失败: {error}"))
+            .and_then(|file| {
+                let mut writer = BufWriter::new(file);
+                let count = with_input_reader(Path::new(&file_path), file_size, |reader, _| {
+                    extract_dtr_text(reader, &mut writer)
+                })??;
+                writer
+                    .flush()
+                    .map_err(|error| format!("写入 DTR 文本失败: {error}"))?;
+                Ok(count)
+            });
+        match scan {
+            Ok(count) => Ok(DtrParseResult {
+                session_id: session_id.to_string(),
+                count,
+            }),
+            Err(error) => {
+                // Never leave a partial txt behind — save_dtr_text treats its
+                // existence as "parse succeeded".
+                let _ = std::fs::remove_file(&txt_path);
+                Err(error)
+            }
+        }
+    }
+
+    /// Copy the session's parsed DTR txt to `path`. Errors if parse_dtr_text
+    /// has not succeeded for this session yet.
+    pub fn save_dtr_text(&self, session_id: &str, path: &str) -> Result<(), String> {
+        {
+            let guard = self.sessions.lock().map_err(|_| "session lock poisoned")?;
+            if !guard.contains_key(session_id) {
+                return Err("解析会话不存在".to_string());
+            }
+        }
+        let txt_path = dtr_text_path(session_id);
+        if !txt_path.exists() {
+            return Err("DTR 文本尚未解析，请先解析".to_string());
+        }
+        std::fs::copy(&txt_path, path)
+            .map(|_| ())
+            .map_err(|error| format!("写入 TXT 失败: {error}"))
+    }
+}
+
+/// Walk record headers, skipping every payload except DTR (50,30), whose
+/// TEXT_DAT becomes one line of `writer`. A truncated tail record ends the
+/// scan quietly — same tolerance as the main parse, which keeps what it read.
+fn extract_dtr_text(reader: &mut dyn Read, writer: &mut impl Write) -> Result<usize, String> {
+    let mut reader = BufReader::with_capacity(PARSE_BUFFER_SIZE, reader);
+    let mut count = 0_usize;
+    loop {
+        let mut header = [0_u8; 4];
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(format!("读取 STDF 失败: {error}")),
+        }
+        let length = u64::from(u16::from_le_bytes([header[0], header[1]]));
+        if header[2] == 50 && header[3] == 30 {
+            let mut payload = vec![0_u8; length as usize];
+            match reader.read_exact(&mut payload) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(format!("读取 STDF 失败: {error}")),
+            }
+            let text = crate::parser::decode_dtr_text(&payload);
+            writer
+                .write_all(text.as_bytes())
+                .and_then(|_| writer.write_all(b"\n"))
+                .map_err(|error| format!("写入 DTR 文本失败: {error}"))?;
+            count += 1;
+        } else {
+            let skipped = io::copy(&mut (&mut reader).take(length), &mut io::sink())
+                .map_err(|error| format!("读取 STDF 失败: {error}"))?;
+            if skipped < length {
+                break;
+            }
+        }
+    }
+    Ok(count)
 }
 
 /// Dedicated temp directory for decompressed files and per-session indexes.
 /// Wiped on app startup, so leftovers from a crash never accumulate.
 pub fn temp_workspace_dir() -> PathBuf {
     std::env::temp_dir().join("stdf-parser")
+}
+
+/// Where parse_dtr_text stages a session's extracted DTR text before the user
+/// picks a destination. Lives in the startup-wiped temp workspace.
+fn dtr_text_path(session_id: &str) -> PathBuf {
+    temp_workspace_dir().join(format!("{session_id}.dtr.txt"))
 }
 
 /// Open a fresh per-session SQLite database. It is a rebuildable temp index, so
@@ -3913,6 +4023,123 @@ mod tests {
             decompressed_temp_files(),
             "zip parsing should not create a decompressed stdf temp file"
         );
+    }
+
+    #[test]
+    fn parses_dtr_text_and_saves_txt_for_plain_and_zip_inputs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stdf_path = dir.path().join("dtr-fixture.std");
+        let zip_path = dir.path().join("dtr-fixture.std.zip");
+
+        let mut bytes = Vec::new();
+        bytes.extend(record(0, 10, &[2, 4]));
+        bytes.extend(record(50, 30, &cn("first line")));
+        // A PTR between the DTRs so the scan has non-DTR payloads to skip over.
+        let mut ptr = Vec::new();
+        ptr.extend_from_slice(&202_u32.to_le_bytes());
+        ptr.extend_from_slice(&[1, 1, 0, 0]);
+        ptr.extend_from_slice(&1.8_f32.to_le_bytes());
+        ptr.extend(cn("VDD_STREAM"));
+        ptr.extend(cn(""));
+        bytes.extend(record(15, 10, &ptr));
+        bytes.extend(record(50, 30, &cn("良率 100%")));
+        bytes.extend(record(50, 30, &cn("")));
+        bytes.extend(record(50, 30, &[2, 0x41, 0xFF]));
+        // Length byte claims 10 chars but only 2 follow — clamp like cn() does.
+        bytes.extend(record(50, 30, &[10, b'h', b'i']));
+        std::fs::write(&stdf_path, &bytes).expect("write stdf");
+
+        {
+            let file = File::create(&zip_path).expect("create zip");
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("dtr-fixture.std", options)
+                .expect("start zip entry");
+            std::io::Write::write_all(&mut zip, &bytes).expect("write zip entry");
+            zip.finish().expect("finish zip");
+        }
+
+        // One text line per DTR in file order; empty text stays an empty line,
+        // and the invalid 0xFF byte decodes lossily instead of failing.
+        let expected = "first line\n良率 100%\n\nA\u{FFFD}\nhi\n";
+
+        for (label, path) in [("plain", &stdf_path), ("zip", &zip_path)] {
+            let manager = SessionManager::default();
+            let (tx, rx) = mpsc::channel();
+            let session = manager
+                .open_stdf(path.to_string_lossy().to_string(), move |event| {
+                    let _ = tx.send(event);
+                })
+                .expect("open session");
+            let mut completed = false;
+            for _ in 0..100 {
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(SessionEvent::Complete(_)) => {
+                        completed = true;
+                        break;
+                    }
+                    Ok(SessionEvent::Error(error)) => panic!("unexpected parse error: {error:?}"),
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+            assert!(completed, "{label}: parser should complete");
+
+            let result = manager
+                .parse_dtr_text(&session.session_id)
+                .expect("parse dtr text");
+            assert_eq!(result.session_id, session.session_id, "{label}");
+            assert_eq!(result.count, 5, "{label}: DTR record count");
+
+            let dest = dir.path().join(format!("dtr-out-{label}.txt"));
+            manager
+                .save_dtr_text(&session.session_id, &dest.to_string_lossy())
+                .expect("save dtr text");
+            assert_eq!(
+                std::fs::read_to_string(&dest).expect("read saved txt"),
+                expected,
+                "{label}: saved txt content"
+            );
+        }
+    }
+
+    #[test]
+    fn save_dtr_text_requires_a_successful_parse_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stdf_path = dir.path().join("no-dtr.std");
+        let mut bytes = Vec::new();
+        bytes.extend(record(0, 10, &[2, 4]));
+        std::fs::write(&stdf_path, &bytes).expect("write stdf");
+
+        let manager = SessionManager::default();
+        let (tx, rx) = mpsc::channel();
+        let session = manager
+            .open_stdf(stdf_path.to_string_lossy().to_string(), move |event| {
+                let _ = tx.send(event);
+            })
+            .expect("open session");
+        for _ in 0..100 {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(SessionEvent::Complete(_)) => break,
+                Ok(SessionEvent::Error(error)) => panic!("unexpected parse error: {error:?}"),
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+
+        let dest = dir.path().join("never-parsed.txt");
+        let error = manager
+            .save_dtr_text(&session.session_id, &dest.to_string_lossy())
+            .expect_err("save before parse should fail");
+        assert!(error.contains("解析"), "error should mention parsing: {error}");
+        assert!(!dest.exists(), "no txt should be written before a parse");
+
+        // A file without any DTR records still parses, with a zero count.
+        let result = manager
+            .parse_dtr_text(&session.session_id)
+            .expect("parse dtr text");
+        assert_eq!(result.count, 0);
     }
 
     #[test]

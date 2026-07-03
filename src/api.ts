@@ -4,6 +4,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   BinSummary,
+  DtrParseResult,
   ParseErrorEvent,
   ParseProgress,
   ParseSession,
@@ -79,6 +80,21 @@ export const tauriApi: StdfApi = {
 
   exportTestItemCsv(sessionId: string, path: string) {
     return invoke<void>("export_test_item_csv", { sessionId, path });
+  },
+
+  parseDtrText(sessionId: string) {
+    return invoke<DtrParseResult>("parse_dtr_text", { sessionId });
+  },
+
+  saveTxtDialog(defaultName: string) {
+    return save({
+      defaultPath: defaultName,
+      filters: [{ name: "TXT", extensions: ["txt"] }]
+    });
+  },
+
+  saveDtrText(sessionId: string, path: string) {
+    return invoke<void>("save_dtr_text", { sessionId, path });
   },
 
   getRecordGroups(sessionId: string) {

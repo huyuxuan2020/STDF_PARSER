@@ -1,4 +1,5 @@
 import type {
+  ParseErrorEvent,
   ParseProgress,
   ParseSession,
   RecordField,
@@ -14,6 +15,7 @@ export type MockApi = StdfApi & {
   emitProgress(event: ParseProgress): void;
   emitSnapshot(event: SessionSnapshot): void;
   emitComplete(sessionId: string): void;
+  emitError(event: ParseErrorEvent): void;
 };
 
 export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
@@ -42,7 +44,8 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
   const groups: RecordGroup[] = [
     { record_type: "FAR", count: 1 },
     { record_type: "MIR", count: 1 },
-    { record_type: "PTR", count: 2 }
+    { record_type: "PTR", count: 2 },
+    { record_type: "DTR", count: 3 }
   ];
 
   const records: RecordSummaryPage = {
@@ -75,6 +78,22 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
         status: "parsed"
       }
     ]
+  };
+
+  // DTR rows exist in the record list but expose no expanded fields — the
+  // panel offers the on-demand parse & txt download instead.
+  const dtrRecords: RecordSummaryPage = {
+    page: 0,
+    page_size: 50,
+    total: 3,
+    records: [5, 6, 7].map((idx, position) => ({
+      id: `session-1:${idx}`,
+      record_type: "DTR",
+      index: idx,
+      offset: 300 + position * 20,
+      length: 16,
+      status: "parsed" as const
+    }))
   };
 
   const fields: RecordField[] = [
@@ -190,7 +209,8 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
   const listeners = {
     progress: [] as Array<(event: { session_id: string; bytes_read: number; total_bytes: number }) => void>,
     snapshot: [] as Array<(snapshot: SessionSnapshot) => void>,
-    complete: [] as Array<(sessionId: string) => void>
+    complete: [] as Array<(sessionId: string) => void>,
+    error: [] as Array<(event: ParseErrorEvent) => void>
   };
 
   const api: MockApi = {
@@ -224,9 +244,17 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
       })),
     saveCsvDialog: async () => "/tmp/export.csv",
     exportTestItemCsv: async () => undefined,
+    parseDtrText: async () => ({ session_id: "session-1", count: 3 }),
+    saveTxtDialog: async () => "/tmp/export.txt",
+    saveDtrText: async () => undefined,
     getRecordGroups: async () => groups,
-    getRecords: async (_sessionId, group) => (group === "MIR" ? mirRecords : records),
-    getRecordFields: async (_sessionId, recordId) => (recordId.endsWith(":1") ? mirFields : fields),
+    getRecords: async (_sessionId, group) =>
+      group === "MIR" ? mirRecords : group === "DTR" ? dtrRecords : records,
+    getRecordFields: async (_sessionId, recordId) => {
+      if (recordId.endsWith(":1")) return mirFields;
+      if (dtrRecords.records.some((record) => record.id === recordId)) return [];
+      return fields;
+    },
     searchFields: async (): Promise<SearchResultPage> => ({
       page: 0,
       page_size: 50,
@@ -252,11 +280,17 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
         listeners.complete = listeners.complete.filter((item) => item !== handler);
       };
     },
-    onParseError: async () => () => undefined,
+    onParseError: async (handler) => {
+      listeners.error.push(handler);
+      return () => {
+        listeners.error = listeners.error.filter((item) => item !== handler);
+      };
+    },
     onParseWarning: async () => () => undefined,
     emitProgress: (event) => listeners.progress.forEach((handler) => handler(event)),
     emitSnapshot: (event) => listeners.snapshot.forEach((handler) => handler(event)),
-    emitComplete: (sessionId) => listeners.complete.forEach((handler) => handler(sessionId))
+    emitComplete: (sessionId) => listeners.complete.forEach((handler) => handler(sessionId)),
+    emitError: (event) => listeners.error.forEach((handler) => handler(event))
   };
   return { ...api, ...overrides };
 }
