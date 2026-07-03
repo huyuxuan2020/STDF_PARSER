@@ -1101,7 +1101,8 @@ function OverviewView({
             <ArrowLeftRight size={11} aria-hidden="true" />
           </button>
         </div>
-        <div className="overflow-hidden rounded-lg border border-border">
+        {/* Fixed height with internal scrolling (the sticky THs pin the header). */}
+        <div className="h-[42vh] min-h-[300px] overflow-auto rounded-lg border border-border">
           <table className={DATA_TABLE}>
             <thead>
               <tr>
@@ -1185,7 +1186,8 @@ function BinYieldCard({ summary, complete }: { summary: BinSummary | null; compl
             ].map((group) => (
               <div key={group.title} className="min-w-0">
                 <div className="mb-1.5 text-xs font-semibold text-muted-foreground">{group.title}</div>
-                <div className="overflow-hidden rounded-lg border border-border">
+                {/* Equal fixed height for both bin tables; long lists scroll inside. */}
+                <div className="h-[236px] overflow-auto rounded-lg border border-border">
                   <table className={DATA_TABLE}>
                     <thead>
                       <tr>
