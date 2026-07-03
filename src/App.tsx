@@ -1530,40 +1530,38 @@ function pfCell(pf: string): ReactNode {
 }
 
 // Per-part info columns shown on the left (not frozen — the whole table scrolls
-// freely). Widths are fixed so the virtualized grid can position cells by pure
-// arithmetic; long values truncate with the full text in a hover tooltip.
+// freely). Widths auto-fit their sampled content, like the value columns.
 // Bin number / name / PF each get their own column so they are always present —
 // empty cells when the file's HBR/SBR don't carry that field.
 type LeftCol = {
   key: string;
   label: string;
-  width: number;
   get: (row: TestItemPartRow) => string;
   title?: (row: TestItemPartRow) => string | undefined;
   render?: (row: TestItemPartRow) => ReactNode;
 };
 
 const LEFT_COLS: LeftCol[] = [
-  { key: "part_id", label: "PartID", width: 110, get: (r) => r.part_id || "-", title: (r) => r.part_id || undefined },
-  { key: "site", label: "Site", width: 56, get: (r) => r.site_num || "-" },
-  { key: "sbin_num", label: "SBIN#", width: 64, get: (r) => r.sbin_num || "-" },
-  { key: "sbin_name", label: "SBIN Name", width: 160, get: (r) => r.sbin_name || "-", title: (r) => r.sbin_name || undefined },
-  { key: "sbin_pf", label: "SBIN PF", width: 64, get: (r) => r.sbin_pf || "-", render: (r) => pfCell(r.sbin_pf) },
-  { key: "hbin_num", label: "HBIN#", width: 64, get: (r) => r.hbin_num || "-" },
-  { key: "hbin_name", label: "HBIN Name", width: 160, get: (r) => r.hbin_name || "-", title: (r) => r.hbin_name || undefined },
-  { key: "hbin_pf", label: "HBIN PF", width: 64, get: (r) => r.hbin_pf || "-", render: (r) => pfCell(r.hbin_pf) },
-  { key: "test_t", label: "TEST_T", width: 80, get: (r) => r.test_t || "-" },
-  { key: "part_txt", label: "PART_TXT", width: 200, get: (r) => r.part_txt || "-", title: (r) => r.part_txt || undefined }
+  { key: "part_id", label: "PartID", get: (r) => r.part_id || "-", title: (r) => r.part_id || undefined },
+  { key: "site", label: "Site", get: (r) => r.site_num || "-" },
+  { key: "sbin_num", label: "SBIN#", get: (r) => r.sbin_num || "-" },
+  { key: "sbin_name", label: "SBIN Name", get: (r) => r.sbin_name || "-", title: (r) => r.sbin_name || undefined },
+  { key: "sbin_pf", label: "SBIN PF", get: (r) => r.sbin_pf || "-", render: (r) => pfCell(r.sbin_pf) },
+  { key: "hbin_num", label: "HBIN#", get: (r) => r.hbin_num || "-" },
+  { key: "hbin_name", label: "HBIN Name", get: (r) => r.hbin_name || "-", title: (r) => r.hbin_name || undefined },
+  { key: "hbin_pf", label: "HBIN PF", get: (r) => r.hbin_pf || "-", render: (r) => pfCell(r.hbin_pf) },
+  { key: "test_t", label: "TEST_T", get: (r) => r.test_t || "-" },
+  { key: "part_txt", label: "PART_TXT", get: (r) => r.part_txt || "-", title: (r) => r.part_txt || undefined }
 ];
-
-// Total width of the part-info block — the horizontal "header offset" for
-// column windowing.
-const TI_LEFT_WIDTH = LEFT_COLS.reduce((sum, col) => sum + col.width, 0);
 // Fixed body-row height (px) — vertical windowing positions rows by this.
 const TI_ROW_H = 40;
-// Auto-fit bounds for value columns.
+// Auto-fit bounds for value columns. The max leaves room for long test names
+// on a single line; anything longer truncates with the detail card as backup.
 const TI_COL_MIN = 84;
-const TI_COL_MAX = 260;
+const TI_COL_MAX = 420;
+// Auto-fit bounds for the left part-info columns.
+const TI_LEFT_MIN = 56;
+const TI_LEFT_MAX = 240;
 
 // Text measurement for auto-fitting column widths. Falls back to a char-count
 // heuristic where canvas 2D is unavailable (jsdom).
@@ -1585,17 +1583,27 @@ const FONT_SANS_13 = '13px -apple-system, "PingFang SC", "Helvetica Neue", sans-
 // Width a value column needs: widest of its metadata rows (the name may wrap
 // to two lines) and a sample of its loaded values, clamped to sane bounds.
 function fitColumnWidth(column: TestItemColumn, sample: TestItemPartRow[], index: number): number {
+  // The full single-line name drives the width — names must not wrap.
   let w = Math.max(
+    textWidth(column.test_name || "-", FONT_SANS_11),
     textWidth(column.low_limit || "-", FONT_MONO_12),
     textWidth(column.high_limit || "-", FONT_MONO_12),
-    textWidth(column.record_type === "FTR" ? "P/F" : column.unit || "-", FONT_SANS_11),
-    textWidth(column.test_name || "-", FONT_SANS_11) / 2
+    textWidth(column.record_type === "FTR" ? "P/F" : column.unit || "-", FONT_SANS_11)
   );
   for (const row of sample) {
     const value = row.results[index]?.value;
     if (value) w = Math.max(w, textWidth(value, FONT_SANS_13));
   }
   return Math.min(TI_COL_MAX, Math.max(TI_COL_MIN, Math.ceil(w) + 20));
+}
+
+// Width a part-info column needs: its header label or the widest sampled value.
+function fitLeftColumnWidth(col: LeftCol, sample: TestItemPartRow[]): number {
+  let w = textWidth(col.label, `600 ${FONT_SANS_11}`);
+  for (const row of sample) {
+    w = Math.max(w, textWidth(col.get(row), FONT_MONO_12));
+  }
+  return Math.min(TI_LEFT_MAX, Math.max(TI_LEFT_MIN, Math.ceil(w) + 22));
 }
 
 // Compact "type num · low~high unit" line under each column's name in the
@@ -1754,6 +1762,14 @@ function TestItemsView({
     for (const width of colWidths) offsets.push(offsets[offsets.length - 1] + width);
     return offsets;
   }, [colWidths]);
+  // Part-info columns auto-fit too (an empty SBIN Name column shouldn't sit at
+  // a fixed 160px while long test names get squeezed).
+  const leftWidths = useMemo(() => {
+    const sample = rows.slice(0, 100);
+    return LEFT_COLS.map((col) => fitLeftColumnWidth(col, sample));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [firstRow]);
+  const leftWidth = useMemo(() => leftWidths.reduce((sum, w) => sum + w, 0), [leftWidths]);
 
   // Window of rows/columns actually mounted; the rest is spacer height/width.
   const win = computeMatrixWindow({
@@ -1762,7 +1778,7 @@ function TestItemsView({
     viewportHeight: view.height,
     viewportWidth: view.width,
     headerHeight: view.headerH,
-    leftWidth: TI_LEFT_WIDTH,
+    leftWidth,
     rowHeight: TI_ROW_H,
     colWidth: TEST_COL_WIDTH,
     rowCount: rows.length,
@@ -1865,8 +1881,8 @@ function TestItemsView({
                 aria-label="测试项矩阵"
               >
                 <colgroup>
-                  {LEFT_COLS.map((col) => (
-                    <col key={col.key} style={{ width: col.width }} />
+                  {LEFT_COLS.map((col, index) => (
+                    <col key={col.key} style={{ width: leftWidths[index] }} />
                   ))}
                   <col style={{ width: spacerLead }} />
                   {visibleCols.map((column, index) => (
@@ -1898,7 +1914,7 @@ function TestItemsView({
                         title="点击查看完整测试项信息"
                         onClick={(e) => setColInfo({ x: e.clientX, y: e.clientY, column })}
                       >
-                        <span className="line-clamp-2 text-[11px] font-medium leading-snug text-foreground [overflow-wrap:anywhere]">
+                        <span className="block truncate whitespace-nowrap text-[11px] font-medium leading-snug text-foreground">
                           {column.test_name || `#${column.test_num}`}
                         </span>
                         {/* Limits only — the record type and test number live in the
