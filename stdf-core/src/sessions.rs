@@ -203,6 +203,30 @@ pub struct TestItemColumnLite {
     pub test_name: String,
 }
 
+/// One bin's share of the parsed parts, for the overview's yield section.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BinStat {
+    pub num: String,
+    pub name: String,
+    pub pf: String,
+    pub count: usize,
+}
+
+/// Yield / bin distribution over all parsed parts. Pass verdicts follow the
+/// same convention as the CSV export: the bin's PF flag when the file carries
+/// one, otherwise "bin 1 = pass".
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BinSummary {
+    pub session_id: String,
+    pub total_parts: usize,
+    pub sbin_pass: usize,
+    pub hbin_pass: usize,
+    pub sbins: Vec<BinStat>,
+    pub hbins: Vec<BinStat>,
+    pub has_bin_pf: bool,
+    pub status: ParseStatus,
+}
+
 #[derive(Clone, Default)]
 struct PendingPartContext {
     head_num: String,
@@ -1020,6 +1044,19 @@ impl SessionManager {
             .collect())
     }
 
+    /// Yield / bin distribution for the overview page.
+    pub fn get_bin_summary(&self, session_id: &str) -> Result<BinSummary, String> {
+        let guard = self.sessions.lock().map_err(|_| "session lock poisoned")?;
+        let state = guard
+            .get(session_id)
+            .ok_or_else(|| "解析会话不存在".to_string())?;
+        Ok(build_bin_summary(
+            session_id,
+            &state.test_items,
+            &state.snapshot.status,
+        ))
+    }
+
     /// Build the full test-item matrix as an STS8300-style CSV and write it to `path`.
     /// Done entirely in Rust so a potentially huge CSV never crosses the IPC bridge.
     pub fn export_test_item_csv(&self, session_id: &str, path: &str) -> Result<(), String> {
@@ -1480,6 +1517,80 @@ fn format_duration(secs: i64) -> String {
 /// best-effort reconstruction from the STDF MIR/MRR + a computed bin summary; the
 /// data section mirrors the reference layout (left fixed columns + one column per
 /// test item, with Unit/LimitL/LimitU header rows).
+fn build_bin_summary(
+    session_id: &str,
+    acc: &TestItemAccumulator,
+    status: &ParseStatus,
+) -> BinSummary {
+    let mut sbin_order: Vec<String> = Vec::new();
+    let mut sbin_counts: HashMap<String, usize> = HashMap::new();
+    let mut hbin_order: Vec<String> = Vec::new();
+    let mut hbin_counts: HashMap<String, usize> = HashMap::new();
+    let mut total = 0_usize;
+    let mut sbin_pass = 0_usize;
+    let mut hbin_pass = 0_usize;
+    for key in &acc.part_order {
+        let Some(row) = acc.part_rows.get(key) else {
+            continue;
+        };
+        total += 1;
+        if bin_passed(&acc.sbin_pf, &row.sbin_num, &row.sbin_pf) {
+            sbin_pass += 1;
+        }
+        if bin_passed(&acc.hbin_pf, &row.hbin_num, &row.hbin_pf) {
+            hbin_pass += 1;
+        }
+        let sbin_count = sbin_counts.entry(row.sbin_num.clone()).or_insert_with(|| {
+            sbin_order.push(row.sbin_num.clone());
+            0
+        });
+        *sbin_count += 1;
+        let hbin_count = hbin_counts.entry(row.hbin_num.clone()).or_insert_with(|| {
+            hbin_order.push(row.hbin_num.clone());
+            0
+        });
+        *hbin_count += 1;
+    }
+    sbin_order.sort_by(|a, b| bin_num_order(a, b));
+    hbin_order.sort_by(|a, b| bin_num_order(a, b));
+
+    let sbins = sbin_order
+        .iter()
+        .map(|num| BinStat {
+            num: num.clone(),
+            name: bin_lookup(&acc.sbin_names, num, ""),
+            pf: bin_lookup(&acc.sbin_pf, num, ""),
+            count: sbin_counts[num],
+        })
+        .collect();
+    let hbins = hbin_order
+        .iter()
+        .map(|num| BinStat {
+            num: num.clone(),
+            name: bin_lookup(&acc.hbin_names, num, ""),
+            pf: bin_lookup(&acc.hbin_pf, num, ""),
+            count: hbin_counts[num],
+        })
+        .collect();
+
+    let has_bin_pf = acc
+        .hbin_pf
+        .values()
+        .chain(acc.sbin_pf.values())
+        .any(|value| !value.trim().is_empty());
+
+    BinSummary {
+        session_id: session_id.to_string(),
+        total_parts: total,
+        sbin_pass,
+        hbin_pass,
+        sbins,
+        hbins,
+        has_bin_pf,
+        status: status.clone(),
+    }
+}
+
 fn build_test_item_csv(snapshot: &SessionSnapshot, acc: &TestItemAccumulator) -> String {
     let mut out = String::new();
     out.push('\u{FEFF}'); // UTF-8 BOM so Excel reads Chinese/units correctly.
@@ -3300,6 +3411,52 @@ mod tests {
         assert!(second_db.exists(), "live session keeps its database");
         // Leave no trace behind for other tests / the shared temp dir.
         let _ = std::fs::remove_file(second_db);
+    }
+
+    #[test]
+    fn bin_summary_reports_totals_pass_counts_and_per_bin_stats() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("bin-summary.stdf");
+        std::fs::write(&file_path, build_test_item_fixture()).expect("write fixture");
+
+        let manager = SessionManager::default();
+        let (tx, rx) = mpsc::channel();
+        let session = manager
+            .open_stdf(file_path.to_string_lossy().to_string(), move |event| {
+                let _ = tx.send(event);
+            })
+            .expect("open session");
+        let mut completed = false;
+        for _ in 0..200 {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(SessionEvent::Complete(_)) => {
+                    completed = true;
+                    break;
+                }
+                Ok(SessionEvent::Error(error)) => panic!("unexpected parse error: {error:?}"),
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert!(completed, "parser should complete");
+
+        let summary = manager
+            .get_bin_summary(&session.session_id)
+            .expect("bin summary");
+        assert_eq!(summary.total_parts, 2);
+        assert_eq!(summary.sbin_pass, 2);
+        assert_eq!(summary.hbin_pass, 2);
+        assert!(summary.has_bin_pf);
+        assert_eq!(summary.sbins.len(), 1);
+        assert_eq!(summary.sbins[0].num, "2");
+        assert_eq!(summary.sbins[0].name, "PASS");
+        assert_eq!(summary.sbins[0].pf, "P");
+        assert_eq!(summary.sbins[0].count, 2);
+        assert_eq!(summary.hbins.len(), 1);
+        assert_eq!(summary.hbins[0].num, "3");
+        assert_eq!(summary.hbins[0].name, "GOOD");
+        assert_eq!(summary.hbins[0].count, 2);
+        assert_eq!(summary.status, ParseStatus::Complete);
     }
 
     #[test]

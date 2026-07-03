@@ -30,6 +30,7 @@ import type {
   SearchResult,
   SessionSnapshot,
   TestItemColumn,
+  BinSummary,
   TestItemColumnLite,
   TestItemPage,
   TestItemPartRow,
@@ -196,6 +197,8 @@ export default function App({ api = tauriApi }: AppProps) {
   );
   const [keyFields, setKeyFields] = useState<Record<string, RecordField[]>>({});
   const [snapshot, setSnapshot] = useState<SessionSnapshot | null>(null);
+  // Yield / bin distribution for the overview, fetched once parsing completes.
+  const [binSummary, setBinSummary] = useState<BinSummary | null>(null);
   const [tiColumns, setTiColumns] = useState<TestItemColumn[]>([]);
   const [tiColTotal, setTiColTotal] = useState(0);
   const [tiRows, setTiRows] = useState<TestItemPartRow[]>([]);
@@ -346,6 +349,7 @@ export default function App({ api = tauriApi }: AppProps) {
     if (!session) return;
     setNav("summary");
     setKeyFields(snapshot?.key_fields ?? {});
+    setBinSummary(null);
     tiEpoch.current += 1;
     // Whenever the loaded rows are cleared, the fetch-key cache MUST be cleared
     // with them — otherwise the page-load effect thinks the window is already
@@ -364,6 +368,19 @@ export default function App({ api = tauriApi }: AppProps) {
     setTiFilterOpen(false);
     setTiAllColumns([]);
   }, [session?.session_id]);
+
+  // Fetch the yield/bin distribution once parsing completes.
+  useEffect(() => {
+    const sessionId = session?.session_id;
+    if (!sessionId || session?.status !== "complete") return;
+    let active = true;
+    api.getBinSummary(sessionId).then((summary) => {
+      if (active && sessionIdRef.current === sessionId) setBinSummary(summary);
+    });
+    return () => {
+      active = false;
+    };
+  }, [api, session?.session_id, session?.status]);
 
   // Load the records that hold OneData's default key fields (MIR/MRR/WIR/SDR). Data arrives
   // incrementally via SQLite, so fetch each type once it appears in groups (MRR is last).
@@ -632,6 +649,7 @@ export default function App({ api = tauriApi }: AppProps) {
     setFields([]);
     setKeyFields({});
     setSnapshot(null);
+    setBinSummary(null);
     tiEpoch.current += 1;
     tiFetchKeyRef.current = "";
     setTiColumns([]);
@@ -729,6 +747,7 @@ export default function App({ api = tauriApi }: AppProps) {
                 session={session}
                 keyFields={keyFields}
                 groups={groups}
+                binSummary={binSummary}
                 onOpenRecordType={(type) => {
                   setSelectedGroup(type);
                   setCursor(0);
@@ -1020,11 +1039,13 @@ function OverviewView({
   session,
   keyFields,
   groups,
+  binSummary,
   onOpenRecordType
 }: {
   session: ParseSession;
   keyFields: Record<string, RecordField[]>;
   groups: RecordGroup[];
+  binSummary: BinSummary | null;
   onOpenRecordType(recordType: string): void;
 }) {
   // Auto-detect: CP files carry wafer records (WIR/WRR); otherwise FT. The
@@ -1051,7 +1072,9 @@ function OverviewView({
     return { ...spec, value: parsed?.value ?? "", meaning: parsed?.description ?? "" };
   });
   return (
-    <section className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-[18px]">
+    // The overview grew past one screen (key fields + yield + pair checks),
+    // so the whole page scrolls instead of squeezing sections into the viewport.
+    <section className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-[18px]">
       <div className="shrink-0">
         <span className={EYEBROW}>File Summary</span>
         <h1
@@ -1061,8 +1084,7 @@ function OverviewView({
           {session.file_name}
         </h1>
       </div>
-      <PairStats groups={groups} complete={complete} />
-      <section className="flex min-h-0 min-w-0 flex-1 flex-col rounded-xl border border-border bg-card p-[18px]">
+      <section className="flex min-w-0 shrink-0 flex-col rounded-xl border border-border bg-card p-[18px]">
         <div className="mb-3 flex min-w-0 items-center justify-between gap-4">
           <span className={EYEBROW}>关键字段</span>
           <button
@@ -1079,7 +1101,7 @@ function OverviewView({
             <ArrowLeftRight size={11} aria-hidden="true" />
           </button>
         </div>
-        <div className={TABLE_SCROLL}>
+        <div className="overflow-hidden rounded-lg border border-border">
           <table className={DATA_TABLE}>
             <thead>
               <tr>
@@ -1113,6 +1135,91 @@ function OverviewView({
           </table>
         </div>
       </section>
+      <BinYieldCard summary={binSummary} complete={complete} />
+      <PairStats groups={groups} complete={complete} />
+    </section>
+  );
+}
+
+// Yield headline + per-bin distribution tables (SBIN / HBIN), matching the
+// CSV export's pass convention (PF flag, else "bin 1 = pass").
+function BinYieldCard({ summary, complete }: { summary: BinSummary | null; complete: boolean }) {
+  const ready = complete && summary !== null;
+  const total = summary?.total_parts ?? 0;
+  const pass = summary?.sbin_pass ?? 0;
+  const yieldPct = total > 0 ? `${((pass / total) * 100).toFixed(1)}%` : "-";
+  return (
+    <section className="shrink-0 rounded-xl border border-border bg-card p-[18px]">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <span className={EYEBROW}>良率与 Bin 统计</span>
+        {!ready && <span className="text-xs text-muted-foreground">解析完成后统计…</span>}
+      </div>
+      {ready && (
+        <>
+          <div className="mb-3 grid grid-cols-4 gap-2">
+            {[
+              { label: "Total", value: total.toLocaleString(), tone: "text-foreground" },
+              { label: "Pass", value: pass.toLocaleString(), tone: "text-success" },
+              { label: "Fail", value: (total - pass).toLocaleString(), tone: "text-danger" },
+              { label: "良率", value: yieldPct, tone: "text-primary" }
+            ].map((stat) => (
+              <div key={stat.label} className="rounded-lg border border-border bg-muted px-3 py-2">
+                <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                  {stat.label}
+                </div>
+                <div className={`mt-0.5 text-lg font-semibold tabular-nums ${stat.tone}`}>
+                  {stat.value}
+                </div>
+              </div>
+            ))}
+          </div>
+          {!summary.has_bin_pf && (
+            <p className="mb-3 text-xs text-warning">
+              本文件的 bin 记录未包含通过/失败标记(PF)，良率按「软 bin 1 = 通过」约定判定。
+            </p>
+          )}
+          <div className="grid grid-cols-2 gap-3">
+            {[
+              { title: "SBIN 分布", bins: summary.sbins },
+              { title: "HBIN 分布", bins: summary.hbins }
+            ].map((group) => (
+              <div key={group.title} className="min-w-0">
+                <div className="mb-1.5 text-xs font-semibold text-muted-foreground">{group.title}</div>
+                <div className="overflow-hidden rounded-lg border border-border">
+                  <table className={DATA_TABLE}>
+                    <thead>
+                      <tr>
+                        <th className={`${TH} w-[18%]`}>Bin#</th>
+                        <th className={`${TH} w-[38%]`}>名称</th>
+                        <th className={`${TH} w-[12%]`}>P/F</th>
+                        <th className={`${TH} w-[16%] text-right`}>数量</th>
+                        <th className={`${TH} w-[16%] text-right`}>占比</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {group.bins.map((bin) => (
+                        <tr key={bin.num}>
+                          <td className={`${TD} ${MONO}`}>{bin.num}</td>
+                          <td className={`${TD}`}>
+                            <span className="block truncate" title={bin.name || undefined}>
+                              {bin.name || "-"}
+                            </span>
+                          </td>
+                          <td className={TD}>{pfCell(bin.pf)}</td>
+                          <td className={`${TD} ${MONO} text-right`}>{bin.count.toLocaleString()}</td>
+                          <td className={`${TD} ${MONO} text-right`}>
+                            {total > 0 ? `${((bin.count / total) * 100).toFixed(1)}%` : "-"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
     </section>
   );
 }

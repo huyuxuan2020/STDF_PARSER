@@ -1,6 +1,6 @@
 use stdf_core::parser::{ParseErrorEvent, ParseProgress};
 use stdf_core::sessions::{
-    EnrichedField, RecordGroup, RecordSummaryPage, SearchProgress, SearchResultPage,
+    BinSummary, EnrichedField, RecordGroup, RecordSummaryPage, SearchProgress, SearchResultPage,
     SessionManager, SessionSnapshot, TestItemColumnLite, TestItemPage,
 };
 use tauri::ipc::Channel;
@@ -76,6 +76,14 @@ fn get_test_item_columns(
     manager: State<'_, SessionManager>,
 ) -> Result<Vec<TestItemColumnLite>, String> {
     manager.get_test_item_columns(&session_id)
+}
+
+#[tauri::command(async)]
+fn get_bin_summary(
+    session_id: String,
+    manager: State<'_, SessionManager>,
+) -> Result<BinSummary, String> {
+    manager.get_bin_summary(&session_id)
 }
 
 #[tauri::command(async)]
@@ -155,6 +163,7 @@ pub fn run() {
             get_session_snapshot,
             get_test_item_page,
             get_test_item_columns,
+            get_bin_summary,
             export_test_item_csv,
             get_record_groups,
             get_records,

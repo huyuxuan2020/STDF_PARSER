@@ -42,6 +42,27 @@ describe("App", () => {
     expect((await screen.findAllByText("demo-2.stdf")).length).toBeGreaterThan(0);
   });
 
+  it("shows yield and bin statistics on the overview once parsing completes", async () => {
+    const api = createMockApi();
+    const user = userEvent.setup();
+
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
+    await screen.findByRole("main", { name: "文件摘要" });
+
+    act(() => {
+      api.emitComplete("session-1");
+    });
+
+    // Yield summary: total / pass / yield percentage.
+    expect(await screen.findByText("良率与 Bin 统计")).toBeInTheDocument();
+    expect(screen.getByText("100")).toBeInTheDocument(); // total parts
+    expect(screen.getAllByText("97.0%").length).toBeGreaterThan(0); // sbin-based yield
+    // Both bin tables render with names and counts.
+    expect(screen.getByText("FAIL_BIN")).toBeInTheDocument();
+    expect(screen.getByText("GOOD")).toBeInTheDocument();
+  });
+
   it("opens the test-item matrix view after parsing completes", async () => {
     const api = createMockApi();
     const user = userEvent.setup();

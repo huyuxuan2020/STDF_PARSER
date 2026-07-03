@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
+  BinSummary,
   ParseErrorEvent,
   ParseProgress,
   ParseSession,
@@ -63,6 +64,10 @@ export const tauriApi: StdfApi = {
 
   getTestItemColumns(sessionId: string) {
     return invoke<TestItemColumnLite[]>("get_test_item_columns", { sessionId });
+  },
+
+  getBinSummary(sessionId: string) {
+    return invoke<BinSummary>("get_bin_summary", { sessionId });
   },
 
   saveCsvDialog(defaultName: string) {

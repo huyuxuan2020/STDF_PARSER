@@ -198,6 +198,22 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
     openDroppedFile: async () => sessions[0],
     cancelParse: async () => undefined,
     getSessionSnapshot: async () => snapshot,
+    getBinSummary: async () => ({
+      session_id: "session-1",
+      total_parts: 100,
+      sbin_pass: 97,
+      hbin_pass: 96,
+      sbins: [
+        { num: "1", name: "PASS", pf: "P", count: 97 },
+        { num: "7", name: "FAIL_BIN", pf: "F", count: 3 }
+      ],
+      hbins: [
+        { num: "1", name: "GOOD", pf: "P", count: 96 },
+        { num: "2", name: "BAD", pf: "F", count: 4 }
+      ],
+      has_bin_pf: true,
+      status: "complete" as const
+    }),
     getTestItemPage: async () => testItemPage,
     getTestItemColumns: async () =>
       testItemPage.columns.map((column) => ({

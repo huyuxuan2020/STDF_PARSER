@@ -103,6 +103,25 @@ export interface TestItemColumnLite {
   test_name: string;
 }
 
+// One bin's share of the parsed parts, for the overview's yield section.
+export interface BinStat {
+  num: string;
+  name: string;
+  pf: string;
+  count: number;
+}
+
+export interface BinSummary {
+  session_id: string;
+  total_parts: number;
+  sbin_pass: number;
+  hbin_pass: number;
+  sbins: BinStat[];
+  hbins: BinStat[];
+  has_bin_pf: boolean;
+  status: ParseStatus;
+}
+
 export interface TestItemPage {
   session_id: string;
   columns: TestItemColumn[];
@@ -163,6 +182,7 @@ export interface StdfApi {
     siteFilter: string
   ): Promise<TestItemPage>;
   getTestItemColumns(sessionId: string): Promise<TestItemColumnLite[]>;
+  getBinSummary(sessionId: string): Promise<BinSummary>;
   saveCsvDialog(defaultName: string): Promise<string | null>;
   exportTestItemCsv(sessionId: string, path: string): Promise<void>;
   getRecordGroups(sessionId: string): Promise<RecordGroup[]>;
