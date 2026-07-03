@@ -1883,7 +1883,7 @@ function TestItemsView({
                   to a full render. table-fixed + the colgroup make cell positions
                   pure arithmetic, so windowing never shifts the layout. */}
               <table
-                className="w-max table-fixed border-separate border-spacing-0 text-[13px] [&_td]:border-b [&_td]:border-r [&_td]:border-border/80 [&_th]:border-b [&_th]:border-r [&_th]:border-border [&_tbody_tr:hover]:bg-muted/30"
+                className="w-max table-fixed border-separate border-spacing-0 text-[13px] [&_td]:border-b [&_td]:border-r [&_td]:border-border/80 [&_th]:border-b [&_th]:border-r [&_th]:border-border [&_thead_th]:sticky [&_thead_th]:top-0 [&_thead_th]:z-[2] [&_tbody_tr:hover]:bg-muted/30"
                 aria-label="测试项矩阵"
               >
                 <colgroup>
@@ -1926,7 +1926,7 @@ function TestItemsView({
                         {/* Limits only — the record type and test number live in the
                             click-to-open detail card. Centered to line up with the
                             centered values below. */}
-                        <span className="mt-0.5 block truncate text-center font-mono text-[10px] tabular-nums text-muted-foreground">
+                        <span className="mt-0.5 block truncate text-center font-mono text-[11px] tabular-nums text-muted-foreground">
                           {columnMetaLine(column)}
                         </span>
                       </th>
