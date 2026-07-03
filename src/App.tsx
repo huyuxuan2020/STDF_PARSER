@@ -1184,8 +1184,8 @@ function BinYieldCard({ summary, complete }: { summary: BinSummary | null; compl
           )}
           <div className="grid grid-cols-2 gap-3">
             {[
-              { title: "SBIN 分布", bins: summary.sbins },
-              { title: "HBIN 分布", bins: summary.hbins }
+              { title: "SBIN 分布", binLabel: "SBIN#", bins: summary.sbins },
+              { title: "HBIN 分布", binLabel: "HBIN#", bins: summary.hbins }
             ].map((group) => (
               <div key={group.title} className="min-w-0">
                 <div className="mb-1.5 text-xs font-semibold text-muted-foreground">{group.title}</div>
@@ -1194,7 +1194,7 @@ function BinYieldCard({ summary, complete }: { summary: BinSummary | null; compl
                   <table className={DATA_TABLE}>
                     <thead>
                       <tr>
-                        <th className={`${TH} w-[18%]`}>Bin#</th>
+                        <th className={`${TH} w-[18%]`}>{group.binLabel}</th>
                         <th className={`${TH} w-[38%]`}>名称</th>
                         <th className={`${TH} w-[12%]`}>P/F</th>
                         <th className={`${TH} w-[16%] text-right`}>数量</th>
