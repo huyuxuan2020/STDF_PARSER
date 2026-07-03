@@ -66,7 +66,10 @@ const RAIL_ITEM =
 const RAIL_ITEM_IDLE = "text-muted-foreground hover:bg-border/40 hover:text-foreground";
 const RAIL_ITEM_ACTIVE = "bg-primary-soft text-primary";
 
-const TABLE_SCROLL = "min-h-0 flex-1 overflow-auto rounded-lg border border-border";
+// overscroll-contain: reaching an inner table's scroll end must not chain the
+// wheel into scrolling the page — the page scrolls only under the cursor's
+// own real estate.
+const TABLE_SCROLL = "min-h-0 flex-1 overflow-auto overscroll-contain rounded-lg border border-border";
 const DATA_TABLE = "w-full table-fixed border-collapse text-[13px] [&_tbody_tr:hover]:bg-muted/50";
 const TH =
   "sticky top-0 z-[1] border-b border-border bg-muted px-2.5 py-2.5 text-left align-top text-xs font-semibold text-muted-foreground";
@@ -1102,7 +1105,7 @@ function OverviewView({
           </button>
         </div>
         {/* Fixed height with internal scrolling (the sticky THs pin the header). */}
-        <div className="h-[42vh] min-h-[300px] overflow-auto rounded-lg border border-border">
+        <div className="h-[42vh] min-h-[300px] overflow-auto overscroll-contain rounded-lg border border-border">
           <table className={DATA_TABLE}>
             <thead>
               <tr>
@@ -1187,7 +1190,7 @@ function BinYieldCard({ summary, complete }: { summary: BinSummary | null; compl
               <div key={group.title} className="min-w-0">
                 <div className="mb-1.5 text-xs font-semibold text-muted-foreground">{group.title}</div>
                 {/* Equal fixed height for both bin tables; long lists scroll inside. */}
-                <div className="h-[236px] overflow-auto rounded-lg border border-border">
+                <div className="h-[236px] overflow-auto overscroll-contain rounded-lg border border-border">
                   <table className={DATA_TABLE}>
                     <thead>
                       <tr>
