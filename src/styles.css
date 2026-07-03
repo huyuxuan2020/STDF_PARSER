@@ -65,35 +65,38 @@
 }
 
 /* Dark mode — toggled manually via the theme button (default is light).
-   Applied by setting data-theme="dark" on <html>; never auto from the OS. */
+   Applied by setting data-theme="dark" on <html>; never auto from the OS.
+   Neutrals follow the Radix Colors slate-dark scale (the palette Linear/
+   Vercel-style data UIs are built on): surfaces get LIGHTER as they rise
+   (bg < card < muted band), body text sits between slate 11 and 12 instead
+   of near-white — dense value grids must not glare — and status hues are
+   desaturated because whole columns render in them. */
 :root[data-theme="dark"] {
   color-scheme: dark;
 
-  --bg: #0d1117;
-  --card: #161c26;
-  --surface-muted: #11161f;
-  --fg: #e6edf5;
-  --fg-muted: #8d9bb0;
-  --border: #262d39;
-  --border-strong: #3a4350;
+  --bg: #111318;
+  --card: #181c22;
+  --surface-muted: #21262e;
+  --fg: #c9d1dc;
+  --fg-muted: #848f9f;
+  --border: #272d36;
+  --border-strong: #3a424e;
 
-  --primary: #5b9bf5;
-  --primary-hover: #74acf8;
-  --primary-fg: #0b1220;
-  --primary-soft: #16243a;
-  --ring: rgba(91, 155, 245, 0.45);
+  --primary: #6ba4e8;
+  --primary-hover: #85b5ee;
+  --primary-fg: #0d1526;
+  --primary-soft: #1a2942;
+  --ring: rgba(107, 164, 232, 0.4);
 
-  /* Status hues are desaturated for dark mode: whole table columns render in
-     these colors, and the light-mode-bright variants glow harshly on #0d1117. */
   --success: #7fb694;
-  --success-soft: #13271d;
-  --success-border: #1f3f2b;
+  --success-soft: #16251d;
+  --success-border: #24402e;
   --warning: #d0a648;
-  --warning-soft: #2b2310;
-  --warning-border: #4a3a16;
+  --warning-soft: #2b2413;
+  --warning-border: #4a3b1a;
   --danger: #d97f74;
-  --danger-soft: #2c1715;
-  --danger-border: #4d2520;
+  --danger-soft: #2d1a17;
+  --danger-border: #4d2822;
 }
 
 /* ------------------------------------------------------------------ *
