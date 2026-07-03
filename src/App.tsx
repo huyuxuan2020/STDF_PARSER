@@ -1585,9 +1585,7 @@ const FONT_SANS_13 = '13px -apple-system, "PingFang SC", "Helvetica Neue", sans-
 // Width a value column needs: widest of its metadata rows (the name may wrap
 // to two lines) and a sample of its loaded values, clamped to sane bounds.
 function fitColumnWidth(column: TestItemColumn, sample: TestItemPartRow[], index: number): number {
-  let w = textWidth(String(column.test_num), FONT_MONO_12);
-  w = Math.max(
-    w,
+  let w = Math.max(
     textWidth(column.low_limit || "-", FONT_MONO_12),
     textWidth(column.high_limit || "-", FONT_MONO_12),
     textWidth(column.record_type === "FTR" ? "P/F" : column.unit || "-", FONT_SANS_11),
@@ -1903,9 +1901,10 @@ function TestItemsView({
                         <span className="line-clamp-2 text-[11px] font-medium leading-snug text-foreground [overflow-wrap:anywhere]">
                           {column.test_name || `#${column.test_num}`}
                         </span>
+                        {/* Limits only — the record type and test number live in the
+                            click-to-open detail card. */}
                         <span className="mt-0.5 block truncate font-mono text-[10px] tabular-nums text-muted-foreground">
-                          <span className="font-semibold text-primary">{column.record_type}</span>{" "}
-                          {column.test_num} · {columnMetaLine(column)}
+                          {columnMetaLine(column)}
                         </span>
                       </th>
                     ))}
