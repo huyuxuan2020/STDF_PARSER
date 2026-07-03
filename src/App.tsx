@@ -347,6 +347,11 @@ export default function App({ api = tauriApi }: AppProps) {
     setNav("summary");
     setKeyFields(snapshot?.key_fields ?? {});
     tiEpoch.current += 1;
+    // Whenever the loaded rows are cleared, the fetch-key cache MUST be cleared
+    // with them — otherwise the page-load effect thinks the window is already
+    // loaded and the view hangs on the loading state. (Bit us via dev
+    // fast-refresh, which re-runs effects with refs preserved.)
+    tiFetchKeyRef.current = "";
     setTiColumns([]);
     setTiRows([]);
     setTiColTotal(0);
@@ -628,6 +633,7 @@ export default function App({ api = tauriApi }: AppProps) {
     setKeyFields({});
     setSnapshot(null);
     tiEpoch.current += 1;
+    tiFetchKeyRef.current = "";
     setTiColumns([]);
     setTiRows([]);
     setTiColTotal(0);
