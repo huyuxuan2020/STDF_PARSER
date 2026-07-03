@@ -60,3 +60,5 @@ PATH="/opt/homebrew/opt/rustup/bin:$PATH" npm run tauri -- build --bundles app
 ## 本地说明
 
 这个副本没有包含 `node_modules`、`target`、`dist` 等可再生成目录。新对话接手后，先在本目录执行 `npm install`。
+
+## Imported Claude Cowork project instructions
