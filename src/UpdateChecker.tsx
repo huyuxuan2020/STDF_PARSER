@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { Download, Loader2, RefreshCw, X } from "lucide-react";
+import { getVersion } from "@tauri-apps/api/app";
+import { AlertCircle, CheckCircle2, Download, Loader2, RefreshCw, WifiOff, X } from "lucide-react";
 
 /* ------------------------------------------------------------------ *
  * Auto-update: silently checks GitHub Releases on launch and exposes  *
@@ -13,8 +14,9 @@ import { Download, Loader2, RefreshCw, X } from "lucide-react";
 const RAIL_ITEM =
   "flex h-14 w-14 flex-col items-center justify-center gap-1 rounded-xl text-[10px] font-medium transition duration-100 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
 const RAIL_ITEM_IDLE = "text-muted-foreground hover:bg-border/40 hover:text-foreground";
+// Compact dialog buttons — the update card is content-first, so actions stay light.
 const BTN_BASE =
-  "inline-flex min-h-[40px] items-center justify-center gap-2 rounded-md px-3.5 text-sm font-medium transition duration-100 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
+  "inline-flex h-9 items-center justify-center gap-1.5 rounded-lg px-3.5 text-[13px] font-medium transition duration-100 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
 const BTN_PRIMARY = `${BTN_BASE} bg-primary text-primary-foreground hover:bg-primary-hover`;
 const BTN_SECONDARY = `${BTN_BASE} whitespace-nowrap border border-border-strong bg-card text-muted-foreground hover:bg-muted hover:text-foreground`;
 
@@ -257,6 +259,22 @@ export function UpdateChecker() {
   // otherwise it races the click and flips `manual` back to false mid-check,
   // hiding the dialog while the button spins on the second in-flight check.
   const manualTaken = useRef(false);
+  // Bumped on every explicit close. An in-flight manual check compares its
+  // captured value so a result landing after the user closed the dialog
+  // doesn't pop it back open (the ugly close → re-open flicker).
+  const closeSeq = useRef(0);
+  // Installed version, shown in the "already up to date" card.
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+
+  function closeDialog() {
+    closeSeq.current += 1;
+    setPhase({ kind: "idle" });
+  }
+
+  useEffect(() => {
+    if (!inTauri) return;
+    getVersion().then(setAppVersion).catch(() => {});
+  }, []);
 
   async function runCheck(isManual: boolean) {
     if (!inTauri) return;
@@ -265,6 +283,8 @@ export function UpdateChecker() {
     } else if (manualTaken.current) {
       return;
     }
+    const seq = closeSeq.current;
+    const dismissed = () => isManual && closeSeq.current !== seq;
     setManual(isManual);
     setPhase({ kind: "checking" });
     try {
@@ -283,23 +303,23 @@ export function UpdateChecker() {
         // Same guard as above for a click that landed during the API call.
         if (!isManual && manualTaken.current) return;
         const notes = combined ?? update.body ?? "";
-        if (isManual) {
+        if (isManual && !dismissed()) {
           setPhase({ kind: "available", update, notes });
         } else {
-          // Silent: surface the update via the red dot on the rail button
-          // and stay out of the way until the user clicks.
+          // Silent check, or the user closed the dialog mid-check: surface the
+          // update via the red dot on the rail button and stay out of the way.
           setPendingUpdate({ update, notes });
-          setPhase({ kind: "idle" });
+          if (!isManual) setPhase({ kind: "idle" });
         }
       } else if (isManual) {
-        setPhase({ kind: "uptodate" });
+        if (!dismissed()) setPhase({ kind: "uptodate" });
       } else {
         // Silent + no update: stay quiet.
         setPhase({ kind: "idle" });
       }
     } catch (err) {
       if (isManual) {
-        setPhase({ kind: "error", message: String(err) });
+        if (!dismissed()) setPhase({ kind: "error", message: String(err) });
       } else {
         // Silent errors stay silent (no network, offline, etc.).
         setPhase({ kind: "idle" });
@@ -372,6 +392,7 @@ export function UpdateChecker() {
     (phase.kind === "checking" && manual);
 
   const checking = phase.kind === "checking";
+  const busy = phase.kind === "downloading" || phase.kind === "installing";
 
   return (
     <>
@@ -398,160 +419,200 @@ export function UpdateChecker() {
       </button>
 
       {showModal && (
+        // The backdrop is intentionally inert: dismissing is an explicit act
+        // (×, 稍后, Esc), so a stray click never kills an in-flight check.
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
-          onClick={() => {
-            // Allow dismissing only when not mid-download.
-            if (phase.kind !== "downloading" && phase.kind !== "installing") {
-              setPhase({ kind: "idle" });
-            }
-          }}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-6"
           role="presentation"
         >
-          <div
-            className="flex w-[420px] max-w-full flex-col overflow-hidden rounded-xl border border-border bg-card shadow-xl"
-            onClick={(event) => event.stopPropagation()}
-            role="dialog"
-            aria-label="软件更新"
-          >
-            <div className="flex items-center justify-between border-b border-border px-4 py-3">
-              <strong className="text-sm font-semibold text-foreground">软件更新</strong>
-              {phase.kind !== "downloading" && phase.kind !== "installing" && (
-                <button
-                  type="button"
-                  onClick={() => setPhase({ kind: "idle" })}
-                  aria-label="关闭"
-                  className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
-                >
-                  <X size={14} />
-                </button>
-              )}
-            </div>
-
-            <div className="px-4 py-4 text-sm text-foreground">
-              {phase.kind === "checking" && (
-                <p className="flex items-center gap-2 text-muted-foreground">
-                  <Loader2 size={16} className="animate-spin" /> 正在检查更新…
-                </p>
-              )}
-
-              {phase.kind === "uptodate" && (
-                <p className="text-muted-foreground">已经是最新版本。</p>
-              )}
-
-              {phase.kind === "available" && (
-                <div className="flex flex-col gap-3">
-                  <p>
-                    发现新版本{" "}
-                    <span className="font-semibold text-primary">v{phase.update.version}</span>
-                    {phase.update.currentVersion && (
-                      <span className="text-muted-foreground">
-                        {" "}
-                        （当前 v{phase.update.currentVersion}）
-                      </span>
-                    )}
-                    。
-                  </p>
-                  {phase.notes && (
-                    <div className="max-h-48 overflow-auto rounded-md border border-border bg-muted/40 px-3 py-2.5">
-                      <ReleaseNotes body={phase.notes} />
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {phase.kind === "downloading" && (
-                <div className="flex flex-col gap-2">
-                  <p className="flex items-center gap-2 text-muted-foreground">
-                    <Download size={16} /> 正在下载更新…
-                  </p>
-                  <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
-                    <div
-                      className="h-full bg-primary transition-[width] duration-150"
-                      style={{ width: `${phase.pct ?? 10}%` }}
-                    />
-                  </div>
-                  {phase.pct != null && (
-                    <span className="text-right text-xs tabular-nums text-muted-foreground">
-                      {phase.pct}%
-                    </span>
-                  )}
-                </div>
-              )}
-
-              {phase.kind === "installing" && (
-                <p className="flex items-center gap-2 text-muted-foreground">
-                  <Loader2 size={16} className="animate-spin" /> 正在安装…
-                </p>
-              )}
-
-              {phase.kind === "ready" && (
-                <p>更新已安装,重启后生效。</p>
-              )}
-
-              {phase.kind === "error" &&
-                (isLikelyOfflineError(phase.message) ? (
-                  <div className="flex flex-col gap-1.5">
-                    <p className="text-muted-foreground">
-                      当前无法连接到更新服务器，请检查网络后重试。
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      离线也不影响 STDF 解析等本地功能，可以正常继续使用。
-                    </p>
-                  </div>
-                ) : (
-                  <p className="text-danger">检查更新失败：{phase.message}</p>
-                ))}
-            </div>
-
-            <div className="flex items-center justify-end gap-2 border-t border-border px-4 py-3">
-              {phase.kind === "available" && (
-                <>
-                  <button
-                    type="button"
-                    className={BTN_SECONDARY}
-                    onClick={() => setPhase({ kind: "idle" })}
-                  >
-                    稍后
-                  </button>
-                  <button
-                    type="button"
-                    className={BTN_PRIMARY}
-                    onClick={() => void downloadAndInstall(phase.update)}
-                  >
-                    下载并安装
-                  </button>
-                </>
-              )}
-
-              {phase.kind === "ready" && (
-                <>
-                  <button
-                    type="button"
-                    className={BTN_SECONDARY}
-                    onClick={() => setPhase({ kind: "idle" })}
-                  >
-                    稍后重启
-                  </button>
-                  <button type="button" className={BTN_PRIMARY} onClick={() => void relaunch()}>
-                    立即重启
-                  </button>
-                </>
-              )}
-
-              {(phase.kind === "uptodate" || phase.kind === "error") && (
-                <button
-                  type="button"
-                  className={BTN_SECONDARY}
-                  onClick={() => setPhase({ kind: "idle" })}
-                >
-                  关闭
-                </button>
-              )}
-            </div>
-          </div>
+          <UpdateCard
+            phase={phase}
+            appVersion={appVersion}
+            canClose={!busy}
+            onClose={closeDialog}
+            onInstall={(update) => void downloadAndInstall(update)}
+            onRetry={() => void runCheck(true)}
+            onRelaunch={() => void relaunch()}
+          />
         </div>
       )}
     </>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * The update card: one compact content-first surface. A status badge  *
+ * plus title/subtitle carry the message; actions sit light at the     *
+ * bottom-right without separator chrome.                              *
+ * ------------------------------------------------------------------ */
+function UpdateCard({
+  phase,
+  appVersion,
+  canClose,
+  onClose,
+  onInstall,
+  onRetry,
+  onRelaunch
+}: {
+  phase: Phase;
+  appVersion: string | null;
+  canClose: boolean;
+  onClose: () => void;
+  onInstall: (update: Update) => void;
+  onRetry: () => void;
+  onRelaunch: () => void;
+}) {
+  // Esc closes whenever explicit closing is allowed.
+  useEffect(() => {
+    if (!canClose) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [canClose, onClose]);
+
+  const offline = phase.kind === "error" && isLikelyOfflineError(phase.message);
+  const badge = (tone: string, icon: ReactNode) => (
+    <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${tone}`}>
+      {icon}
+    </div>
+  );
+
+  let badgeNode: ReactNode = null;
+  let title = "";
+  let subtitle: ReactNode = null;
+  switch (phase.kind) {
+    case "checking":
+      badgeNode = badge("bg-primary-soft text-primary", <Loader2 size={19} className="animate-spin" />);
+      title = "正在检查更新…";
+      subtitle = "正在获取最新版本信息。";
+      break;
+    case "uptodate":
+      badgeNode = badge("bg-success-soft text-success", <CheckCircle2 size={19} />);
+      title = "已是最新版本";
+      subtitle = appVersion ? `当前版本 v${appVersion}，无需更新。` : "当前已是最新发布版本。";
+      break;
+    case "available":
+      badgeNode = badge("bg-primary-soft text-primary", <Download size={19} />);
+      title = `发现新版本 v${phase.update.version}`;
+      subtitle = phase.update.currentVersion
+        ? `当前 v${phase.update.currentVersion}，可直接升级。`
+        : "可直接下载安装。";
+      break;
+    case "downloading":
+      badgeNode = badge("bg-primary-soft text-primary", <Download size={19} />);
+      title = "正在下载更新…";
+      subtitle = "下载完成后会自动安装。";
+      break;
+    case "installing":
+      badgeNode = badge("bg-primary-soft text-primary", <Loader2 size={19} className="animate-spin" />);
+      title = "正在安装…";
+      subtitle = "马上就好。";
+      break;
+    case "ready":
+      badgeNode = badge("bg-success-soft text-success", <CheckCircle2 size={19} />);
+      title = "更新已就绪";
+      subtitle = "重启应用后生效。";
+      break;
+    case "error":
+      if (offline) {
+        badgeNode = badge("bg-warning-soft text-warning", <WifiOff size={19} />);
+        title = "无法连接更新服务器";
+        subtitle = "请检查网络后重试。离线不影响解析等本地功能。";
+      } else {
+        badgeNode = badge("bg-danger-soft text-danger", <AlertCircle size={19} />);
+        title = "检查更新失败";
+        subtitle = <span className="break-all">{phase.message}</span>;
+      }
+      break;
+    default:
+      break;
+  }
+
+  return (
+    <div
+      className={`relative flex max-w-full flex-col rounded-2xl border border-border bg-card p-5 shadow-2xl ${
+        phase.kind === "available" ? "w-[460px]" : "w-[360px]"
+      }`}
+      role="dialog"
+      aria-label="软件更新"
+    >
+      {canClose && (
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="关闭"
+          className="absolute right-3 top-3 flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        >
+          <X size={15} />
+        </button>
+      )}
+
+      <div className="flex items-start gap-3 pr-7">
+        {badgeNode}
+        <div className="min-w-0 flex-1 pt-0.5">
+          <p className="text-[15px] font-semibold leading-snug text-foreground">{title}</p>
+          {subtitle && (
+            <p className="mt-0.5 text-[13px] leading-relaxed text-muted-foreground">{subtitle}</p>
+          )}
+        </div>
+      </div>
+
+      {phase.kind === "available" && phase.notes && (
+        <div className="mt-3.5 max-h-56 overflow-auto overscroll-contain rounded-lg border border-border bg-muted/40 px-3 py-2.5">
+          <ReleaseNotes body={phase.notes} />
+        </div>
+      )}
+
+      {phase.kind === "downloading" && (
+        <div className="mt-3.5 flex items-center gap-3">
+          <div className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-muted">
+            <div
+              className={`h-full rounded-full bg-primary transition-[width] duration-150 ${
+                phase.pct == null ? "w-1/3 animate-pulse" : ""
+              }`}
+              style={phase.pct != null ? { width: `${phase.pct}%` } : undefined}
+            />
+          </div>
+          {phase.pct != null && (
+            <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{phase.pct}%</span>
+          )}
+        </div>
+      )}
+
+      {phase.kind === "available" && (
+        <div className="mt-4 flex justify-end gap-2">
+          <button type="button" className={BTN_SECONDARY} onClick={onClose}>
+            稍后
+          </button>
+          <button type="button" className={BTN_PRIMARY} onClick={() => onInstall(phase.update)}>
+            下载并安装
+          </button>
+        </div>
+      )}
+
+      {phase.kind === "ready" && (
+        <div className="mt-4 flex justify-end gap-2">
+          <button type="button" className={BTN_SECONDARY} onClick={onClose}>
+            稍后重启
+          </button>
+          <button type="button" className={BTN_PRIMARY} onClick={onRelaunch}>
+            立即重启
+          </button>
+        </div>
+      )}
+
+      {phase.kind === "error" && (
+        <div className="mt-4 flex justify-end gap-2">
+          <button type="button" className={BTN_SECONDARY} onClick={onClose}>
+            关闭
+          </button>
+          <button type="button" className={BTN_PRIMARY} onClick={onRetry}>
+            重试
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
