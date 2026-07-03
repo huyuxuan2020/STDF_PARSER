@@ -243,6 +243,25 @@ struct PendingPartContext {
     results: HashMap<(String, u32), TestItemCell>,
 }
 
+/// Official bin counts from HBR/SBR records. HEAD_NUM=255 marks the tester's
+/// overall summary record; other head numbers are per-site partials that must
+/// only be summed when no summary record exists (never both).
+#[derive(Clone, Copy, Default)]
+struct DeclaredBinCounts {
+    summary: Option<u64>,
+    site_sum: u64,
+}
+
+impl DeclaredBinCounts {
+    fn resolve(&self, prefer_summary: bool) -> u64 {
+        if prefer_summary {
+            self.summary.unwrap_or(0)
+        } else {
+            self.site_sum
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct TestItemAccumulator {
     columns_by_key: HashMap<(String, u32), TestItemColumn>,
@@ -253,6 +272,12 @@ struct TestItemAccumulator {
     hbin_pf: HashMap<String, String>,
     sbin_names: HashMap<String, String>,
     sbin_pf: HashMap<String, String>,
+    hbin_declared: HashMap<String, DeclaredBinCounts>,
+    sbin_declared: HashMap<String, DeclaredBinCounts>,
+    /// Last-touchdown (sbin, hbin) per die identity — X/Y coordinates when the
+    /// file carries them (CP), else PART_ID:site. Retested dies overwrite their
+    /// earlier touchdown, so counting this map yields per-die final results.
+    die_bins: HashMap<String, (String, String)>,
     open_parts: HashMap<(String, String), PendingPartContext>,
     part_rows: HashMap<(String, String), TestItemPartRow>,
     part_order: Vec<(String, String)>,
@@ -1240,7 +1265,15 @@ fn update_test_item_accumulator(
             if !key.is_empty() {
                 acc.hbin_names
                     .insert(key.clone(), field_value(fields, "HBIN_NAM"));
-                acc.hbin_pf.insert(key, field_value(fields, "HBIN_PF"));
+                acc.hbin_pf
+                    .insert(key.clone(), field_value(fields, "HBIN_PF"));
+                let count = field_value(fields, "HBIN_CNT").parse::<u64>().unwrap_or(0);
+                let declared = acc.hbin_declared.entry(key).or_default();
+                if field_value(fields, "HEAD_NUM") == "255" {
+                    declared.summary = Some(count);
+                } else {
+                    declared.site_sum += count;
+                }
             }
         }
         "SBR" => {
@@ -1248,7 +1281,15 @@ fn update_test_item_accumulator(
             if !key.is_empty() {
                 acc.sbin_names
                     .insert(key.clone(), field_value(fields, "SBIN_NAM"));
-                acc.sbin_pf.insert(key, field_value(fields, "SBIN_PF"));
+                acc.sbin_pf
+                    .insert(key.clone(), field_value(fields, "SBIN_PF"));
+                let count = field_value(fields, "SBIN_CNT").parse::<u64>().unwrap_or(0);
+                let declared = acc.sbin_declared.entry(key).or_default();
+                if field_value(fields, "HEAD_NUM") == "255" {
+                    declared.summary = Some(count);
+                } else {
+                    declared.site_sum += count;
+                }
             }
         }
         "PTR" | "FTR" | "MPR" => {
@@ -1331,6 +1372,25 @@ fn update_test_item_accumulator(
             }
             let sbin_num = field_value(fields, "SOFT_BIN");
             let hbin_num = field_value(fields, "HARD_BIN");
+            // Track final bins per die: X/Y is the die identity on wafer files
+            // (retests reappear at the same coordinates under a fresh PART_ID);
+            // -32768 is the STDF "no coordinate" sentinel.
+            {
+                let x = field_value(fields, "X_COORD");
+                let y = field_value(fields, "Y_COORD");
+                let has_xy = !x.is_empty() && !y.is_empty() && !(x == "-32768" || y == "-32768");
+                let die_key = if has_xy {
+                    format!("xy:{x}:{y}")
+                } else {
+                    format!(
+                        "id:{}:{}",
+                        field_value(fields, "PART_ID"),
+                        field_value(fields, "SITE_NUM")
+                    )
+                };
+                acc.die_bins
+                    .insert(die_key, (sbin_num.clone(), hbin_num.clone()));
+            }
             pending.sbin_num = sbin_num.clone();
             pending.sbin_name = acc.sbin_names.get(&sbin_num).cloned().unwrap_or_default();
             pending.sbin_pf = acc.sbin_pf.get(&sbin_num).cloned().unwrap_or_default();
@@ -1513,65 +1573,67 @@ fn format_duration(secs: i64) -> String {
     )
 }
 
-/// Build the whole test-item matrix as an STS8300-style CSV string. Metadata is a
-/// best-effort reconstruction from the STDF MIR/MRR + a computed bin summary; the
-/// data section mirrors the reference layout (left fixed columns + one column per
-/// test item, with Unit/LimitL/LimitU header rows).
+/// Per-bin counts: the tester's declared HBR/SBR totals when the file carries
+/// them (they already account for retests), else computed from the final
+/// result of each die (see `TestItemAccumulator::die_bins`).
+fn resolve_bin_counts(
+    declared: &HashMap<String, DeclaredBinCounts>,
+    die_bins: &HashMap<String, (String, String)>,
+    pick: impl Fn(&(String, String)) -> &String,
+) -> HashMap<String, usize> {
+    if !declared.is_empty() {
+        let prefer_summary = declared.values().any(|d| d.summary.is_some());
+        let counts: HashMap<String, usize> = declared
+            .iter()
+            .map(|(num, d)| (num.clone(), d.resolve(prefer_summary) as usize))
+            .collect();
+        if counts.values().sum::<usize>() > 0 {
+            return counts;
+        }
+    }
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for bins in die_bins.values() {
+        *counts.entry(pick(bins).clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
 fn build_bin_summary(
     session_id: &str,
     acc: &TestItemAccumulator,
     status: &ParseStatus,
 ) -> BinSummary {
-    let mut sbin_order: Vec<String> = Vec::new();
-    let mut sbin_counts: HashMap<String, usize> = HashMap::new();
-    let mut hbin_order: Vec<String> = Vec::new();
-    let mut hbin_counts: HashMap<String, usize> = HashMap::new();
-    let mut total = 0_usize;
-    let mut sbin_pass = 0_usize;
-    let mut hbin_pass = 0_usize;
-    for key in &acc.part_order {
-        let Some(row) = acc.part_rows.get(key) else {
-            continue;
-        };
-        total += 1;
-        if bin_passed(&acc.sbin_pf, &row.sbin_num, &row.sbin_pf) {
-            sbin_pass += 1;
-        }
-        if bin_passed(&acc.hbin_pf, &row.hbin_num, &row.hbin_pf) {
-            hbin_pass += 1;
-        }
-        let sbin_count = sbin_counts.entry(row.sbin_num.clone()).or_insert_with(|| {
-            sbin_order.push(row.sbin_num.clone());
-            0
-        });
-        *sbin_count += 1;
-        let hbin_count = hbin_counts.entry(row.hbin_num.clone()).or_insert_with(|| {
-            hbin_order.push(row.hbin_num.clone());
-            0
-        });
-        *hbin_count += 1;
-    }
-    sbin_order.sort_by(|a, b| bin_num_order(a, b));
-    hbin_order.sort_by(|a, b| bin_num_order(a, b));
+    let sbin_counts = resolve_bin_counts(&acc.sbin_declared, &acc.die_bins, |(sbin, _)| sbin);
+    let hbin_counts = resolve_bin_counts(&acc.hbin_declared, &acc.die_bins, |(_, hbin)| hbin);
 
-    let sbins = sbin_order
-        .iter()
-        .map(|num| BinStat {
-            num: num.clone(),
-            name: bin_lookup(&acc.sbin_names, num, ""),
-            pf: bin_lookup(&acc.sbin_pf, num, ""),
-            count: sbin_counts[num],
-        })
-        .collect();
-    let hbins = hbin_order
-        .iter()
-        .map(|num| BinStat {
-            num: num.clone(),
-            name: bin_lookup(&acc.hbin_names, num, ""),
-            pf: bin_lookup(&acc.hbin_pf, num, ""),
-            count: hbin_counts[num],
-        })
-        .collect();
+    let to_stats = |counts: &HashMap<String, usize>,
+                    names: &HashMap<String, String>,
+                    pf: &HashMap<String, String>| {
+        let mut order: Vec<&String> = counts.keys().collect();
+        order.sort_by(|a, b| bin_num_order(a, b));
+        order
+            .into_iter()
+            .map(|num| BinStat {
+                num: num.clone(),
+                name: bin_lookup(names, num, ""),
+                pf: bin_lookup(pf, num, ""),
+                count: counts[num],
+            })
+            .collect::<Vec<_>>()
+    };
+    let sbins = to_stats(&sbin_counts, &acc.sbin_names, &acc.sbin_pf);
+    let hbins = to_stats(&hbin_counts, &acc.hbin_names, &acc.hbin_pf);
+
+    let passed = |counts: &HashMap<String, usize>, pf: &HashMap<String, String>| {
+        counts
+            .iter()
+            .filter(|(num, _)| bin_passed(pf, num, ""))
+            .map(|(_, count)| *count)
+            .sum::<usize>()
+    };
+    let sbin_pass = passed(&sbin_counts, &acc.sbin_pf);
+    let hbin_pass = passed(&hbin_counts, &acc.hbin_pf);
+    let total = hbin_counts.values().sum::<usize>();
 
     let has_bin_pf = acc
         .hbin_pf
@@ -1608,20 +1670,15 @@ fn build_test_item_csv(snapshot: &SessionSnapshot, acc: &TestItemAccumulator) ->
         .iter()
         .filter_map(|key| acc.part_rows.get(key))
         .collect();
-    let total = parts.len();
 
-    // Pass/fail per bin type (the hard-bin and soft-bin sections each get their own
-    // statistics). PASSFG follows the soft-bin disposition, matching the reference tool
-    // where PASSFG correlates with SOFT_BIN. When a file omits bin PF, bin 1 = pass.
+    // Bin totals/yield come from the shared summary (declared HBR/SBR counts,
+    // retest-deduplicated) so the CSV header agrees with the overview page.
+    // PASSFG per data ROW still follows each touchdown's own soft bin.
+    let bins = build_bin_summary(&snapshot.session_id, acc, &snapshot.status);
+    let total = bins.total_parts;
+    let hbin_pass = bins.hbin_pass;
+    let sbin_pass = bins.sbin_pass;
     let part_pass = |row: &TestItemPartRow| bin_passed(&acc.sbin_pf, &row.sbin_num, &row.sbin_pf);
-    let hbin_pass = parts
-        .iter()
-        .filter(|r| bin_passed(&acc.hbin_pf, &r.hbin_num, &r.hbin_pf))
-        .count();
-    let sbin_pass = parts
-        .iter()
-        .filter(|r| bin_passed(&acc.sbin_pf, &r.sbin_num, &r.sbin_pf))
-        .count();
 
     let avg_t = {
         let mut sum = 0.0f64;
@@ -1639,33 +1696,14 @@ fn build_test_item_csv(snapshot: &SessionSnapshot, acc: &TestItemAccumulator) ->
         }
     };
 
-    // Soft-bin summary: (count, name, hard bin), sorted by bin number.
-    let mut sbin_order: Vec<String> = Vec::new();
-    let mut sbin_stats: HashMap<String, (usize, String, String)> = HashMap::new();
+    // The soft-bin section shows each bin's hard-bin counterpart — derive the
+    // mapping from the first part seen in that soft bin.
+    let mut sbin_to_hbin: HashMap<String, String> = HashMap::new();
     for row in &parts {
-        let entry = sbin_stats.entry(row.sbin_num.clone()).or_insert_with(|| {
-            sbin_order.push(row.sbin_num.clone());
-            (
-                0,
-                bin_lookup(&acc.sbin_names, &row.sbin_num, &row.sbin_name),
-                row.hbin_num.clone(),
-            )
-        });
-        entry.0 += 1;
+        sbin_to_hbin
+            .entry(row.sbin_num.clone())
+            .or_insert_with(|| row.hbin_num.clone());
     }
-    sbin_order.sort_by(|a, b| bin_num_order(a, b));
-
-    // Hard-bin summary, sorted by bin number (shown above the soft-bin summary).
-    let mut hbin_order: Vec<String> = Vec::new();
-    let mut hbin_stats: HashMap<String, (usize, String)> = HashMap::new();
-    for row in &parts {
-        let entry = hbin_stats.entry(row.hbin_num.clone()).or_insert_with(|| {
-            hbin_order.push(row.hbin_num.clone());
-            (0, bin_lookup(&acc.hbin_names, &row.hbin_num, &row.hbin_name))
-        });
-        entry.0 += 1;
-    }
-    hbin_order.sort_by(|a, b| bin_num_order(a, b));
 
     // ----- metadata block -----
     let node = key_field(snapshot, "MIR", "NODE_NAM");
@@ -1713,14 +1751,13 @@ fn build_test_item_csv(snapshot: &SessionSnapshot, acc: &TestItemAccumulator) ->
     push_meta(&mut out, &format!("Total: {}", total));
     push_meta(&mut out, &format!("Pass: {}   {}%", hbin_pass, pct(hbin_pass, total)));
     push_meta(&mut out, &format!("Fail: {}   {}%", total - hbin_pass, pct(total - hbin_pass, total)));
-    for hbin in &hbin_order {
-        let (count, name) = &hbin_stats[hbin];
-        let label = if name.is_empty() {
-            format!("HBin[{}]", hbin)
+    for bin in &bins.hbins {
+        let label = if bin.name.is_empty() {
+            format!("HBin[{}]", bin.num)
         } else {
-            format!("HBin[{}] {}", hbin, name)
+            format!("HBin[{}] {}", bin.num, bin.name)
         };
-        push_meta(&mut out, &format!("{}  {}  {}%", label, count, pct(*count, total)));
+        push_meta(&mut out, &format!("{}  {}  {}%", label, bin.count, pct(bin.count, total)));
     }
     push_meta(&mut out, "");
 
@@ -1728,16 +1765,16 @@ fn build_test_item_csv(snapshot: &SessionSnapshot, acc: &TestItemAccumulator) ->
     push_meta(&mut out, &format!("Total: {}", total));
     push_meta(&mut out, &format!("Pass: {}   {}%", sbin_pass, pct(sbin_pass, total)));
     push_meta(&mut out, &format!("Fail: {}   {}%", total - sbin_pass, pct(total - sbin_pass, total)));
-    for sbin in &sbin_order {
-        let (count, name, hbin) = &sbin_stats[sbin];
-        let label = if name.is_empty() {
-            format!("SBin[{}]", sbin)
+    for bin in &bins.sbins {
+        let label = if bin.name.is_empty() {
+            format!("SBin[{}]", bin.num)
         } else {
-            format!("SBin[{}] {}", sbin, name)
+            format!("SBin[{}] {}", bin.num, bin.name)
         };
+        let hbin = sbin_to_hbin.get(&bin.num).cloned().unwrap_or_default();
         push_meta(
             &mut out,
-            &format!("{}  {}  {}%  {}", label, count, pct(*count, total), hbin),
+            &format!("{}  {}  {}%  {}", label, bin.count, pct(bin.count, total), hbin),
         );
     }
     push_meta(&mut out, "");
@@ -3413,6 +3450,110 @@ mod tests {
         let _ = std::fs::remove_file(second_db);
     }
 
+    /// Retest wafer: two dies, three touchdowns. Die (10,20) fails (bin 2)
+    /// then passes on retest (bin 1, a NEW PART_ID); die (11,20) fails.
+    /// The optional HBR/SBR records carry the tester's official (already
+    /// deduplicated) counts: bin 1 = 1, bin 2 = 1.
+    fn build_retest_fixture(with_bin_records: bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(record(0, 10, &[2, 4]));
+        if with_bin_records {
+            for (typ, num, pf, name) in [
+                (1_u8, 1_u16, "P", "GOOD"),
+                (1, 2, "F", "BAD"),
+                (2, 1, "P", "pass"),
+                (2, 2, "F", "fail"),
+            ] {
+                let mut bin = Vec::new();
+                push_payload(
+                    &mut bin,
+                    &[u1(255), u1(0), u2(num), u4(1), c1(pf), cn(name)],
+                );
+                bytes.extend(record(1, if typ == 1 { 40 } else { 50 }, &bin));
+            }
+        }
+        for (hbin, sbin, x, y, part) in [
+            (2_u16, 2_u16, 10, 20, "P1"),
+            (2, 2, 11, 20, "P2"),
+            (1, 1, 10, 20, "P3"),
+        ] {
+            let mut pir = Vec::new();
+            push_payload(&mut pir, &[u1(1), u1(1)]);
+            bytes.extend(record(5, 10, &pir));
+            let mut prr = Vec::new();
+            push_payload(
+                &mut prr,
+                &[
+                    u1(1),
+                    u1(1),
+                    u1(0),
+                    u2(0),
+                    u2(hbin),
+                    u2(sbin),
+                    i2(x),
+                    i2(y),
+                    u4(1000),
+                    cn(part),
+                    cn(""),
+                ],
+            );
+            bytes.extend(record(5, 20, &prr));
+        }
+        bytes
+    }
+
+    fn parse_to_completion(bytes: Vec<u8>, name: &str) -> (SessionManager, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join(name);
+        std::fs::write(&file_path, bytes).expect("write fixture");
+        let manager = SessionManager::default();
+        let (tx, rx) = mpsc::channel();
+        let session = manager
+            .open_stdf(file_path.to_string_lossy().to_string(), move |event| {
+                let _ = tx.send(event);
+            })
+            .expect("open session");
+        for _ in 0..200 {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(SessionEvent::Complete(_)) => return (manager, session.session_id),
+                Ok(SessionEvent::Error(error)) => panic!("unexpected parse error: {error:?}"),
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        panic!("parser should complete");
+    }
+
+    #[test]
+    fn bin_summary_prefers_declared_counts_on_retest_files() {
+        let (manager, sid) = parse_to_completion(build_retest_fixture(true), "retest.stdf");
+        let summary = manager.get_bin_summary(&sid).expect("bin summary");
+        // 3 touchdowns but 2 dies — the HBR/SBR declared counts are the truth.
+        assert_eq!(summary.total_parts, 2);
+        assert_eq!(summary.hbin_pass, 1);
+        assert_eq!(summary.sbin_pass, 1);
+        let hbin1 = summary.hbins.iter().find(|b| b.num == "1").expect("hbin 1");
+        assert_eq!(hbin1.count, 1);
+        assert_eq!(hbin1.name, "GOOD");
+        let hbin2 = summary.hbins.iter().find(|b| b.num == "2").expect("hbin 2");
+        assert_eq!(hbin2.count, 1);
+    }
+
+    #[test]
+    fn bin_summary_dedupes_dies_by_coordinates_without_bin_records() {
+        let (manager, sid) = parse_to_completion(build_retest_fixture(false), "retest-nobins.stdf");
+        let summary = manager.get_bin_summary(&sid).expect("bin summary");
+        // No HBR/SBR: fall back to per-die last-result over (X,Y) coordinates.
+        assert_eq!(summary.total_parts, 2);
+        assert!(!summary.has_bin_pf);
+        let hbin1 = summary.hbins.iter().find(|b| b.num == "1").expect("hbin 1");
+        assert_eq!(hbin1.count, 1);
+        let hbin2 = summary.hbins.iter().find(|b| b.num == "2").expect("hbin 2");
+        assert_eq!(hbin2.count, 1);
+        // "bin 1 = pass" convention applies without PF flags.
+        assert_eq!(summary.sbin_pass, 1);
+    }
+
     #[test]
     fn bin_summary_reports_totals_pass_counts_and_per_bin_stats() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3595,6 +3736,10 @@ mod tests {
         acc.sbin_pf.insert("1".to_string(), "P".to_string());
         acc.hbin_names.insert("1".to_string(), "GOOD".to_string());
         acc.hbin_pf.insert("1".to_string(), "P".to_string());
+        // What the PRR arm records during a real parse — the bin summary
+        // counts dies from here (no HBR/SBR declared counts in this fixture).
+        acc.die_bins
+            .insert("id:P1:0".to_string(), ("1".to_string(), "1".to_string()));
 
         let pkey = ("P1".to_string(), "0".to_string());
         acc.part_order.push(pkey.clone());
