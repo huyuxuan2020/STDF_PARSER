@@ -42,6 +42,51 @@ describe("App", () => {
     expect((await screen.findAllByText("demo-2.stdf")).length).toBeGreaterThan(0);
   });
 
+  it("parses DTR text from the DTR record panel and downloads the txt", async () => {
+    const api = createMockApi();
+    const parseDtrText = vi.spyOn(api, "parseDtrText");
+    const saveTxtDialog = vi.spyOn(api, "saveTxtDialog");
+    const saveDtrText = vi.spyOn(api, "saveDtrText");
+    const user = userEvent.setup();
+
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
+    await screen.findByRole("main", { name: "文件摘要" });
+    await user.click(screen.getByRole("button", { name: "明细" }));
+    await user.click(await screen.findByRole("button", { name: "DTR 3 条记录" }));
+
+    // The DTR panel replaces the generic "no data fields" empty state with a
+    // parse call to action; downloading only unlocks after a successful parse.
+    await user.click(await screen.findByRole("button", { name: "解析 DTR 文本" }));
+    expect(parseDtrText).toHaveBeenCalledWith("session-1");
+    expect(await screen.findByText(/共 3 条/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "下载 TXT" }));
+    expect(saveTxtDialog).toHaveBeenCalledWith("demo-1_DTR.txt");
+    await waitFor(() => expect(saveDtrText).toHaveBeenCalledWith("session-1", "/tmp/export.txt"));
+    expect(await screen.findByText("已保存 ✓")).toBeInTheDocument();
+  });
+
+  it("shows an inline error and allows retry when DTR parsing fails", async () => {
+    const api = createMockApi({
+      parseDtrText: async () => {
+        throw new Error("读取 STDF 失败: 模拟错误");
+      }
+    });
+    const user = userEvent.setup();
+
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
+    await screen.findByRole("main", { name: "文件摘要" });
+    await user.click(screen.getByRole("button", { name: "明细" }));
+    await user.click(await screen.findByRole("button", { name: "DTR 3 条记录" }));
+
+    await user.click(await screen.findByRole("button", { name: "解析 DTR 文本" }));
+    expect(await screen.findByText(/读取 STDF 失败: 模拟错误/)).toBeInTheDocument();
+    // The parse button stays available so the user can retry in place.
+    expect(screen.getByRole("button", { name: "解析 DTR 文本" })).toBeEnabled();
+  });
+
   it("shows yield and bin statistics on the overview once parsing completes", async () => {
     const api = createMockApi();
     const user = userEvent.setup();
@@ -54,10 +99,11 @@ describe("App", () => {
       api.emitComplete("session-1");
     });
 
-    // Yield summary: total / pass / yield percentage.
-    expect(await screen.findByText("良率与 Bin 统计")).toBeInTheDocument();
+    // Yield hero: label + total + pass % (count-up settles at the final value).
+    expect(await screen.findByText("良率")).toBeInTheDocument();
     expect(screen.getByText("100")).toBeInTheDocument(); // total parts
-    expect(screen.getAllByText("97.0%").length).toBeGreaterThan(0); // sbin-based yield
+    // Yield % animates from 0 up to 97.0; wait for the settled digit.
+    expect(await screen.findByText("97.0")).toBeInTheDocument();
     // Both bin tables render with names and counts.
     expect(screen.getByText("FAIL_BIN")).toBeInTheDocument();
     expect(screen.getByText("GOOD")).toBeInTheDocument();
@@ -253,6 +299,32 @@ describe("App", () => {
     await screen.findByRole("main", { name: "文件摘要" });
 
     expect(screen.getByRole("button", { name: "测试项" })).toBeDisabled();
+  });
+
+  it("ignores parse errors from superseded sessions and lets the banner be dismissed", async () => {
+    const api = createMockApi();
+    const user = userEvent.setup();
+
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
+    await screen.findByRole("main", { name: "文件摘要" });
+
+    // Opening a new file evicts older backend sessions, whose parse threads
+    // can still emit errors while winding down — those must not paint a
+    // banner over the session that won.
+    act(() => {
+      api.emitError({ session_id: "stale-session", message: "解析会话不存在" });
+    });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    // Errors for the live session still surface, and the banner can be closed.
+    act(() => {
+      api.emitError({ session_id: "session-1", message: "字段在读取过程中被截断" });
+    });
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("字段在读取过程中被截断");
+    await user.click(screen.getByRole("button", { name: "关闭错误提示" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("does not let stale snapshot reset parse progress", async () => {

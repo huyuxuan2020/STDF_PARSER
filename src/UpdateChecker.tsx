@@ -12,8 +12,8 @@ import { AlertCircle, CheckCircle2, Download, Loader2, RefreshCw, WifiOff, X } f
  * ------------------------------------------------------------------ */
 
 const RAIL_ITEM =
-  "flex h-14 w-14 flex-col items-center justify-center gap-1 rounded-xl text-[10px] font-medium transition duration-100 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
-const RAIL_ITEM_IDLE = "text-muted-foreground hover:bg-border/40 hover:text-foreground";
+  "flex h-14 w-14 flex-col items-center justify-center gap-1 rounded-xl text-[11px] font-medium transition duration-100 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+const RAIL_ITEM_IDLE = "text-muted-foreground hover:bg-foreground/5 hover:text-foreground";
 // Compact dialog buttons — the update card is content-first, so actions stay light.
 const BTN_BASE =
   "inline-flex h-9 items-center justify-center gap-1.5 rounded-lg px-3.5 text-[13px] font-medium transition duration-100 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
@@ -422,7 +422,7 @@ export function UpdateChecker() {
         // The backdrop is intentionally inert: dismissing is an explicit act
         // (×, 稍后, Esc), so a stray click never kills an in-flight check.
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-6"
+          className="overlay-fade fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-6"
           role="presentation"
         >
           <UpdateCard
@@ -532,7 +532,7 @@ function UpdateCard({
 
   return (
     <div
-      className={`relative flex max-w-full flex-col rounded-2xl border border-border bg-card p-5 shadow-2xl ${
+      className={`pop-in relative flex max-w-full flex-col rounded-2xl border border-border bg-card p-5 shadow-overlay ${
         phase.kind === "available" ? "w-[460px]" : "w-[360px]"
       }`}
       role="dialog"

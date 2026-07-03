@@ -6,17 +6,24 @@ import {
   ChevronRight,
   CircleDot,
   Download,
+  FileText,
   Filter,
   FolderOpen,
+  Hourglass,
+  Inbox,
   LayoutDashboard,
   Loader2,
   Moon,
+  MousePointerClick,
+  ScanText,
   Search,
+  SearchX,
   Sun,
   TableProperties,
   Table2,
   X,
-  XCircle
+  XCircle,
+  type LucideIcon
 } from "lucide-react";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { computeMatrixWindow } from "./matrixWindow";
@@ -54,6 +61,11 @@ const THEME_KEY = "stdf-theme";
  * ------------------------------------------------------------------ */
 const EYEBROW = "text-[11px] font-semibold uppercase tracking-wide text-muted-foreground";
 
+// One page gutter: every top-level view surface (header, banners, view
+// sections, the records detail pane) shares the same 20px inset so content
+// on every page sits on a single left rhythm line.
+const PAGE_PAD = "p-5";
+
 const BTN_BASE =
   "inline-flex min-h-[40px] items-center justify-center gap-2 rounded-md px-3.5 text-sm font-medium transition duration-100 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
 const BTN_PRIMARY = `${BTN_BASE} bg-primary text-primary-foreground hover:bg-primary-hover`;
@@ -62,8 +74,8 @@ const PAGER_BTN =
   "inline-flex h-7 select-none items-center gap-0.5 rounded-md border border-border-strong bg-card px-2 text-xs font-medium text-muted-foreground transition duration-100 hover:bg-muted hover:text-foreground active:scale-95 active:border-primary active:bg-primary-soft active:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
 
 const RAIL_ITEM =
-  "flex h-14 w-14 flex-col items-center justify-center gap-1 rounded-xl text-[10px] font-medium transition duration-100 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
-const RAIL_ITEM_IDLE = "text-muted-foreground hover:bg-border/40 hover:text-foreground";
+  "relative flex h-14 w-14 flex-col items-center justify-center gap-1 rounded-xl text-[11px] font-medium transition duration-100 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+const RAIL_ITEM_IDLE = "text-muted-foreground hover:bg-foreground/5 hover:text-foreground";
 const RAIL_ITEM_ACTIVE = "bg-primary-soft text-primary";
 
 // overscroll-contain: reaching an inner table's scroll end must not chain the
@@ -165,6 +177,23 @@ const ONEDATA_KEY_FIELDS: KeyFieldSpec[] = [
   { rec: "SDR", field: "LOAD_ID", oneData: "probecardLoadboardId", scope: "ft" }
 ];
 
+// On-demand DTR text extraction (明细 → DTR 记录面板). Per-session state:
+// parse re-scans the file into a backend temp txt, download copies it out.
+interface DtrParseState {
+  phase: "idle" | "parsing" | "done" | "error";
+  count: number;
+  message: string;
+  saving: boolean;
+  saved: boolean;
+}
+const IDLE_DTR_PARSE: DtrParseState = {
+  phase: "idle",
+  count: 0,
+  message: "",
+  saving: false,
+  saved: false
+};
+
 interface AppProps {
   api?: StdfApi;
 }
@@ -218,6 +247,7 @@ export default function App({ api = tauriApi }: AppProps) {
   const [tiColumnsLoading, setTiColumnsLoading] = useState(false);
   const [tiExporting, setTiExporting] = useState(false);
   const [tiExported, setTiExported] = useState(false);
+  const [dtrParse, setDtrParse] = useState<DtrParseState>(IDLE_DTR_PARSE);
   const [tiHasBinPf, setTiHasBinPf] = useState(true);
   // Bumped whenever the column window / selection changes, to drop stale "load more" responses.
   const tiEpoch = useRef(0);
@@ -232,6 +262,12 @@ export default function App({ api = tauriApi }: AppProps) {
   const [theme, setTheme] = useState<Theme>(readInitialTheme);
   const sessionIdRef = useRef<string | null>(null);
   const sessionStatusRef = useRef<ParseSession["status"] | null>(null);
+  // Serializes competing file opens (double drop events, rapid re-drops). The
+  // backend keeps a single session and evicts every older one on open, so a
+  // superseded open chain must go silent — otherwise its doomed follow-up
+  // calls reject with "解析会话不存在" and paint a stale error banner over the
+  // session that actually won.
+  const openSeqRef = useRef(0);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -245,6 +281,26 @@ export default function App({ api = tauriApi }: AppProps) {
   }, [theme]);
 
   const toggleTheme = () => setTheme((current) => (current === "dark" ? "light" : "dark"));
+
+  // ⌘O / Ctrl+O opens the file picker from anywhere — mirrors the rail button
+  // and backs the shortcut hint on the launch screen.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (
+        (event.metaKey || event.ctrlKey) &&
+        !event.shiftKey &&
+        !event.altKey &&
+        event.key.toLowerCase() === "o"
+      ) {
+        event.preventDefault();
+        openAnotherFile();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // openAnotherFile is a hoisted function declaration whose only moving part is `api`.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api]);
 
   const progressPercent = useMemo(() => {
     if (!progress || progress.total_bytes === 0) return 0;
@@ -291,7 +347,12 @@ export default function App({ api = tauriApi }: AppProps) {
       cleanupSnapshot = cleanup;
     });
     api.onNativeFileDrop((path) => {
-      api.openDroppedFile(path).then(startSession).catch((err) => setError(String(err)));
+      // The disposed guard matters here: in dev StrictMode the first mount's
+      // listener can outlive its cleanup (registration is async, so cleanup
+      // runs before the unlisten fn exists). Without the guard one physical
+      // drop fires two open_stdf calls and the second evicts the first's
+      // session mid-flight.
+      if (!disposed) openSessionFrom(api.openDroppedFile(path));
     }).then((cleanup) => {
       cleanupNativeDrop = cleanup;
     });
@@ -305,7 +366,10 @@ export default function App({ api = tauriApi }: AppProps) {
       cleanupComplete = cleanup;
     });
     api.onParseError((event: ParseErrorEvent) => {
-      if (!disposed) setError(event.message);
+      // Same session guard as warnings: an evicted session's parse thread can
+      // still emit errors while it winds down — those belong to a session the
+      // UI has already left behind.
+      if (!disposed && sessionIdRef.current === event.session_id) setError(event.message);
     }).then((cleanup) => {
       cleanupError = cleanup;
     });
@@ -370,6 +434,7 @@ export default function App({ api = tauriApi }: AppProps) {
     setTiSelected([]);
     setTiFilterOpen(false);
     setTiAllColumns([]);
+    setDtrParse(IDLE_DTR_PARSE);
   }, [session?.session_id]);
 
   // Fetch the yield/bin distribution once parsing completes.
@@ -576,15 +641,20 @@ export default function App({ api = tauriApi }: AppProps) {
       .finally(() => setTiLoadingMore(false));
   }
 
+  // STDF filename without compression/format extensions — the stem every
+  // export (CSV, DTR txt) derives its default filename from.
+  function sessionBaseName() {
+    return (session?.file_name || "export")
+      .replace(/\.(gz|zip)$/i, "")
+      .replace(/\.(stdf|std)$/i, "");
+  }
+
   // Export the full test-item matrix to a CSV the user picks via a save dialog.
   // Default name = STDF filename with a .csv extension; the backend writes the file.
   async function exportTestItemsCsv() {
     const sessionId = session?.session_id;
     if (!sessionId || tiExporting) return;
-    const base = (session?.file_name || "export")
-      .replace(/\.(gz|zip)$/i, "")
-      .replace(/\.(stdf|std)$/i, "");
-    const path = await api.saveCsvDialog(`${base}.csv`);
+    const path = await api.saveCsvDialog(`${sessionBaseName()}.csv`);
     if (!path) return;
     setTiExporting(true);
     setTiExported(false);
@@ -596,6 +666,39 @@ export default function App({ api = tauriApi }: AppProps) {
       setError(`导出 CSV 失败：${String(err)}`);
     } finally {
       setTiExporting(false);
+    }
+  }
+
+  // Scan the whole file for DTR records and stage their text in a backend
+  // temp txt. Deliberately re-runnable — 重新解析 just repeats the scan.
+  async function handleParseDtr() {
+    const sessionId = session?.session_id;
+    if (!sessionId || dtrParse.phase === "parsing") return;
+    setDtrParse({ ...IDLE_DTR_PARSE, phase: "parsing" });
+    try {
+      const result = await api.parseDtrText(sessionId);
+      if (sessionIdRef.current !== sessionId) return; // superseded by a newer open
+      setDtrParse({ ...IDLE_DTR_PARSE, phase: "done", count: result.count });
+    } catch (err) {
+      if (sessionIdRef.current !== sessionId) return;
+      setDtrParse({ ...IDLE_DTR_PARSE, phase: "error", message: String(err) });
+    }
+  }
+
+  // Copy the staged DTR txt to a user-picked path (save dialog first, so a
+  // cancelled dialog costs nothing).
+  async function handleDownloadDtr() {
+    const sessionId = session?.session_id;
+    if (!sessionId || dtrParse.phase !== "done" || dtrParse.saving) return;
+    const path = await api.saveTxtDialog(`${sessionBaseName()}_DTR.txt`);
+    if (!path) return;
+    setDtrParse((prev) => ({ ...prev, saving: true, saved: false, message: "" }));
+    try {
+      await api.saveDtrText(sessionId, path);
+      setDtrParse((prev) => ({ ...prev, saving: false, saved: true }));
+      window.setTimeout(() => setDtrParse((prev) => ({ ...prev, saved: false })), 2500);
+    } catch (err) {
+      setDtrParse((prev) => ({ ...prev, saving: false, message: `保存 TXT 失败：${String(err)}` }));
     }
   }
 
@@ -666,7 +769,11 @@ export default function App({ api = tauriApi }: AppProps) {
     setTiSelected([]);
     setTiFilterOpen(false);
     setTiAllColumns([]);
+    setDtrParse(IDLE_DTR_PARSE);
     const initialSnapshot = await api.getSessionSnapshot(nextSession.session_id);
+    // A newer open may have taken over while the snapshot was in flight —
+    // its state must not be clobbered with this session's data.
+    if (sessionIdRef.current !== nextSession.session_id) return;
     applySnapshot(initialSnapshot);
     void hydrateEarlySnapshot(nextSession.session_id);
   }
@@ -675,7 +782,13 @@ export default function App({ api = tauriApi }: AppProps) {
     for (let attempt = 0; attempt < 20; attempt += 1) {
       if (sessionIdRef.current !== sessionId) return;
       await new Promise((resolve) => window.setTimeout(resolve, 100));
-      const nextSnapshot = await api.getSessionSnapshot(sessionId);
+      let nextSnapshot: SessionSnapshot;
+      try {
+        nextSnapshot = await api.getSessionSnapshot(sessionId);
+      } catch {
+        // Session evicted by a newer open — stop polling quietly.
+        return;
+      }
       if (sessionIdRef.current !== sessionId) return;
       applySnapshot(nextSnapshot);
       if (Object.keys(nextSnapshot.key_fields).length > 0 || nextSnapshot.status !== "running") {
@@ -684,12 +797,22 @@ export default function App({ api = tauriApi }: AppProps) {
     }
   }
 
-  async function openAnotherFile() {
-    try {
-      await api.openFile().then(startSession);
-    } catch (err) {
-      setError(String(err));
-    }
+  // Every file-open entry point (dialog, native drop, HTML drop) funnels
+  // through here so competing opens can't interleave: only the latest one may
+  // adopt its session or surface its failure.
+  function openSessionFrom(pending: Promise<ParseSession | null>) {
+    const seq = ++openSeqRef.current;
+    pending
+      .then((next) => {
+        if (seq === openSeqRef.current) return startSession(next);
+      })
+      .catch((err) => {
+        if (seq === openSeqRef.current) setError(String(err));
+      });
+  }
+
+  function openAnotherFile() {
+    openSessionFrom(api.openFile());
   }
 
   function handleDrop(event: React.DragEvent<HTMLDivElement>) {
@@ -698,12 +821,14 @@ export default function App({ api = tauriApi }: AppProps) {
     const file = event.dataTransfer.files[0];
     const path = "path" in file ? String((file as File & { path?: string }).path) : "";
     if (path) {
-      api.openDroppedFile(path).then(startSession).catch((err) => setError(String(err)));
+      openSessionFrom(api.openDroppedFile(path));
     }
   }
 
   return (
-    <div className="flex h-dvh min-h-[720px] overflow-hidden bg-background">
+    // Inset-canvas shell: the nav rail sits directly on the deeper window
+    // tone, and the whole content area floats on it as one elevated panel.
+    <div className="flex h-dvh min-h-[720px] overflow-hidden bg-shell">
       <NavRail
         nav={nav}
         onNavigate={setNav}
@@ -714,7 +839,7 @@ export default function App({ api = tauriApi }: AppProps) {
         parseComplete={session?.status === "complete"}
       />
       <main
-        className="flex min-w-0 flex-1 flex-col overflow-hidden"
+        className="my-2 mr-2 flex min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-border/60 bg-background shadow-card"
         aria-label={nav === "summary" ? "文件摘要" : "STDF 工作台"}
       >
         {session ? (
@@ -725,24 +850,39 @@ export default function App({ api = tauriApi }: AppProps) {
               progressPercent={progressPercent}
               progress={progress}
               totalRecords={totalRecords}
-              nav={nav}
             />
             {error && (
               <div
-                className="flex items-center gap-2 border-b border-danger-border bg-danger-soft px-4 py-2.5 text-sm text-danger"
+                className="flex items-center gap-2 border-b border-danger-border bg-danger-soft px-5 py-2.5 text-sm text-danger"
                 role="alert"
               >
-                <AlertCircle size={16} />
-                <span>{error}</span>
+                <AlertCircle size={16} className="shrink-0" />
+                <span className="min-w-0 flex-1">{error}</span>
+                <button
+                  type="button"
+                  aria-label="关闭错误提示"
+                  onClick={() => setError("")}
+                  className="shrink-0 rounded-md p-1 transition-colors hover:bg-danger/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <X size={14} aria-hidden="true" />
+                </button>
               </div>
             )}
             {warning && (
               <div
-                className="flex items-start gap-2 border-b border-warning-border bg-warning-soft px-4 py-2.5 text-sm text-warning"
+                className="flex items-start gap-2 border-b border-warning-border bg-warning-soft px-5 py-2.5 text-sm text-warning"
                 role="status"
               >
                 <AlertCircle size={16} className="mt-0.5 shrink-0" />
-                <span>{warning}</span>
+                <span className="min-w-0 flex-1">{warning}</span>
+                <button
+                  type="button"
+                  aria-label="关闭警告提示"
+                  onClick={() => setWarning("")}
+                  className="shrink-0 rounded-md p-1 transition-colors hover:bg-warning/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <X size={14} aria-hidden="true" />
+                </button>
               </div>
             )}
             {nav === "summary" && (
@@ -808,6 +948,9 @@ export default function App({ api = tauriApi }: AppProps) {
             {nav === "records" && (
               <RecordsView
                 groups={groups}
+                dtrParse={dtrParse}
+                onParseDtr={handleParseDtr}
+                onDownloadDtr={handleDownloadDtr}
                 selectedGroup={selectedGroup}
                 onSelectGroup={(group) => {
                   setSelectedGroup(group);
@@ -834,7 +977,7 @@ export default function App({ api = tauriApi }: AppProps) {
           </>
         ) : (
           <NoFileView
-            onOpen={() => api.openFile().then(startSession)}
+            onOpen={openAnotherFile}
             isDragOver={isDragOver}
             setDragOver={setDragOver}
             onDrop={handleDrop}
@@ -845,6 +988,48 @@ export default function App({ api = tauriApi }: AppProps) {
     </div>
   );
 }
+
+// Code-drawn wafer bin map for the launch screen: die tone falls off from the
+// wafer center and a few fail dies are scattered in, so it reads as test data
+// rather than decoration. Built from theme tokens — light/dark and any zoom
+// level need no separate assets.
+function WaferMark({ className }: { className?: string }) {
+  const dies: ReactNode[] = [];
+  const fails = new Set(["2:7", "5:2", "8:9", "9:4"]);
+  for (let row = 0; row < 12; row += 1) {
+    for (let col = 0; col < 12; col += 1) {
+      const x = 15 + col * 10;
+      const y = 15 + row * 10;
+      const dist = Math.hypot(x - 70, y - 70);
+      if (dist > 53) continue;
+      const fail = fails.has(`${row}:${col}`);
+      const opacity = fail ? 0.62 : dist < 20 ? 0.68 : dist < 36 ? 0.42 : 0.2;
+      dies.push(
+        <rect
+          key={`${row}:${col}`}
+          x={x - 4.3}
+          y={y - 4.3}
+          width={8.6}
+          height={8.6}
+          rx={1.5}
+          fill={fail ? "var(--danger)" : "var(--primary)"}
+          fillOpacity={opacity}
+        />
+      );
+    }
+  }
+  return (
+    <svg viewBox="0 0 140 140" className={className} aria-hidden="true">
+      <circle cx="70" cy="70" r="62" fill="var(--bg)" stroke="var(--border-strong)" strokeWidth="1.5" />
+      <circle cx="70" cy="70" r="56" fill="none" stroke="var(--border)" strokeDasharray="3 5" />
+      {dies}
+      {/* Bottom notch — the wafer's orientation mark. */}
+      <circle cx="70" cy="132" r="4.5" fill="var(--card)" stroke="var(--border-strong)" strokeWidth="1.5" />
+    </svg>
+  );
+}
+
+const FILE_EXT_CHIPS = [".stdf", ".std", ".gz", ".zip"];
 
 function NoFileView({
   onOpen,
@@ -861,7 +1046,7 @@ function NoFileView({
 }) {
   return (
     <section
-      className="flex flex-1 items-center justify-center overflow-auto p-10"
+      className="launch-bg flex flex-1 items-center justify-center overflow-auto p-10"
       aria-label="选择 STDF 文件"
       onDragOver={(event) => {
         event.preventDefault();
@@ -870,30 +1055,74 @@ function NoFileView({
       onDragLeave={() => setDragOver(false)}
       onDrop={onDrop}
     >
-      <div
-        className={`flex min-h-[360px] w-full max-w-[640px] flex-col items-center justify-center gap-5 rounded-2xl border-2 border-dashed bg-card p-12 text-center transition-colors ${
-          isDragOver ? "border-primary bg-primary-soft" : "border-border-strong"
-        }`}
-      >
-        <img src="/logo.png" alt="" className="h-16 w-16" aria-hidden="true" />
-        <div className="flex max-w-[460px] flex-col gap-1.5">
-          <h1 className="text-xl font-semibold text-foreground">选择一个 STDF 文件</h1>
-          <p className="text-muted-foreground">把 .stdf / .std 文件拖到这里，或点下面的按钮打开。</p>
-          <p className="text-muted-foreground">按 record type 浏览字段、值和中文说明。</p>
-        </div>
-        <button className={BTN_PRIMARY} type="button" onClick={onOpen}>
-          <FolderOpen size={18} />
-          打开 STDF 文件
-        </button>
-        <p className="text-xs text-muted-foreground">支持 STDF V4 / V4-2007。</p>
-        {error && (
-          <p
-            className="max-w-[520px] rounded-md border border-danger-border bg-danger-soft px-3 py-2 text-sm text-danger"
-            role="alert"
+      <div className="relative flex w-full max-w-[560px] flex-col items-center gap-4">
+        {/* Resting state reads as a welcome card (solid hairline + card
+            elevation); the dashed drop-zone treatment only appears while a
+            drag actually hovers, so the launch screen stops looking like an
+            upload form. Border stays 1px in both states (no layout shift) —
+            the drag emphasis comes from the ring, tint and scale. */}
+        <div
+          className={`flex w-full flex-col items-center gap-6 rounded-2xl border bg-card/80 px-10 pb-9 pt-10 text-center backdrop-blur-sm transition-all duration-200 ease-[cubic-bezier(0.32,0.72,0,1)] ${
+            isDragOver
+              ? "scale-[1.015] border-dashed border-primary bg-primary-soft/80 shadow-lg shadow-primary/10 ring-2 ring-primary/30"
+              : "border-border/60 shadow-card"
+          }`}
+        >
+          <WaferMark
+            className={`h-36 w-36 transition-transform duration-300 ${isDragOver ? "scale-105" : ""}`}
+          />
+          <div className="flex flex-col gap-2">
+            <h1 className="text-balance text-2xl font-semibold tracking-tight text-foreground">
+              把 STDF 文件拖到这里
+            </h1>
+            <p className="max-w-[400px] text-pretty text-sm leading-relaxed text-muted-foreground">
+              解析后可查看良率与 bin 分布，按 record 浏览字段和中文说明，全文检索，并把测试项矩阵导出为
+              CSV。
+            </p>
+          </div>
+          {/* Button-in-button CTA: pill body + nested icon disc that nudges
+              forward on hover (transform only). */}
+          <button
+            type="button"
+            onClick={onOpen}
+            className="group inline-flex h-11 items-center gap-3 rounded-full bg-primary pl-5 pr-1.5 text-sm font-medium text-primary-foreground transition duration-200 ease-[cubic-bezier(0.32,0.72,0,1)] hover:bg-primary-hover active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
-            {error}
-          </p>
-        )}
+            打开 STDF 文件
+            <span
+              aria-hidden="true"
+              className="flex h-8 w-8 items-center justify-center rounded-full bg-primary-foreground/15 transition-transform duration-200 ease-[cubic-bezier(0.32,0.72,0,1)] group-hover:translate-x-0.5"
+            >
+              <FolderOpen size={15} />
+            </span>
+          </button>
+          <div className="flex flex-wrap items-center justify-center gap-1.5 text-xs text-muted-foreground">
+            {FILE_EXT_CHIPS.map((ext) => (
+              <span
+                key={ext}
+                className="rounded-md border border-border bg-muted px-2 py-0.5 font-mono text-[11px]"
+              >
+                {ext}
+              </span>
+            ))}
+            <span className="px-0.5">·</span>
+            <span>STDF V4 / V4-2007</span>
+          </div>
+          {error && (
+            <p
+              className="max-w-[440px] rounded-md border border-danger-border bg-danger-soft px-3 py-2 text-sm text-danger"
+              role="alert"
+            >
+              {error}
+            </p>
+          )}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          也可以按{" "}
+          <kbd className="rounded border border-border-strong bg-card px-1.5 py-0.5 font-mono text-[11px] text-foreground">
+            ⌘ O
+          </kbd>{" "}
+          打开文件选择器
+        </p>
       </div>
     </section>
   );
@@ -917,7 +1146,7 @@ function NavRail({
   parseComplete: boolean;
 }) {
   return (
-    <nav className="flex w-[72px] shrink-0 flex-col items-center gap-1.5 border-r border-border bg-muted py-3" aria-label="导航">
+    <nav className="flex w-[72px] shrink-0 flex-col items-center gap-1.5 py-3" aria-label="导航">
       <img src="/logo.png" alt="" className="mb-2 h-9 w-9" aria-hidden="true" />
       {NAV_ITEMS.map((item) => {
         const active = nav === item.key;
@@ -934,6 +1163,12 @@ function NavRail({
             onClick={() => onNavigate(item.key)}
             className={`${RAIL_ITEM} ${active ? RAIL_ITEM_ACTIVE : RAIL_ITEM_IDLE} disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-muted-foreground`}
           >
+            {active && (
+              <span
+                aria-hidden="true"
+                className="absolute -left-2 top-1/2 h-5 w-[3px] -translate-y-1/2 rounded-full bg-primary"
+              />
+            )}
             <Icon size={19} aria-hidden="true" />
             <span>{item.label}</span>
           </button>
@@ -945,7 +1180,7 @@ function NavRail({
         <button
           type="button"
           aria-label="打开另一个文件"
-          title="打开另一个文件"
+          title="打开另一个文件（⌘O）"
           onClick={onOpenAnotherFile}
           className={`${RAIL_ITEM} ${RAIL_ITEM_IDLE}`}
         >
@@ -981,59 +1216,67 @@ function StatusPill({ statusView }: { statusView: ReturnType<typeof getStatusVie
   );
 }
 
+// Document header, identical on every page: filename (the session's primary
+// context) leads, meta trails, live parse stats + status sit on the right.
+// Parse progress renders as a hairline bar along the header's bottom edge —
+// present while running, settles at 100% and fades out once the session ends.
 function TopBar({
   session,
   statusView,
   progressPercent,
   progress,
-  totalRecords,
-  nav
+  totalRecords
 }: {
   session: ParseSession;
   statusView: ReturnType<typeof getStatusView>;
   progressPercent: number;
   progress: ParseProgress | null;
   totalRecords: number;
-  nav: NavSection;
 }) {
+  const running = statusView.tone === "running";
   return (
-    <header className="flex items-center gap-4 border-b border-border bg-card px-4 py-2" aria-label="文件解析状态">
-      <div className="flex min-w-0 flex-1 items-center">
-        {nav === "summary" ? (
-          <span className="truncate text-[13px] text-muted-foreground">
-            {formatBytes(session.file_size)} · {totalRecords.toLocaleString()} records
-          </span>
-        ) : (
-          <span className="min-w-0 truncate text-[13px] text-muted-foreground" title={session.file_name}>
-            {session.file_name}
-          </span>
-        )}
+    <header
+      className="relative flex h-12 shrink-0 items-center gap-3 border-b border-border bg-card px-5"
+      aria-label="文件解析状态"
+    >
+      <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
+        <span className="truncate text-[13px] font-medium text-foreground" title={session.file_name}>
+          {session.file_name}
+        </span>
+        <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+          {formatBytes(session.file_size)} · {totalRecords.toLocaleString()} records
+        </span>
       </div>
-      {nav === "summary" && (
-        <>
-          <StatusPill statusView={statusView} />
-          <div className="hidden w-[340px] lg:block">
-            <div className="flex justify-between gap-3 text-xs text-muted-foreground" aria-label="解析进度">
-              <span>{progressPercent}%</span>
-              <span>
-                {formatBytes(progress?.bytes_read ?? 0)} / {formatBytes(progress?.total_bytes ?? session.file_size)}
-              </span>
-            </div>
-            <div
-              className="mt-1 h-2 overflow-hidden rounded-full bg-muted"
-              role="progressbar"
-              aria-valuenow={progressPercent}
-              aria-valuemin={0}
-              aria-valuemax={100}
-            >
-              <div
-                className="h-full rounded-full bg-primary transition-[width] duration-200"
-                style={{ width: `${progressPercent}%` }}
-              />
-            </div>
-          </div>
-        </>
+      {running && (
+        <div
+          className="flex shrink-0 items-center gap-2 text-xs tabular-nums text-muted-foreground"
+          aria-label="解析进度"
+        >
+          <span>{progressPercent}%</span>
+          <span className="hidden lg:inline">
+            {formatBytes(progress?.bytes_read ?? 0)} / {formatBytes(progress?.total_bytes ?? session.file_size)}
+          </span>
+        </div>
       )}
+      <StatusPill statusView={statusView} />
+      <div
+        className="absolute inset-x-0 bottom-0 h-0.5"
+        role="progressbar"
+        aria-valuenow={progressPercent}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-hidden={!running}
+        // Opacity waits for the width to land at 100% before fading, and the
+        // same delay applies on the way back in (imperceptible at parse start).
+        style={{ opacity: running ? 1 : 0, transition: "opacity 600ms ease 250ms" }}
+      >
+        <div
+          className={`relative h-full overflow-hidden bg-primary transition-[width] duration-300 ${
+            progressPercent > 0 && progressPercent < 100 ? "progress-shine" : ""
+          }`}
+          style={{ width: `${progressPercent}%` }}
+        />
+      </div>
     </header>
   );
 }
@@ -1075,21 +1318,25 @@ function OverviewView({
     return { ...spec, value: parsed?.value ?? "", meaning: parsed?.description ?? "" };
   });
   return (
-    // The overview grew past one screen (key fields + yield + pair checks),
+    // The overview grew past one screen (yield hero + key fields + pair checks),
     // so the whole page scrolls instead of squeezing sections into the viewport.
-    <section className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-[18px]">
-      <div className="shrink-0">
-        <span className={EYEBROW}>File Summary</span>
-        <h1
-          className="mt-1 text-[13px] font-normal leading-snug text-foreground [overflow-wrap:anywhere]"
-          title={session.file_name}
-        >
-          {session.file_name}
-        </h1>
-      </div>
-      <section className="flex min-w-0 shrink-0 flex-col rounded-xl border border-border bg-card p-[18px]">
+    // Section enter is staggered via --stagger for a light "灵动" cascade.
+    <section className={`flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto ${PAGE_PAD}`}>
+      <BinYieldCard summary={binSummary} complete={complete} />
+      <section
+        className="fade-rise flex min-w-0 shrink-0 flex-col rounded-xl border border-border/60 bg-card p-4 shadow-card"
+        style={{ ["--stagger" as string]: 1 }}
+      >
         <div className="mb-3 flex min-w-0 items-center justify-between gap-4">
-          <span className={EYEBROW}>关键字段</span>
+          <div className="flex min-w-0 items-baseline gap-2">
+            <h2 className="text-[15px] font-semibold text-foreground">关键字段</h2>
+            <span
+              className="truncate text-xs text-muted-foreground"
+              title={session.file_name}
+            >
+              {session.file_name}
+            </span>
+          </div>
           <button
             type="button"
             onClick={() => setOverride(isCp ? "ft" : "cp")}
@@ -1098,14 +1345,15 @@ function OverviewView({
                 ? `已手动切换为 ${isCp ? "CP" : "FT"}（自动识别为 ${autoIsCp ? "CP" : "FT"}），点击切换`
                 : `自动识别为 ${isCp ? "CP" : "FT"}，点击切换`
             }
-            className="inline-flex shrink-0 items-center gap-1 rounded-full border border-primary-soft bg-primary-soft px-2.5 py-0.5 text-xs font-medium text-primary transition hover:bg-primary hover:text-primary-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="inline-flex shrink-0 items-center gap-1 rounded-full border border-primary-soft bg-primary-soft px-2.5 py-0.5 text-xs font-medium text-primary transition hover:bg-primary hover:text-primary-foreground active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             {isCp ? "CP" : "FT"}
             <ArrowLeftRight size={11} aria-hidden="true" />
           </button>
         </div>
-        {/* Fixed height with internal scrolling (the sticky THs pin the header). */}
-        <div className="h-[42vh] min-h-[300px] overflow-auto overscroll-contain rounded-lg border border-border">
+        {/* Renders at natural height — the ~20 rows scroll with the page as a
+            single layer instead of nesting a second scroll region. */}
+        <div className="overflow-hidden rounded-lg border border-border">
           <table className={DATA_TABLE}>
             <thead>
               <tr>
@@ -1139,94 +1387,233 @@ function OverviewView({
           </table>
         </div>
       </section>
-      <BinYieldCard summary={binSummary} complete={complete} />
       <PairStats groups={groups} complete={complete} />
     </section>
   );
 }
 
-// Yield headline + per-bin distribution tables (SBIN / HBIN), matching the
-// CSV export's pass convention (PF flag, else "bin 1 = pass").
+// Yield hero + per-bin distribution tables (SBIN / HBIN). Yield is the
+// headline metric of the page, so the pass % gets the visual weight; the
+// supporting counts sit to its right. Matches the CSV export's pass
+// convention (PF flag, else "bin 1 = pass").
 function BinYieldCard({ summary, complete }: { summary: BinSummary | null; complete: boolean }) {
   const ready = complete && summary !== null;
   const total = summary?.total_parts ?? 0;
   const pass = summary?.sbin_pass ?? 0;
-  const yieldPct = total > 0 ? `${((pass / total) * 100).toFixed(1)}%` : "-";
+  const fail = total - pass;
+  const yieldNum = total > 0 ? (pass / total) * 100 : null;
+  // Once parsing finishes, count the yield digit from 0 up to the real
+  // value once. Small "lands with intent" flourish, cheap (single rAF).
+  const displayYield = useCountUp(ready ? yieldNum : null, 720);
   return (
-    <section className="shrink-0 rounded-xl border border-border bg-card p-[18px]">
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <span className={EYEBROW}>良率与 Bin 统计</span>
-        {!ready && <span className="text-xs text-muted-foreground">解析完成后统计…</span>}
-      </div>
-      {ready && (
-        <>
-          <div className="mb-3 grid grid-cols-4 gap-2">
-            {[
-              { label: "Total", value: total.toLocaleString(), tone: "text-foreground" },
-              { label: "Pass", value: pass.toLocaleString(), tone: "text-success" },
-              { label: "Fail", value: (total - pass).toLocaleString(), tone: "text-danger" },
-              { label: "良率", value: yieldPct, tone: "text-primary" }
-            ].map((stat) => (
-              <div key={stat.label} className="rounded-lg border border-border bg-muted px-3 py-2">
-                <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                  {stat.label}
-                </div>
-                <div className={`mt-0.5 text-lg font-semibold tabular-nums ${stat.tone}`}>
-                  {stat.value}
-                </div>
-              </div>
-            ))}
+    <section
+      className="fade-rise flex shrink-0 flex-col gap-4 rounded-xl border border-border/60 bg-card bg-gradient-to-br from-primary-soft/45 to-transparent p-4 shadow-card"
+      style={{ ["--stagger" as string]: 0 }}
+    >
+      {/* Hero row: giant yield % on the left, supporting metrics stack on the right. */}
+      <div className="flex flex-wrap items-center gap-x-8 gap-y-4">
+        <div className="flex min-w-[140px] flex-col">
+          <div className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+            良率
           </div>
-          {!summary.has_bin_pf && (
-            <p className="mb-3 text-xs text-warning">
-              本文件的 bin 记录未包含通过/失败标记(PF)，良率按「软 bin 1 = 通过」约定判定。
-            </p>
+          {ready ? (
+            <div
+              key={yieldNum ?? "empty"}
+              className="number-land mt-0.5 flex items-baseline gap-1 font-semibold tabular-nums text-foreground"
+            >
+              <span className="text-[44px] leading-none tracking-tight">
+                {yieldNum == null ? "-" : displayYield.toFixed(1)}
+              </span>
+              {yieldNum != null && (
+                <span className="text-lg font-medium text-muted-foreground">%</span>
+              )}
+            </div>
+          ) : (
+            <div className="mt-1.5 h-10 w-32 skeleton" aria-label="正在解析良率" />
           )}
-          <div className="grid grid-cols-2 gap-3">
-            {[
-              { title: "SBIN 分布", binLabel: "SBIN#", bins: summary.sbins },
-              { title: "HBIN 分布", binLabel: "HBIN#", bins: summary.hbins }
-            ].map((group) => (
-              <div key={group.title} className="min-w-0">
-                <div className="mb-1.5 text-xs font-semibold text-muted-foreground">{group.title}</div>
-                {/* Equal fixed height for both bin tables; long lists scroll inside. */}
-                <div className="h-[236px] overflow-auto overscroll-contain rounded-lg border border-border">
-                  <table className={DATA_TABLE}>
-                    <thead>
-                      <tr>
-                        <th className={`${TH} w-[18%]`}>{group.binLabel}</th>
-                        <th className={`${TH} w-[38%]`}>名称</th>
-                        <th className={`${TH} w-[12%]`}>P/F</th>
-                        <th className={`${TH} w-[16%] text-right`}>数量</th>
-                        <th className={`${TH} w-[16%] text-right`}>占比</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {group.bins.map((bin) => (
-                        <tr key={bin.num}>
-                          <td className={`${TD} ${MONO}`}>{bin.num}</td>
-                          <td className={`${TD}`}>
-                            <span className="block truncate" title={bin.name || undefined}>
-                              {bin.name || "-"}
-                            </span>
-                          </td>
-                          <td className={TD}>{pfCell(bin.pf)}</td>
-                          <td className={`${TD} ${MONO} text-right`}>{bin.count.toLocaleString()}</td>
-                          <td className={`${TD} ${MONO} text-right`}>
-                            {total > 0 ? `${((bin.count / total) * 100).toFixed(1)}%` : "-"}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            ))}
-          </div>
-        </>
+        </div>
+        <div className="flex flex-1 flex-wrap items-stretch gap-x-6 gap-y-2 border-l border-border pl-6">
+          <YieldStat label="Total" value={total} ready={ready} tone="foreground" />
+          <YieldStat label="Pass" value={pass} ready={ready} tone="success" />
+          <YieldStat label="Fail" value={fail} ready={ready} tone="danger" />
+        </div>
+      </div>
+      {/* Pass/fail stacked bar ties the hero number to the counts at a glance. */}
+      {ready && total > 0 && (
+        <div className="flex h-1.5 overflow-hidden rounded-full bg-muted" aria-hidden="true">
+          <div className="h-full bg-success" style={{ width: `${(pass / total) * 100}%` }} />
+          <div className="h-full flex-1 bg-danger" />
+        </div>
       )}
+      {ready && !summary.has_bin_pf && (
+        <p className="text-xs text-warning">
+          本文件的 bin 记录未包含通过/失败标记(PF)，良率按「软 bin 1 = 通过」约定判定。
+        </p>
+      )}
+      {/* Bin distributions: side-by-side; header sits inline (no eyebrow noise). */}
+      <div className="grid grid-cols-2 gap-4">
+        {[
+          { title: "SBIN 分布", binLabel: "SBIN#", bins: summary?.sbins ?? [] },
+          { title: "HBIN 分布", binLabel: "HBIN#", bins: summary?.hbins ?? [] }
+        ].map((group) => {
+          // The share bars normalize against the group's dominant bin so
+          // sub-percent fail bins still register visually.
+          const maxCount = group.bins.reduce((max, bin) => Math.max(max, bin.count), 0);
+          return (
+          <div key={group.title} className="min-w-0">
+            {/* Height caps at ~6 rows and long lists scroll inside; short lists
+                collapse to their content instead of framing empty space.
+                No section title — the SBIN#/HBIN# table headers carry the label. */}
+            <div className="max-h-[236px] overflow-auto overscroll-contain rounded-lg border border-border">
+              {ready ? (
+                <table className={DATA_TABLE}>
+                  <thead>
+                    <tr>
+                      <th className={`${TH} w-[14%]`}>{group.binLabel}</th>
+                      <th className={`${TH} w-[32%]`}>名称</th>
+                      <th className={`${TH} w-[10%]`}>P/F</th>
+                      <th className={`${TH} w-[18%] text-right`}>数量</th>
+                      <th className={`${TH} w-[26%] text-right`}>占比</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {group.bins.map((bin, i) => (
+                      <tr
+                        key={bin.num}
+                        className="fade-rise"
+                        style={{ ["--stagger" as string]: Math.min(i, 12) }}
+                      >
+                        <td className={`${TD} ${MONO}`}>{bin.num}</td>
+                        <td className={`${TD}`}>
+                          <span className="block truncate" title={bin.name || undefined}>
+                            {bin.name || "-"}
+                          </span>
+                        </td>
+                        <td className={TD}>{pfCell(bin.pf)}</td>
+                        <td className={`${TD} ${MONO} text-right`}>{bin.count.toLocaleString()}</td>
+                        <td className={`${TD} text-right`}>
+                          <ShareCell count={bin.count} total={total} max={maxCount} pf={bin.pf} />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <BinTableSkeleton />
+              )}
+            </div>
+          </div>
+          );
+        })}
+      </div>
     </section>
   );
+}
+
+// 占比 cell: the true percentage as text plus a small bar normalized to the
+// group's largest bin (`max`), toned by the bin's pass/fail flag.
+function ShareCell({ count, total, max, pf }: { count: number; total: number; max: number; pf: string }) {
+  if (total <= 0) return <span className="text-muted-foreground">-</span>;
+  const share = (count / total) * 100;
+  const rel = max > 0 ? Math.max((count / max) * 100, 2.5) : 0;
+  const fill = pf === "F" ? "bg-danger" : pf === "P" ? "bg-success" : "bg-primary";
+  return (
+    <span className="flex items-center justify-end gap-2 whitespace-nowrap">
+      <span className="h-1.5 w-10 shrink-0 overflow-hidden rounded-full bg-muted" aria-hidden="true">
+        <span className={`block h-full rounded-full ${fill}`} style={{ width: `${rel}%` }} />
+      </span>
+      <span className={`${MONO} tabular-nums`}>{share.toFixed(1)}%</span>
+    </span>
+  );
+}
+
+function YieldStat({
+  label,
+  value,
+  ready,
+  tone
+}: {
+  label: string;
+  value: number;
+  ready: boolean;
+  tone: "foreground" | "success" | "danger";
+}) {
+  const toneClass = { foreground: "text-foreground", success: "text-success", danger: "text-danger" }[tone];
+  return (
+    <div className="flex min-w-[92px] flex-col">
+      <div className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+        {label}
+      </div>
+      {ready ? (
+        <div className={`number-land mt-0.5 text-xl font-semibold tabular-nums ${toneClass}`}>
+          {value.toLocaleString()}
+        </div>
+      ) : (
+        <div className="mt-1.5 h-6 w-16 skeleton" aria-hidden="true" />
+      )}
+    </div>
+  );
+}
+
+// Rows of shimmering placeholders sized like the real bin table so the
+// layout doesn't jump when data lands.
+function BinTableSkeleton() {
+  return (
+    <div className="flex h-full flex-col divide-y divide-border/50 p-2">
+      {Array.from({ length: 6 }).map((_, i) => (
+        <div key={i} className="flex items-center gap-3 py-2">
+          <div className="skeleton h-3 w-8 shrink-0" />
+          <div className="skeleton h-3 flex-1" />
+          <div className="skeleton h-3 w-4 shrink-0" />
+          <div className="skeleton h-3 w-12 shrink-0" />
+          <div className="skeleton h-3 w-10 shrink-0" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Animates a numeric value from 0 up to `target` over `duration` ms using
+// requestAnimationFrame. Ease-out cubic — quick at first, gentle landing.
+// Only reveals the first time target transitions from null → number, so
+// re-entering the overview after parse-complete shows the settled value
+// instantly instead of replaying the reveal. Also falls through to target
+// under prefers-reduced-motion (and when rAF isn't available, e.g. jsdom).
+function useCountUp(target: number | null, duration = 700): number {
+  const [value, setValue] = useState<number>(target ?? 0);
+  // shouldReveal = we've observed null and are waiting on the first number.
+  // If the component mounts with target already known, we skip the reveal.
+  const shouldRevealRef = useRef<boolean>(target == null);
+  useEffect(() => {
+    if (target == null) {
+      setValue(0);
+      shouldRevealRef.current = true;
+      return;
+    }
+    const reduced =
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (!shouldRevealRef.current || reduced || typeof requestAnimationFrame !== "function") {
+      setValue(target);
+      shouldRevealRef.current = false;
+      return;
+    }
+    shouldRevealRef.current = false;
+    let raf = 0;
+    let start = 0;
+    const from = 0;
+    const step = (t: number) => {
+      if (!start) start = t;
+      const p = Math.min(1, (t - start) / duration);
+      const eased = 1 - Math.pow(1 - p, 3);
+      setValue(from + (target - from) * eased);
+      if (p < 1) raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [target, duration]);
+  return value;
 }
 
 // STDF open/close record pairs whose counts should match (一眼校验是否对得上).
@@ -1248,18 +1635,21 @@ function PairStats({ groups, complete }: { groups: RecordGroup[]; complete: bool
   })).filter((r) => r.ca > 0 || r.cb > 0);
   if (rows.length === 0) return null;
   return (
-    <section className="shrink-0 rounded-xl border border-border bg-card px-4 py-3">
-      <div className="mb-2 flex items-center justify-between gap-3">
-        <span className={EYEBROW}>配对统计</span>
-        {!complete && <span className="text-xs text-muted-foreground">解析完成后校验…</span>}
-      </div>
+    <section
+      className="fade-rise shrink-0 rounded-xl border border-border/60 bg-card px-4 py-3 shadow-card"
+      style={{ ["--stagger" as string]: 2 }}
+    >
       {complete ? (
         <div className="grid grid-cols-4 gap-2">
-          {rows.map((r) => {
+          {rows.map((r, i) => {
             const ok = r.ca === r.cb;
             const Icon = ok ? CheckCircle2 : AlertCircle;
             return (
-              <div key={r.a} className="min-w-0 rounded-lg border border-border bg-muted px-2.5 py-1.5">
+              <div
+                key={r.a}
+                className="fade-rise min-w-0 rounded-lg border border-border bg-muted px-2.5 py-1.5"
+                style={{ ["--stagger" as string]: 3 + i }}
+              >
                 <div className="flex items-center justify-between gap-1.5">
                   <span className="text-[13px] font-medium text-foreground">
                     {r.a} ↔ {r.b}
@@ -1284,7 +1674,10 @@ function PairStats({ groups, complete }: { groups: RecordGroup[]; complete: bool
           })}
         </div>
       ) : (
-        <p className="text-[13px] text-muted-foreground">等待文件解析完成后再校验成对记录数量。</p>
+        <div className="flex items-center gap-2 text-[13px] text-muted-foreground">
+          <span className="dot-pulse inline-block h-1.5 w-1.5 rounded-full bg-primary" />
+          等待文件解析完成后再校验成对记录数量。
+        </div>
       )}
     </section>
   );
@@ -1298,7 +1691,10 @@ function RecordsView({
   fields,
   cursor,
   recordTotal,
-  onCursorChange
+  onCursorChange,
+  dtrParse,
+  onParseDtr,
+  onDownloadDtr
 }: {
   groups: RecordGroup[];
   selectedGroup: string;
@@ -1308,13 +1704,18 @@ function RecordsView({
   cursor: number;
   recordTotal: number;
   onCursorChange(index: number): void;
+  dtrParse: DtrParseState;
+  onParseDtr(): void;
+  onDownloadDtr(): void;
 }) {
   return (
     <section
-      className="grid min-h-0 flex-1 grid-cols-[minmax(180px,220px)_minmax(360px,1fr)] overflow-hidden"
+      className="fade-rise grid min-h-0 flex-1 grid-cols-[minmax(180px,220px)_minmax(360px,1fr)] overflow-hidden"
       aria-label="工作台"
     >
-      <aside className="flex min-h-0 flex-col overflow-hidden border-r border-border bg-muted px-2.5 py-3" aria-label="Record 类型">
+      {/* pt-5 keeps the aside's eyebrow on the same baseline as the detail
+          pane's PAGE_PAD inset. */}
+      <aside className="flex min-h-0 flex-col overflow-hidden border-r border-border bg-muted px-2.5 pb-3 pt-5" aria-label="Record 类型">
         <div className="flex items-center justify-between px-1.5 pb-2">
           <span className={EYEBROW}>Record Types</span>
           <span className="text-xs tabular-nums text-muted-foreground">{groups.length.toLocaleString()}</span>
@@ -1349,6 +1750,9 @@ function RecordsView({
         cursor={cursor}
         recordTotal={recordTotal}
         onCursorChange={onCursorChange}
+        dtrParse={dtrParse}
+        onParseDtr={onParseDtr}
+        onDownloadDtr={onDownloadDtr}
       />
     </section>
   );
@@ -1359,13 +1763,19 @@ function FieldDetailPanel({
   fields,
   cursor,
   recordTotal,
-  onCursorChange
+  onCursorChange,
+  dtrParse,
+  onParseDtr,
+  onDownloadDtr
 }: {
   selectedRecord: RecordSummary | null;
   fields: RecordField[];
   cursor: number;
   recordTotal: number;
   onCursorChange(index: number): void;
+  dtrParse: DtrParseState;
+  onParseDtr(): void;
+  onDownloadDtr(): void;
 }) {
   const hasPager = recordTotal > 1;
   const [draft, setDraft] = useState(String(cursor + 1));
@@ -1381,11 +1791,11 @@ function FieldDetailPanel({
     onCursorChange(Math.min(Math.max(parsed, 1), recordTotal) - 1);
   };
   return (
-    <section className="flex min-h-0 flex-col gap-3 overflow-hidden bg-card p-4" aria-label="字段详情">
+    <section className={`flex min-h-0 flex-col gap-3 overflow-hidden bg-card ${PAGE_PAD}`} aria-label="字段详情">
       <div className="flex shrink-0 items-start justify-between gap-3 border-b border-border pb-3">
         <div className="flex min-w-0 flex-col gap-0.5">
           <span className={EYEBROW}>字段详情</span>
-          <strong className="block text-sm font-semibold text-foreground">
+          <strong className="block text-[15px] font-semibold text-foreground">
             {selectedRecord ? selectedRecord.record_type : "未选择记录"}
           </strong>
           {selectedRecord && RECORD_TYPE_INFO[selectedRecord.record_type] && (
@@ -1445,7 +1855,7 @@ function FieldDetailPanel({
               </div>
               <div
                 role="tooltip"
-                className="pointer-events-none absolute right-0 top-full z-20 mt-1.5 hidden w-72 rounded-lg border border-border bg-card p-2.5 text-xs leading-relaxed text-foreground shadow-lg group-hover:block"
+                className="pop-in pointer-events-none absolute right-0 top-full z-20 mt-1.5 hidden w-72 rounded-lg border border-border bg-card p-2.5 text-xs leading-relaxed text-foreground shadow-overlay group-hover:block"
               >
                 {recordStatusHint(selectedRecord.status)}
               </div>
@@ -1454,14 +1864,129 @@ function FieldDetailPanel({
         </div>
       </div>
       {selectedRecord ? (
-        <FieldsTable fields={fields} />
+        selectedRecord.record_type === "DTR" ? (
+          <DtrTextCard state={dtrParse} onParse={onParseDtr} onDownload={onDownloadDtr} />
+        ) : (
+          <FieldsTable fields={fields} />
+        )
       ) : (
         <EmptyState
+          icon={MousePointerClick}
           title="未选择 record"
           body="从左侧选择 record type 后，这里会显示字段名、值和中文说明，可用上一条 / 下一条切换记录。"
         />
       )}
     </section>
+  );
+}
+
+// DTR TEXT_DAT is deliberately not expanded during the initial parse (huge
+// datalog files can hold millions of DTR lines). This card offers the
+// on-demand path instead: scan the file once, then download the txt.
+function DtrTextCard({
+  state,
+  onParse,
+  onDownload
+}: {
+  state: DtrParseState;
+  onParse(): void;
+  onDownload(): void;
+}) {
+  const parsing = state.phase === "parsing";
+  const done = state.phase === "done";
+  const failed = state.phase === "error";
+  const empty = done && state.count === 0;
+  // Icon chip tone tracks the phase (same 44px chip idiom as EmptyState and
+  // the update dialog): primary while idle/scanning, success when the text is
+  // staged, danger when the scan failed, neutral when the file has no DTRs.
+  const chipTone = failed
+    ? "bg-danger-soft text-danger"
+    : empty
+      ? "bg-muted text-muted-foreground"
+      : done
+        ? "bg-success-soft text-success"
+        : "bg-primary-soft text-primary";
+  const ChipIcon = failed ? AlertCircle : empty ? FileText : done ? CheckCircle2 : ScanText;
+  return (
+    <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto">
+      <div className="fade-rise flex w-full max-w-[460px] flex-col items-center gap-3 rounded-xl border border-border/60 bg-card px-6 py-8 text-center shadow-card">
+        {/* Keyed on phase so idle → parsing → done each re-enters with the
+            same soft rise the rest of the app uses. */}
+        <div key={state.phase} className="fade-rise flex w-full flex-col items-center gap-3">
+          <div className={`flex h-11 w-11 items-center justify-center rounded-xl ${chipTone}`}>
+            {parsing ? (
+              <Loader2 size={20} className="animate-spin" aria-hidden="true" />
+            ) : (
+              <ChipIcon size={20} aria-hidden="true" />
+            )}
+          </div>
+          <strong className="text-[15px] font-semibold text-foreground">
+            {done
+              ? `解析完成，共 ${state.count.toLocaleString()} 条 DTR 文本`
+              : parsing
+                ? "正在扫描 DTR 文本…"
+                : failed
+                  ? "DTR 解析失败"
+                  : "DTR 文本未解析"}
+          </strong>
+          <p className="max-w-[360px] text-pretty text-xs leading-relaxed text-muted-foreground">
+            {done
+              ? empty
+                ? "整份文件没有扫描到 DTR 记录，无可下载的文本。"
+                : "已按文件顺序整理，每条 DTR 一行，可下载为 TXT 文件。"
+              : parsing
+                ? "正在重新扫描整份文件提取全部 DTR 文本，大文件需要几秒，期间其他页面可正常使用。"
+                : "DTR 的 TEXT_DAT 默认不在解析时展开。点击解析会重新扫描整份文件，提取全部 DTR 文本。"}
+          </p>
+        </div>
+        {state.message && (
+          <p
+            className="w-full rounded-lg border border-danger-border bg-danger-soft px-3 py-2 text-left text-xs leading-relaxed text-danger [overflow-wrap:anywhere]"
+            role="alert"
+          >
+            {state.message}
+          </p>
+        )}
+        {parsing ? (
+          // Scan duration is unknown, so the buttons row hands its space to the
+          // same indeterminate sweep the search kick-off uses.
+          <div className="flex min-h-[40px] w-full max-w-[280px] items-center pt-1">
+            <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-muted">
+              <div className="indeterminate-sweep absolute inset-y-0 left-0 w-1/3 rounded-full bg-primary" />
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+            {done ? (
+              <>
+                <button
+                  type="button"
+                  className={BTN_PRIMARY}
+                  onClick={onDownload}
+                  disabled={state.saving || state.count === 0}
+                >
+                  {state.saving ? (
+                    <Loader2 size={16} className="animate-spin" />
+                  ) : (
+                    <Download size={16} />
+                  )}
+                  {state.saving ? "保存中…" : state.saved ? "已保存 ✓" : "下载 TXT"}
+                </button>
+                <button type="button" className={BTN_SECONDARY} onClick={onParse}>
+                  <ScanText size={16} />
+                  重新解析
+                </button>
+              </>
+            ) : (
+              <button type="button" className={BTN_PRIMARY} onClick={onParse}>
+                <ScanText size={16} />
+                解析 DTR 文本
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -1488,11 +2013,11 @@ function SearchView({
       ? Math.min(100, Math.round((searchProgress.scanned / searchProgress.total) * 100))
       : null;
   return (
-    <section className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-[18px]" aria-label="搜索">
+    <section className={`fade-rise flex min-h-0 flex-1 flex-col gap-3 overflow-hidden ${PAGE_PAD}`} aria-label="搜索">
       <div className="flex items-center justify-between gap-3">
         <div>
           <span className={EYEBROW}>Search</span>
-          <strong className="block text-sm font-semibold text-foreground">
+          <strong className="block text-[15px] font-semibold text-foreground">
             {searching
               ? pct != null
                 ? `搜索中… ${pct}%`
@@ -1519,18 +2044,22 @@ function SearchView({
       {searching && (
         <div className="flex flex-col gap-1.5">
           <div
-            className="h-1.5 w-full overflow-hidden rounded-full bg-muted"
+            className="relative h-1.5 w-full overflow-hidden rounded-full bg-muted"
             role="progressbar"
             aria-valuenow={pct ?? undefined}
             aria-valuemin={0}
             aria-valuemax={100}
           >
-            <div
-              className={`h-full bg-primary transition-[width] duration-150 ${
-                pct == null ? "w-1/3 animate-pulse" : ""
-              }`}
-              style={pct != null ? { width: `${pct}%` } : undefined}
-            />
+            {pct == null ? (
+              <div className="indeterminate-sweep absolute inset-y-0 left-0 w-1/3 rounded-full bg-primary" />
+            ) : (
+              // overlay-fade softens the swap from the sweeping segment to the
+              // determinate bar when the first progress tick lands.
+              <div
+                className="overlay-fade relative h-full overflow-hidden rounded-full bg-primary transition-[width] duration-150 progress-shine"
+                style={{ width: `${pct}%` }}
+              />
+            )}
           </div>
           {searchProgress && searchProgress.total > 0 && (
             <span className="text-right text-[11px] tabular-nums text-muted-foreground">
@@ -1541,16 +2070,18 @@ function SearchView({
       )}
       {!parseComplete ? (
         <EmptyState
+          icon={Hourglass}
           title="等待解析完成后搜索"
           body="为了保持摘要和字段浏览不卡顿，解析过程中暂停全量搜索；文件解析完成后即可搜索全部字段。"
         />
       ) : trimmed.length < 2 ? (
         <EmptyState
+          icon={Search}
           title="输入至少 2 个字符开始搜索"
           body="可搜索 record type、字段名或字段值。大文件为全量搜索，输入后会稍等片刻再出结果。"
         />
       ) : searching ? (
-        <EmptyState title="搜索中…" body="正在全量检索，较大文件需要几秒，请稍候。" />
+        <EmptyState icon={Loader2} spin title="搜索中…" body="正在全量检索，较大文件需要几秒，请稍候。" />
       ) : (
         <SearchResultsTable results={searchResults} />
       )}
@@ -1579,7 +2110,6 @@ function ColumnPager({
   const end = Math.min((page + 1) * size, total);
   return (
     <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 text-xs text-muted-foreground">
-      <span className="font-medium text-foreground">测试项</span>
       <span className="flex items-center gap-1.5">
         每页
         <span className="inline-flex overflow-hidden rounded-md border border-border-strong">
@@ -1654,22 +2184,27 @@ function pfCell(pf: string): ReactNode {
 type LeftCol = {
   key: string;
   label: string;
+  // Per-column alignment: text scans from the left, numbers compare along the
+  // right edge, single-letter P/F flags read best centered.
+  align: "left" | "right" | "center";
   get: (row: TestItemPartRow) => string;
   title?: (row: TestItemPartRow) => string | undefined;
   render?: (row: TestItemPartRow) => ReactNode;
 };
 
+const ALIGN_CLASS = { left: "text-left", right: "text-right", center: "text-center" } as const;
+
 const LEFT_COLS: LeftCol[] = [
-  { key: "part_id", label: "PartID", get: (r) => r.part_id || "-", title: (r) => r.part_id || undefined },
-  { key: "site", label: "Site", get: (r) => r.site_num || "-" },
-  { key: "sbin_num", label: "SBIN#", get: (r) => r.sbin_num || "-" },
-  { key: "sbin_name", label: "SBIN Name", get: (r) => r.sbin_name || "-", title: (r) => r.sbin_name || undefined },
-  { key: "sbin_pf", label: "SBIN PF", get: (r) => r.sbin_pf || "-", render: (r) => pfCell(r.sbin_pf) },
-  { key: "hbin_num", label: "HBIN#", get: (r) => r.hbin_num || "-" },
-  { key: "hbin_name", label: "HBIN Name", get: (r) => r.hbin_name || "-", title: (r) => r.hbin_name || undefined },
-  { key: "hbin_pf", label: "HBIN PF", get: (r) => r.hbin_pf || "-", render: (r) => pfCell(r.hbin_pf) },
-  { key: "test_t", label: "TEST_T", get: (r) => r.test_t || "-" },
-  { key: "part_txt", label: "PART_TXT", get: (r) => r.part_txt || "-", title: (r) => r.part_txt || undefined }
+  { key: "part_id", label: "PartID", align: "left", get: (r) => r.part_id || "-", title: (r) => r.part_id || undefined },
+  { key: "site", label: "Site", align: "right", get: (r) => r.site_num || "-" },
+  { key: "sbin_num", label: "SBIN#", align: "right", get: (r) => r.sbin_num || "-" },
+  { key: "sbin_name", label: "SBIN Name", align: "left", get: (r) => r.sbin_name || "-", title: (r) => r.sbin_name || undefined },
+  { key: "sbin_pf", label: "SBIN PF", align: "center", get: (r) => r.sbin_pf || "-", render: (r) => pfCell(r.sbin_pf) },
+  { key: "hbin_num", label: "HBIN#", align: "right", get: (r) => r.hbin_num || "-" },
+  { key: "hbin_name", label: "HBIN Name", align: "left", get: (r) => r.hbin_name || "-", title: (r) => r.hbin_name || undefined },
+  { key: "hbin_pf", label: "HBIN PF", align: "center", get: (r) => r.hbin_pf || "-", render: (r) => pfCell(r.hbin_pf) },
+  { key: "test_t", label: "TEST_T", align: "right", get: (r) => r.test_t || "-" },
+  { key: "part_txt", label: "PART_TXT", align: "left", get: (r) => r.part_txt || "-", title: (r) => r.part_txt || undefined }
 ];
 // Fixed body-row height (px) — vertical windowing positions rows by this.
 const TI_ROW_H = 40;
@@ -1696,7 +2231,6 @@ function textWidth(text: string, font: string): number {
 
 const FONT_MONO_12 = '12px ui-monospace, SFMono-Regular, Menlo, monospace';
 const FONT_SANS_11 = '11px -apple-system, "PingFang SC", "Helvetica Neue", sans-serif';
-const FONT_SANS_13 = '13px -apple-system, "PingFang SC", "Helvetica Neue", sans-serif';
 
 // Width a value column needs: widest of its metadata rows (the name may wrap
 // to two lines) and a sample of its loaded values, clamped to sane bounds.
@@ -1710,7 +2244,8 @@ function fitColumnWidth(column: TestItemColumn, sample: TestItemPartRow[], index
   );
   for (const row of sample) {
     const value = row.results[index]?.value;
-    if (value) w = Math.max(w, textWidth(value, FONT_SANS_13));
+    // Values render in 12px mono (right-aligned numeric column), measure in kind.
+    if (value) w = Math.max(w, textWidth(value, FONT_MONO_12));
   }
   return Math.min(TI_COL_MAX, Math.max(TI_COL_MIN, Math.ceil(w) + 20));
 }
@@ -1913,11 +2448,11 @@ function TestItemsView({
   const fullColSpan = LEFT_COLS.length + visibleCols.length + 2;
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-[18px]" aria-label="测试项">
+    <section className={`fade-rise flex min-h-0 flex-1 flex-col gap-3 overflow-hidden ${PAGE_PAD}`} aria-label="测试项">
       <div className="flex items-center justify-between gap-3">
         <div>
           <span className={EYEBROW}>Test Items</span>
-          <strong className="block text-sm font-semibold text-foreground">
+          <strong className="block text-[15px] font-semibold text-foreground">
             {loaded
               ? `共 ${colTotal.toLocaleString()} 个测试项 · ${rowTotal.toLocaleString()} 个 Part/Site 行`
               : session.status === "complete"
@@ -1929,19 +2464,23 @@ function TestItemsView({
       {!loaded ? (
         session.status === "complete" ? (
           <EmptyState
+            icon={Loader2}
+            spin
             title="正在汇总测试项…"
             body="按 Part × 测试列展开整份文件，大文件首次打开需要几秒；期间其他页面可以正常使用。"
           />
         ) : (
           <EmptyState
+            icon={Hourglass}
             title="等待解析完成"
             body="测试项页在解析完成后开放，用于按 Part × 测试列查看 PTR / MPR / FTR 值。"
           />
         )
       ) : (
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-border bg-card">
-          {/* Filters */}
-          <div className="flex flex-wrap items-center gap-3 border-b border-border bg-muted px-3 py-2">
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-border/60 bg-card shadow-card">
+          {/* Single toolbar: actions, then the column pager, with the loaded
+              counter + PMR badge pushed right. Wraps only when space runs out. */}
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-border bg-muted px-3 py-1.5">
             <button
               type="button"
               onClick={onOpenFilter}
@@ -1960,12 +2499,7 @@ function TestItemsView({
               {exporting ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
               {exporting ? "导出中…" : exported ? "已导出 ✓" : "导出 CSV"}
             </button>
-            <span className="ml-auto rounded-full border border-border bg-card px-2.5 py-1 text-xs text-muted-foreground">
-              {pmrCount.toLocaleString()} PMR
-            </span>
-          </div>
-          {/* Column pager + row counter */}
-          <div className="flex flex-wrap items-center justify-between gap-x-5 gap-y-2 border-b border-border bg-card px-3 py-2">
+            <span aria-hidden="true" className="h-4 w-px shrink-0 bg-border-strong/70" />
             <ColumnPager
               page={colPage}
               size={colSize}
@@ -1973,9 +2507,17 @@ function TestItemsView({
               onPageChange={onColPageChange}
               onSizeChange={onColSizeChange}
             />
-            <span className="flex items-center gap-1.5 text-xs tabular-nums text-muted-foreground">
+            <span className="ml-auto flex shrink-0 items-center gap-2 text-xs tabular-nums text-muted-foreground">
               {loadingMore && <Loader2 size={13} className="animate-spin" />}
-              已加载 {rows.length.toLocaleString()} / {rowTotal.toLocaleString()} 行
+              <span>
+                已加载 {rows.length.toLocaleString()} / {rowTotal.toLocaleString()} 行
+              </span>
+              <span
+                className="rounded-full border border-border bg-card px-2 py-0.5"
+                title="文件中的 PMR（Pin Map Record，引脚映射记录）数量"
+              >
+                {pmrCount.toLocaleString()} PMR
+              </span>
             </span>
           </div>
           {!hasBinPf && (
@@ -1987,7 +2529,13 @@ function TestItemsView({
             </div>
           )}
           {rowTotal === 0 || colTotal === 0 ? (
-            <div className="px-3 py-6 text-[13px] text-muted-foreground">没有匹配筛选条件的测试项或 PART。</div>
+            <div className="flex min-h-0 flex-1 p-3">
+              <EmptyState
+                icon={SearchX}
+                title="没有匹配筛选条件的测试项或 PART"
+                body="换个筛选条件，或在筛选对话框里全选恢复全部测试项。"
+              />
+            </div>
           ) : (
             <div ref={scrollRef} onScroll={handleScroll} className="min-h-0 overflow-auto">
               {/* Virtualized matrix: only the scroll window of rows × columns is
@@ -2019,7 +2567,7 @@ function TestItemsView({
                     {LEFT_COLS.map((col) => (
                       <th
                         key={col.key}
-                        className="overflow-hidden whitespace-nowrap bg-muted px-2.5 py-2 text-center align-middle text-[11px] font-semibold text-foreground"
+                        className={`overflow-hidden whitespace-nowrap bg-muted px-2.5 py-2 align-middle text-[11px] font-semibold text-foreground ${ALIGN_CLASS[col.align]}`}
                       >
                         {col.label}
                       </th>
@@ -2036,9 +2584,9 @@ function TestItemsView({
                           {column.test_name || `#${column.test_num}`}
                         </span>
                         {/* Limits only — the record type and test number live in the
-                            click-to-open detail card. Centered to line up with the
-                            centered values below. */}
-                        <span className="mt-0.5 block truncate text-center font-mono text-[11px] tabular-nums text-muted-foreground">
+                            click-to-open detail card. Right-aligned to sit on the
+                            same edge as the values below. */}
+                        <span className="mt-0.5 block truncate text-right font-mono text-[11px] tabular-nums text-muted-foreground">
                           {columnMetaLine(column)}
                         </span>
                       </th>
@@ -2057,7 +2605,7 @@ function TestItemsView({
                       {LEFT_COLS.map((col) => (
                         <td
                           key={col.key}
-                          className={`${MONO} overflow-hidden whitespace-nowrap px-2.5 py-0 text-center align-middle text-foreground`}
+                          className={`${MONO} overflow-hidden whitespace-nowrap px-2.5 py-0 align-middle text-foreground ${ALIGN_CLASS[col.align]}`}
                           title={col.title?.(row)}
                         >
                           {col.render ? (
@@ -2086,7 +2634,7 @@ function TestItemsView({
                         return (
                           <td
                             key={`${row.part_id}:${row.site_num}:${column.record_type}:${column.test_num}`}
-                            className={`overflow-hidden px-2 py-0 text-center align-middle ${status === "F" ? "bg-danger-soft" : ""}`}
+                            className={`overflow-hidden px-2 py-0 align-middle ${status === "F" ? "bg-danger-soft" : ""}`}
                             onContextMenu={(e) => {
                               e.preventDefault();
                               setCellMenu({
@@ -2100,7 +2648,7 @@ function TestItemsView({
                           >
                             <span
                               title={cell?.value || undefined}
-                              className={`block w-full truncate text-center tabular-nums ${textTone}`}
+                              className={`block w-full truncate text-right font-mono text-xs tabular-nums ${textTone}`}
                             >
                               {display}
                             </span>
@@ -2130,7 +2678,7 @@ function TestItemsView({
         <div
           role="dialog"
           aria-label="测试项详情"
-          className="fixed z-50 w-[320px] rounded-lg border border-border-strong bg-card p-3.5 shadow-xl"
+          className="pop-in fixed z-50 w-[320px] rounded-lg border border-border-strong bg-card p-3.5 shadow-overlay"
           style={{
             left: Math.max(8, Math.min(colInfo.x, window.innerWidth - 336)),
             top: Math.min(colInfo.y + 10, window.innerHeight - 220)
@@ -2195,7 +2743,7 @@ function TestItemsView({
       {cellMenu && (
         <div
           role="menu"
-          className="fixed z-50 min-w-[160px] rounded-md border border-border-strong bg-card py-1 text-sm shadow-lg"
+          className="pop-in fixed z-50 min-w-[160px] rounded-md border border-border-strong bg-card py-1 text-sm shadow-overlay"
           style={{ left: cellMenu.x, top: cellMenu.y }}
           onMouseDown={(e) => e.stopPropagation()}
         >
@@ -2296,18 +2844,18 @@ function TestItemFilterDialog({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
+      className="overlay-fade fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
       onClick={onClose}
       role="presentation"
     >
       <div
-        className="flex max-h-[80vh] w-[560px] max-w-full flex-col overflow-hidden rounded-xl border border-border bg-card shadow-xl"
+        className="pop-in flex max-h-[80vh] w-[560px] max-w-full flex-col overflow-hidden rounded-xl border border-border bg-card shadow-overlay"
         onClick={(event) => event.stopPropagation()}
         role="dialog"
         aria-label="筛选测试项"
       >
         <div className="flex items-center justify-between border-b border-border px-4 py-3">
-          <strong className="text-sm font-semibold text-foreground">筛选测试项</strong>
+          <strong className="text-[15px] font-semibold text-foreground">筛选测试项</strong>
           <button type="button" className={PAGER_BTN} onClick={onClose} aria-label="关闭">
             <X size={14} />
           </button>
@@ -2395,7 +2943,7 @@ function TestItemFilterDialog({
 
 function SearchResultsTable({ results }: { results: SearchResult[] }) {
   if (results.length === 0) {
-    return <EmptyState title="没有搜索结果" body="尝试搜索 record type、字段名或字段值。" />;
+    return <EmptyState icon={SearchX} title="没有搜索结果" body="尝试搜索 record type、字段名或字段值。" />;
   }
 
   return (
@@ -2428,6 +2976,7 @@ function FieldsTable({ fields }: { fields: RecordField[] }) {
   if (fields.length === 0) {
     return (
       <EmptyState
+        icon={Inbox}
         title="该 record 无数据字段"
         body="EPS（程序段结束标记）等 record 按 STDF V4 规范本身不含数据字段，属正常情况，并非仍在加载。"
       />
@@ -2455,7 +3004,7 @@ function FieldsTable({ fields }: { fields: RecordField[] }) {
                     title="STDF v4 允许该字段在同一 TEST_NUM 后续 PTR/MPR 中省略，值继承自首条记录"
                   >
                     {displayValue(field.name, field.inherited_value)}
-                    <span className="ml-1.5 rounded-sm bg-primary-soft px-1 py-px text-[10px] font-medium not-italic text-primary">
+                    <span className="ml-1.5 rounded-sm bg-primary-soft px-1 py-px text-[11px] font-medium not-italic text-primary">
                       继承
                     </span>
                   </span>
@@ -2472,11 +3021,26 @@ function FieldsTable({ fields }: { fields: RecordField[] }) {
   );
 }
 
-function EmptyState({ title, body }: { title: string; body: string }) {
+function EmptyState({
+  icon: Icon,
+  spin = false,
+  title,
+  body
+}: {
+  icon?: LucideIcon;
+  spin?: boolean;
+  title: string;
+  body: string;
+}) {
   return (
     <div className="flex min-h-[160px] flex-1 flex-col items-center justify-center rounded-xl border border-dashed border-border-strong p-6 text-center text-muted-foreground">
-      <strong className="text-foreground">{title}</strong>
-      <p className="mt-1.5 max-w-[320px]">{body}</p>
+      {Icon && (
+        <div className="mb-3 flex h-11 w-11 items-center justify-center rounded-xl bg-muted">
+          <Icon size={20} className={spin ? "animate-spin" : undefined} aria-hidden="true" />
+        </div>
+      )}
+      <strong className="text-balance text-foreground">{title}</strong>
+      <p className="mt-1.5 max-w-[340px] text-pretty text-[13px] leading-relaxed">{body}</p>
     </div>
   );
 }
