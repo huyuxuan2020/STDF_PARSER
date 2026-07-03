@@ -1556,11 +1556,52 @@ const LEFT_COLS: LeftCol[] = [
   { key: "part_txt", label: "PART_TXT", width: 200, get: (r) => r.part_txt || "-", title: (r) => r.part_txt || undefined }
 ];
 
-// Total width of the left info block — the horizontal "header offset" for
-// column windowing.
-const TI_LEFT_WIDTH = LEFT_COLS.reduce((sum, col) => sum + col.width, 0);
+// Width of the meta-label lane sitting between the part-info block and the
+// value grid ("Test Type" / "Low Limit" / ... labels).
+const TI_GUTTER_W = 88;
+// Total width left of the value grid — the horizontal "header offset" for
+// column windowing (part-info columns + the label lane).
+const TI_LEFT_WIDTH = LEFT_COLS.reduce((sum, col) => sum + col.width, 0) + TI_GUTTER_W;
 // Fixed body-row height (px) — vertical windowing positions rows by this.
 const TI_ROW_H = 40;
+// Auto-fit bounds for value columns.
+const TI_COL_MIN = 84;
+const TI_COL_MAX = 260;
+
+// Text measurement for auto-fitting column widths. Falls back to a char-count
+// heuristic where canvas 2D is unavailable (jsdom).
+let measureCtx: CanvasRenderingContext2D | null | undefined;
+function textWidth(text: string, font: string): number {
+  if (measureCtx === undefined) {
+    measureCtx =
+      typeof document !== "undefined" ? document.createElement("canvas").getContext("2d") : null;
+  }
+  if (!measureCtx) return text.length * 7.2;
+  measureCtx.font = font;
+  return measureCtx.measureText(text).width;
+}
+
+const FONT_MONO_12 = '12px ui-monospace, SFMono-Regular, Menlo, monospace';
+const FONT_SANS_11 = '11px -apple-system, "PingFang SC", "Helvetica Neue", sans-serif';
+const FONT_SANS_13 = '13px -apple-system, "PingFang SC", "Helvetica Neue", sans-serif';
+
+// Width a value column needs: widest of its metadata rows (the name may wrap
+// to two lines) and a sample of its loaded values, clamped to sane bounds.
+function fitColumnWidth(column: TestItemColumn, sample: TestItemPartRow[], index: number): number {
+  let w = textWidth(String(column.test_num), FONT_MONO_12);
+  w = Math.max(
+    w,
+    textWidth(column.low_limit || "-", FONT_MONO_12),
+    textWidth(column.high_limit || "-", FONT_MONO_12),
+    textWidth(column.record_type === "FTR" ? "P/F" : column.unit || "-", FONT_SANS_11),
+    textWidth(column.test_name || "-", FONT_SANS_11) / 2
+  );
+  for (const row of sample) {
+    const value = row.results[index]?.value;
+    if (value) w = Math.max(w, textWidth(value, FONT_SANS_13));
+  }
+  return Math.min(TI_COL_MAX, Math.max(TI_COL_MIN, Math.ceil(w) + 20));
+}
 
 // The test-item header is transposed into one row per metadata field, so each of
 // Test Type / Num / Name / Low / High / Unit becomes its own row across all columns.
@@ -1574,9 +1615,11 @@ const META_ROWS: { key: string; label: string; value: (column: TestItemColumn) =
 ];
 
 // Non-sticky header cell tokens (borders come from the table-level selectors).
-const HDR_LABEL = "px-2.5 py-1.5 text-right align-middle text-[11px] font-semibold text-muted-foreground bg-muted";
-const HDR_VALUE = "px-2 py-1 align-middle text-[11px] text-foreground bg-card";
-const HDR_COL = "px-2.5 py-1.5 text-left align-middle text-[11px] font-semibold text-foreground bg-muted";
+// The meta labels sit on the card background (not a gray slab) so the top-left
+// block reads as row labels for the header matrix, not a dead area.
+const HDR_LABEL = "px-2.5 py-1.5 text-right align-middle text-[11px] font-medium text-muted-foreground bg-card";
+const HDR_VALUE =
+  "px-2 py-1 align-middle text-[11px] text-foreground bg-card cursor-pointer transition-colors hover:bg-primary-soft/60";
 const TEST_COL_WIDTH = 120;
 
 function TestItemsView({
@@ -1635,13 +1678,21 @@ function TestItemsView({
     recordType: string;
     recordPosition: number | undefined;
   } | null>(null);
+  // Column detail card: opened by clicking any header cell of a test column.
+  // Shows the full (grid-truncated) name selectable, plus copy shortcuts.
+  const [colInfo, setColInfo] = useState<{ x: number; y: number; column: TestItemColumn } | null>(
+    null
+  );
   useEffect(() => {
-    if (!cellMenu) return;
-    const close = () => setCellMenu(null);
+    if (!cellMenu && !colInfo) return;
+    const close = () => {
+      setCellMenu(null);
+      setColInfo(null);
+    };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") close();
     };
-    // Any mousedown, scroll, or Escape dismisses the menu.
+    // Any mousedown, scroll, or Escape dismisses the menu / detail card.
     window.addEventListener("mousedown", close);
     window.addEventListener("scroll", close, true);
     window.addEventListener("keydown", onKey);
@@ -1650,7 +1701,7 @@ function TestItemsView({
       window.removeEventListener("scroll", close, true);
       window.removeEventListener("keydown", onKey);
     };
-  }, [cellMenu]);
+  }, [cellMenu, colInfo]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const theadRef = useRef<HTMLTableSectionElement>(null);
   // Scroll/viewport metrics driving the render window. Scroll offsets are
@@ -1663,7 +1714,9 @@ function TestItemsView({
     if (!el) return;
     const next = {
       top: Math.floor(el.scrollTop / TI_ROW_H) * TI_ROW_H,
-      left: Math.floor(el.scrollLeft / TEST_COL_WIDTH) * TEST_COL_WIDTH,
+      // Columns are variable-width, so bucketize by a fixed quantum (well under
+      // the minimum column width) purely to dedupe scroll-driven re-renders.
+      left: Math.floor(el.scrollLeft / 48) * 48,
       height: el.clientHeight,
       width: el.clientWidth,
       headerH: theadRef.current?.offsetHeight ?? 0
@@ -1700,6 +1753,21 @@ function TestItemsView({
     }
   };
 
+  // Auto-fitted value-column widths, measured from column metadata plus a
+  // sample of the first loaded rows. Keyed on the first row's identity so
+  // load-more appends never shift the layout.
+  const firstRow = rows[0];
+  const colWidths = useMemo(() => {
+    const sample = rows.slice(0, 30);
+    return columns.map((column, index) => fitColumnWidth(column, sample, index));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [columns, firstRow]);
+  const colOffsets = useMemo(() => {
+    const offsets = [0];
+    for (const width of colWidths) offsets.push(offsets[offsets.length - 1] + width);
+    return offsets;
+  }, [colWidths]);
+
   // Window of rows/columns actually mounted; the rest is spacer height/width.
   const win = computeMatrixWindow({
     scrollTop: view.top,
@@ -1711,16 +1779,18 @@ function TestItemsView({
     rowHeight: TI_ROW_H,
     colWidth: TEST_COL_WIDTH,
     rowCount: rows.length,
-    colCount: columns.length
+    colCount: columns.length,
+    colOffsets
   });
   const visibleRows = rows.slice(win.rowStart, win.rowEnd);
   const visibleCols = columns.slice(win.colStart, win.colEnd);
   const spacerTop = win.rowStart * TI_ROW_H;
   const spacerBottom = (rows.length - win.rowEnd) * TI_ROW_H;
-  const spacerLead = win.colStart * TEST_COL_WIDTH;
-  const spacerTrail = (columns.length - win.colEnd) * TEST_COL_WIDTH;
-  // colgroup entries: left info cols + lead spacer + windowed value cols + trail spacer.
-  const fullColSpan = LEFT_COLS.length + visibleCols.length + 2;
+  const spacerLead = colOffsets[win.colStart] ?? 0;
+  const spacerTrail = (colOffsets[columns.length] ?? 0) - (colOffsets[win.colEnd] ?? 0);
+  // colgroup entries: left info cols + label lane + lead spacer + windowed
+  // value cols + trail spacer.
+  const fullColSpan = LEFT_COLS.length + 1 + visibleCols.length + 2;
 
   return (
     <section className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-[18px]" aria-label="测试项">
@@ -1812,19 +1882,35 @@ function TestItemsView({
                   {LEFT_COLS.map((col) => (
                     <col key={col.key} style={{ width: col.width }} />
                   ))}
+                  <col style={{ width: TI_GUTTER_W }} />
                   <col style={{ width: spacerLead }} />
-                  {visibleCols.map((column) => (
-                    <col key={`${column.record_type}:${column.test_num}`} style={{ width: TEST_COL_WIDTH }} />
+                  {visibleCols.map((column, index) => (
+                    <col
+                      key={`${column.record_type}:${column.test_num}`}
+                      style={{ width: colWidths[win.colStart + index] }}
+                    />
                   ))}
                   <col style={{ width: spacerTrail }} />
                 </colgroup>
                 <thead ref={theadRef}>
-                  {/* One row per test-item metadata field (Type / Num / Name / Low / High / Unit). */}
-                  {META_ROWS.map((meta) => (
+                  {/* One row per test-item metadata field (Type / Num / Name / Low /
+                      High / Unit). The part-info column headers span all meta rows
+                      vertically (bottom-aligned), so the top-left region holds real
+                      headers instead of a dead slab; the meta labels sit in a narrow
+                      lane right against the value grid. */}
+                  {META_ROWS.map((meta, metaIndex) => (
                     <tr key={meta.key}>
-                      <th colSpan={LEFT_COLS.length} className={HDR_LABEL}>
-                        {meta.label}
-                      </th>
+                      {metaIndex === 0 &&
+                        LEFT_COLS.map((col) => (
+                          <th
+                            key={col.key}
+                            rowSpan={META_ROWS.length}
+                            className="overflow-hidden whitespace-nowrap bg-card px-2.5 pb-2 text-left align-bottom text-[11px] font-semibold text-foreground"
+                          >
+                            {col.label}
+                          </th>
+                        ))}
+                      <th className={HDR_LABEL}>{meta.label}</th>
                       <th aria-hidden className="!border-0 p-0" />
                       {visibleCols.map((column) => {
                         const value = meta.value(column);
@@ -1837,6 +1923,8 @@ function TestItemsView({
                             className={`${HDR_VALUE} font-normal ${isName ? "text-left" : "text-center"} ${
                               meta.key === "type" ? "text-primary" : ""
                             }`}
+                            title="点击查看完整测试项信息"
+                            onClick={(e) => setColInfo({ x: e.clientX, y: e.clientY, column })}
                           >
                             <span
                               className={`${
@@ -1844,7 +1932,6 @@ function TestItemsView({
                                   ? "line-clamp-2 [overflow-wrap:anywhere]"
                                   : "block truncate"
                               } ${meta.mono ? "font-mono tabular-nums" : ""}`}
-                              title={value}
                             >
                               {value}
                             </span>
@@ -1854,15 +1941,6 @@ function TestItemsView({
                       <th aria-hidden className="!border-0 p-0" />
                     </tr>
                   ))}
-                  {/* Header row for the per-part info columns. */}
-                  <tr>
-                    {LEFT_COLS.map((col) => (
-                      <th key={col.key} className={`${HDR_COL} overflow-hidden whitespace-nowrap`}>
-                        {col.label}
-                      </th>
-                    ))}
-                    <th colSpan={visibleCols.length + 2} className="bg-muted" />
-                  </tr>
                 </thead>
                 <tbody>
                   {spacerTop > 0 && (
@@ -1885,6 +1963,8 @@ function TestItemsView({
                           )}
                         </td>
                       ))}
+                      {/* Label-lane gutter: keeps 固定信息 and 数据矩阵 visually apart. */}
+                      <td aria-hidden className="!border-b-0 bg-muted/20 p-0" />
                       <td aria-hidden className="!border-0 p-0" />
                       {visibleCols.map((column, index) => {
                         const cell = row.results[win.colStart + index];
@@ -1942,6 +2022,72 @@ function TestItemsView({
               )}
             </div>
           )}
+        </div>
+      )}
+      {colInfo && (
+        <div
+          role="dialog"
+          aria-label="测试项详情"
+          className="fixed z-50 w-[320px] rounded-lg border border-border-strong bg-card p-3.5 shadow-xl"
+          style={{
+            left: Math.max(8, Math.min(colInfo.x, window.innerWidth - 336)),
+            top: Math.min(colInfo.y + 10, window.innerHeight - 220)
+          }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <div className="flex items-center gap-2">
+            <span className="rounded-sm bg-primary-soft px-1.5 py-px text-[11px] font-medium text-primary">
+              {colInfo.column.record_type}
+            </span>
+            <span className="font-mono text-xs tabular-nums text-muted-foreground">
+              {colInfo.column.test_num}
+            </span>
+          </div>
+          <p className="mt-2 select-text break-all text-[13px] font-medium leading-relaxed text-foreground">
+            {colInfo.column.test_name || "-"}
+          </p>
+          <div className="mt-2.5 grid grid-cols-3 gap-2 rounded-md bg-muted px-2.5 py-2 text-xs">
+            <div>
+              <div className="text-muted-foreground">Low</div>
+              <div className="mt-0.5 select-text truncate font-mono text-foreground" title={colInfo.column.low_limit || undefined}>
+                {colInfo.column.low_limit || "-"}
+              </div>
+            </div>
+            <div>
+              <div className="text-muted-foreground">High</div>
+              <div className="mt-0.5 select-text truncate font-mono text-foreground" title={colInfo.column.high_limit || undefined}>
+                {colInfo.column.high_limit || "-"}
+              </div>
+            </div>
+            <div>
+              <div className="text-muted-foreground">Unit</div>
+              <div className="mt-0.5 select-text truncate text-foreground">
+                {colInfo.column.record_type === "FTR" ? "P/F" : colInfo.column.unit || "-"}
+              </div>
+            </div>
+          </div>
+          <div className="mt-3 flex gap-2">
+            <button
+              type="button"
+              className={PAGER_BTN}
+              onClick={() => {
+                void navigator.clipboard?.writeText(colInfo.column.test_name || "");
+                setColInfo(null);
+              }}
+            >
+              复制名称
+            </button>
+            <button
+              type="button"
+              className={PAGER_BTN}
+              onClick={() => {
+                void navigator.clipboard?.writeText(String(colInfo.column.test_num));
+                setColInfo(null);
+              }}
+            >
+              复制编号
+            </button>
+          </div>
         </div>
       )}
       {cellMenu && (

@@ -72,4 +72,58 @@ describe("computeMatrixWindow", () => {
     expect(win.rowStart).toBeLessThanOrEqual(5);
     expect(win.rowEnd).toBe(5);
   });
+
+  describe("variable column widths (colOffsets)", () => {
+    // Deliberately non-uniform widths (400, 50, 50, 50, 400) so uniform-width
+    // math would land on different columns than offset math.
+    const OFFSETS = [0, 400, 450, 500, 550, 950];
+    const VAR = { ...BASE, colCount: 5, colOffsets: OFFSETS, overscanCols: 0 };
+
+    it("starts at the first column when the left block is still in view", () => {
+      const win = computeMatrixWindow({ ...VAR, scrollLeft: 0 });
+      expect(win.colStart).toBe(0);
+    });
+
+    it("locates the visible window by offsets, not by uniform width", () => {
+      // Visible span starts 420px into the grid → inside column 1 (400..450);
+      // with a 60px viewport it ends inside column 2 (450..500).
+      // Uniform 120px math would have said columns 3..5.
+      const win = computeMatrixWindow({
+        ...VAR,
+        viewportWidth: 60,
+        scrollLeft: 1000 + 420
+      });
+      expect(win.colStart).toBe(1);
+      expect(win.colEnd).toBe(3);
+    });
+
+    it("spans many narrow columns when the viewport is wide", () => {
+      // 420..900 covers columns 1,2,3 and reaches into 4 (550..950).
+      const win = computeMatrixWindow({
+        ...VAR,
+        viewportWidth: 480,
+        scrollLeft: 1000 + 420
+      });
+      expect(win.colStart).toBe(1);
+      expect(win.colEnd).toBe(5);
+    });
+
+    it("applies column overscan on both sides", () => {
+      const win = computeMatrixWindow({
+        ...VAR,
+        overscanCols: 1,
+        viewportWidth: 60,
+        scrollLeft: 1000 + 420
+      });
+      expect(win.colStart).toBe(0);
+      expect(win.colEnd).toBe(4);
+    });
+
+    it("clamps to the column count when scrolled past the end", () => {
+      const win = computeMatrixWindow({ ...VAR, scrollLeft: 1000 + 5000 });
+      expect(win.colStart).toBeLessThanOrEqual(5);
+      expect(win.colEnd).toBe(5);
+      expect(win.colStart).toBeLessThanOrEqual(win.colEnd);
+    });
+  });
 });

@@ -174,6 +174,42 @@ describe("App", () => {
     await waitFor(() => expect(getTestItemColumns).toHaveBeenCalledTimes(1));
   });
 
+  it("opens a column detail card with the full test name and copies it", async () => {
+    const api = createMockApi();
+    const user = userEvent.setup();
+    // After setup(): user-event installs its own clipboard stub — override it
+    // so we can observe what the component copies.
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true
+    });
+
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
+    await screen.findByRole("main", { name: "文件摘要" });
+    act(() => {
+      api.emitComplete("session-1");
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "测试项" })).not.toBeDisabled());
+    await user.click(screen.getByRole("button", { name: "测试项" }));
+    await screen.findByText("PART-1");
+
+    // Clicking a column's header opens a detail card where the full (possibly
+    // truncated in the grid) name is visible, selectable and copyable.
+    await user.click(screen.getByText("VDD_CORE"));
+    const card = await screen.findByRole("dialog", { name: "测试项详情" });
+    expect(within(card).getByText("VDD_CORE")).toBeInTheDocument();
+    expect(within(card).getByText("100")).toBeInTheDocument(); // test num
+    expect(within(card).getByText("1.0")).toBeInTheDocument(); // low limit
+
+    await user.click(within(card).getByRole("button", { name: "复制名称" }));
+    expect(writeText).toHaveBeenCalledWith("VDD_CORE");
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "测试项详情" })).not.toBeInTheDocument()
+    );
+  });
+
   it("keeps the test-item nav gated until parsing completes", async () => {
     const api = createMockApi({
       getSessionSnapshot: async () => ({
