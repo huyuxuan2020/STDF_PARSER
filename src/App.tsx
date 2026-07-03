@@ -123,9 +123,9 @@ const RECORD_TYPE_INFO: Record<string, string> = {
 
 const NAV_ITEMS = [
   { key: "summary", label: "概览", icon: LayoutDashboard },
-  { key: "records", label: "记录", icon: Table2 },
-  { key: "search", label: "搜索", icon: Search },
-  { key: "test-items", label: "测试项", icon: TableProperties }
+  { key: "records", label: "明细", icon: Table2 },
+  { key: "test-items", label: "测试项", icon: TableProperties },
+  { key: "search", label: "搜索", icon: Search }
 ] as const;
 
 type NavSection = (typeof NAV_ITEMS)[number]["key"];

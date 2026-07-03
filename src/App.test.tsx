@@ -15,7 +15,7 @@ describe("App", () => {
 
     expect(await screen.findByRole("main", { name: "文件摘要" })).toBeInTheDocument();
     expect(screen.getAllByText("demo-1.stdf").length).toBeGreaterThan(0);
-    expect(screen.getByRole("button", { name: "记录" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "明细" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "打开另一个文件" })).toBeInTheDocument();
     expect(screen.getByText("LOT_ID")).toBeInTheDocument();
     expect(screen.getByText("V29F7")).toBeInTheDocument();
@@ -32,7 +32,7 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
 
     expect(await screen.findByRole("main", { name: "文件摘要" })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "记录" }));
+    await user.click(screen.getByRole("button", { name: "明细" }));
     expect(await screen.findByRole("main", { name: "STDF 工作台" })).toBeInTheDocument();
     expect(await screen.findByRole("button", { name: "FAR 1 条记录" })).toBeInTheDocument();
     expect(await screen.findByText("CPU 类型")).toBeInTheDocument();
