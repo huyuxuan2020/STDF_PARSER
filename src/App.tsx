@@ -26,6 +26,7 @@ import {
   type LucideIcon
 } from "lucide-react";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { computeMatrixWindow } from "./matrixWindow";
 import type {
   ParseErrorEvent,
@@ -2678,7 +2679,11 @@ function TestItemsView({
           )}
         </div>
       )}
-      {colInfo && (
+      {/* Both popups render through a portal: position: fixed resolves against
+          the nearest transformed ancestor, so leaving them inside the (animated)
+          section risks offset coordinates whenever a transform is in effect. */}
+      {colInfo &&
+        createPortal(
         <div
           role="dialog"
           aria-label="测试项详情"
@@ -2742,13 +2747,18 @@ function TestItemsView({
               复制编号
             </button>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
-      {cellMenu && (
+      {cellMenu &&
+        createPortal(
         <div
           role="menu"
           className="pop-in fixed z-50 min-w-[160px] rounded-md border border-border-strong bg-card py-1 text-sm shadow-overlay"
-          style={{ left: cellMenu.x, top: cellMenu.y }}
+          style={{
+            left: Math.max(8, Math.min(cellMenu.x, window.innerWidth - 168)),
+            top: Math.max(8, Math.min(cellMenu.y, window.innerHeight - 90))
+          }}
           onMouseDown={(e) => e.stopPropagation()}
         >
           <button
@@ -2779,7 +2789,8 @@ function TestItemsView({
           >
             复制值
           </button>
-        </div>
+        </div>,
+        document.body
       )}
     </section>
   );

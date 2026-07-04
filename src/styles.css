@@ -236,8 +236,13 @@ input[type="number"] {
   }
 }
 
+/* Fill mode must stay `backwards`: with `both`/`forwards` the finished
+   animation keeps the `to` transform applied as an identity matrix (not
+   `none`), which turns the section into the containing block for every
+   `position: fixed` descendant — context menus / detail cards then render
+   offset by the section's viewport position. */
 .fade-rise {
-  animation: fade-rise 420ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation: fade-rise 420ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
   animation-delay: calc(var(--stagger, 0) * 55ms);
 }
 
