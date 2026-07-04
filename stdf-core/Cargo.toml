@@ -23,7 +23,11 @@ unrar = "0.5.8"
 tar = "0.4.46"
 bzip2 = "0.6.1"
 zstd = "0.13.3"
-liblzma = "0.4.7"
+# "static" is load-bearing: without it the build machine's pkg-config finds
+# Homebrew xz and links liblzma.5.dylib dynamically — the shipped app then
+# crashes at launch (dyld "Library not loaded") on machines without it.
+# That exact failure shipped as v1.0.0.
+liblzma = { version = "0.4.7", features = ["static"] }
 
 [dev-dependencies]
 tempfile = "3"

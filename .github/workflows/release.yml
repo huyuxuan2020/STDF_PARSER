@@ -126,6 +126,21 @@ jobs:
           includeUpdaterJson: true
           args: ${{ matrix.args }}
 
+      # 静态链接守卫：产物若引用 Homebrew / /usr/local 的动态库（例如
+      # liblzma.5.dylib），在没装对应库的用户机器上会启动即崩——v1.0.0
+      # 就是这样翻车的。此步失败则整个 job 失败，Release 停留在草稿，
+      # 不会对用户可见。
+      - name: Assert no external dylib references (macOS)
+        if: matrix.platform == 'macos-latest'
+        run: |
+          BIN=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -path "*.app/Contents/MacOS/*" -type f | head -1)
+          echo "checking: $BIN"
+          otool -L "$BIN"
+          if otool -L "$BIN" | grep -E "/opt/homebrew|/usr/local"; then
+            echo "::error::App binary links non-system dylibs and would crash on user machines"
+            exit 1
+          fi
+
   # ── 3) 两个平台都成功后，才正式发布（取消草稿）──
   publish-release:
     needs: [create-release, build-tauri]
