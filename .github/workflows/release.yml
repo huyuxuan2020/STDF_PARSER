@@ -133,7 +133,11 @@ jobs:
       - name: Assert no external dylib references (macOS)
         if: matrix.platform == 'macos-latest'
         run: |
-          BIN=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -path "*.app/Contents/MacOS/*" -type f | head -1)
+          BIN=$(find target/universal-apple-darwin/release/bundle/macos -path "*.app/Contents/MacOS/*" -type f | head -1)
+          if [ -z "$BIN" ]; then
+            echo "::error::bundled app binary not found — check the bundle path"
+            exit 1
+          fi
           echo "checking: $BIN"
           otool -L "$BIN"
           if otool -L "$BIN" | grep -E "/opt/homebrew|/usr/local"; then
@@ -147,7 +151,7 @@ jobs:
       - name: Smoke-launch the built app (macOS)
         if: matrix.platform == 'macos-latest'
         run: |
-          BIN=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -path "*.app/Contents/MacOS/*" -type f | head -1)
+          BIN=$(find target/universal-apple-darwin/release/bundle/macos -path "*.app/Contents/MacOS/*" -type f | head -1)
           echo "launching: $BIN"
           "$BIN" &
           PID=$!
@@ -162,7 +166,7 @@ jobs:
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          $bin = "src-tauri/target/release/stdf-viewer-mac.exe"
+          $bin = "target/release/stdf-viewer-mac.exe"
           Write-Host "launching: $bin"
           $p = Start-Process -FilePath $bin -PassThru
           Start-Sleep -Seconds 8
