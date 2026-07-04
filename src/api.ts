@@ -23,7 +23,27 @@ export const tauriApi: StdfApi = {
   async openFile() {
     const selected = await open({
       multiple: false,
-      filters: [{ name: "STDF", extensions: ["stdf", "std", "gz", "zip"] }]
+      filters: [
+        {
+          name: "STDF",
+          extensions: [
+            "stdf",
+            "std",
+            "gz",
+            "zip",
+            "7z",
+            "rar",
+            "xz",
+            "bz2",
+            "zst",
+            "tar",
+            "tgz",
+            "txz",
+            "tbz",
+            "tbz2"
+          ]
+        }
+      ]
     });
     if (typeof selected !== "string") {
       return null;

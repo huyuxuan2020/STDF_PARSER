@@ -417,8 +417,27 @@ impl SessionManager {
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if !matches!(extension.as_str(), "stdf" | "std" | "gz" | "zip") {
-            return Err("仅支持 .stdf / .std，或 .gz / .zip 压缩包".to_string());
+        if !matches!(
+            extension.as_str(),
+            "stdf"
+                | "std"
+                | "gz"
+                | "zip"
+                | "7z"
+                | "rar"
+                | "xz"
+                | "bz2"
+                | "zst"
+                | "tar"
+                | "tgz"
+                | "txz"
+                | "tbz"
+                | "tbz2"
+        ) {
+            return Err(
+                "仅支持 .stdf / .std，或 zip / gz / 7z / rar / tar / xz / bz2 / zst 压缩包"
+                    .to_string(),
+            );
         }
 
         let session_id = Uuid::new_v4().to_string();
@@ -2582,31 +2601,94 @@ fn read_blob_u64(blob: &[u8], cursor: &mut usize) -> Result<u64, String> {
 
 /// Detect compression by magic bytes and stream the selected STDF payload into
 /// the parser without writing a decompressed temp file.
+/// Route the input to the right decoder. The input may be a bare STDF, a
+/// single-file compressed stream (gz / xz / bz2 / zst), or an archive holding
+/// the STDF among other files (zip / 7z / rar / tar — including tar wrapped
+/// in any single-file compressor, e.g. .tar.gz). Detection is magic-byte
+/// based rather than extension based, so renamed files keep working. Archive
+/// entry policy matches the original zip behavior everywhere: the first
+/// *.stdf / *.std file entry wins.
 fn with_input_reader<T>(
     path: &Path,
     fallback_total: u64,
     parse: impl FnOnce(&mut dyn Read, u64) -> T,
 ) -> Result<T, String> {
-    let mut magic = [0_u8; 4];
+    let mut magic = [0_u8; 8];
     {
         let mut probe = File::open(path).map_err(|error| error.to_string())?;
         let _ = probe.read(&mut magic);
     }
-    let is_gzip = magic[0] == 0x1f && magic[1] == 0x8b;
-    let is_zip = magic[0] == 0x50 && magic[1] == 0x4b && magic[2] == 0x03 && magic[3] == 0x04;
-    if !is_gzip && !is_zip {
+
+    // Single-file decompressors all share the tar sniffing path, because a
+    // .tar.gz/.tar.xz/... shows the compressor's magic outside and the tar
+    // layout only inside the decompressed stream.
+    if magic.starts_with(&[0x1f, 0x8b]) {
+        let input = File::open(path).map_err(|error| error.to_string())?;
+        return parse_decompressed(flate2::read::GzDecoder::new(input), fallback_total, parse);
+    }
+    if magic.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+        let input = File::open(path).map_err(|error| error.to_string())?;
+        return parse_decompressed(liblzma::read::XzDecoder::new(input), fallback_total, parse);
+    }
+    if magic.starts_with(b"BZh") {
+        let input = File::open(path).map_err(|error| error.to_string())?;
+        return parse_decompressed(bzip2::read::BzDecoder::new(input), fallback_total, parse);
+    }
+    if magic.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        let input = File::open(path).map_err(|error| error.to_string())?;
+        let decoder =
+            zstd::stream::read::Decoder::new(input).map_err(|error| error.to_string())?;
+        return parse_decompressed(decoder, fallback_total, parse);
+    }
+
+    if magic.starts_with(&[b'7', b'z', 0xbc, 0xaf, 0x27, 0x1c]) {
+        return parse_sevenz(path, fallback_total, parse);
+    }
+    if magic.starts_with(b"Rar!\x1a\x07") {
+        return parse_rar(path, fallback_total, parse);
+    }
+
+    let is_zip = magic.starts_with(&[0x50, 0x4b, 0x03, 0x04]);
+    if !is_zip {
+        // Plain uncompressed tar carries no leading magic — "ustar" sits at
+        // offset 257. Bare .stdf/.std extensions skip the sniff so payload
+        // bytes can never reroute a real STDF.
+        if !has_stdf_extension(path) && file_is_tar(path)? {
+            let input = File::open(path).map_err(|error| error.to_string())?;
+            return parse_tar_stream(input, fallback_total, parse);
+        }
         let mut file = File::open(path).map_err(|error| error.to_string())?;
         return Ok(parse(&mut file, fallback_total));
     }
 
-    if is_gzip {
-        let input = File::open(path).map_err(|error| error.to_string())?;
-        let mut decoder = flate2::read::GzDecoder::new(input);
-        return Ok(parse(&mut decoder, fallback_total));
-    }
-
     if let Some(message) = incomplete_zip_message(path) {
         return Err(message);
+    }
+
+    // Central-directory reader first: Finder/ditto zips keep entry sizes only
+    // in the data descriptor + central directory, which the pure streaming
+    // reader rejects ("file length is not available in the local header").
+    let input = File::open(path).map_err(|error| error.to_string())?;
+    match zip::ZipArchive::new(BufReader::with_capacity(PARSE_BUFFER_SIZE, input)) {
+        Ok(mut archive) => {
+            for index in 0..archive.len() {
+                let mut entry = archive
+                    .by_index(index)
+                    .map_err(|error| format!("zip 解析失败: {error}"))?;
+                if entry.is_file() && is_stdf_entry_name(entry.name()) {
+                    let total_bytes = if entry.size() == 0 {
+                        fallback_total
+                    } else {
+                        entry.size()
+                    };
+                    return Ok(parse(&mut entry, total_bytes));
+                }
+            }
+            return Err("zip 包内没有可解析的文件".to_string());
+        }
+        // No usable central directory (truncated download, exotic writer):
+        // fall back to walking local headers as before.
+        Err(_) => {}
     }
 
     let input = File::open(path).map_err(|error| error.to_string())?;
@@ -2618,19 +2700,191 @@ fn with_input_reader<T>(
         let Some(mut entry) = entry.take() else {
             return Err("zip 包内没有可解析的文件".to_string());
         };
-        if entry.is_file() {
-            let name = entry.name().to_ascii_lowercase();
-            if name.ends_with(".stdf") || name.ends_with(".std") {
-                let total_bytes = if entry.size() == 0 {
-                    fallback_total
-                } else {
-                    entry.size()
-                };
-                return Ok(parse(&mut entry, total_bytes));
-            }
+        if entry.is_file() && is_stdf_entry_name(entry.name()) {
+            let total_bytes = if entry.size() == 0 {
+                fallback_total
+            } else {
+                entry.size()
+            };
+            return Ok(parse(&mut entry, total_bytes));
         }
         io::copy(&mut entry, &mut io::sink()).map_err(|error| error.to_string())?;
     }
+}
+
+fn has_stdf_extension(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    name.ends_with(".stdf") || name.ends_with(".std")
+}
+
+/// Entry predicate shared by every archive container: the first *.stdf/*.std
+/// file wins — but macOS metadata companions do not count. bsdtar/Finder
+/// inject AppleDouble "._foo.stdf" entries (and zip an "__MACOSX/" tree)
+/// whose payload is resource-fork bytes, not STDF; bsdtar even places them
+/// BEFORE the real file, so without this filter the junk entry wins.
+fn is_stdf_entry_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase().replace('\\', "/");
+    if lower.contains("__macosx/") {
+        return false;
+    }
+    let base = lower.rsplit('/').next().unwrap_or(&lower);
+    if base.starts_with("._") {
+        return false;
+    }
+    base.ends_with(".stdf") || base.ends_with(".std")
+}
+
+/// POSIX ("ustar\0") and GNU ("ustar ") tar both carry "ustar" at offset 257
+/// of the first header block.
+const TAR_MAGIC_OFFSET: usize = 257;
+
+fn tar_magic_present(head: &[u8]) -> bool {
+    head.len() >= TAR_MAGIC_OFFSET + 5
+        && &head[TAR_MAGIC_OFFSET..TAR_MAGIC_OFFSET + 5] == b"ustar"
+}
+
+fn file_is_tar(path: &Path) -> Result<bool, String> {
+    let mut head = [0_u8; TAR_MAGIC_OFFSET + 5];
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let mut filled = 0_usize;
+    while filled < head.len() {
+        match file.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(filled == head.len() && tar_magic_present(&head))
+}
+
+/// A decompressed single-file stream is either the STDF itself or a tar
+/// wrapping it (.tar.gz / .tar.xz / ...): peek the first header block, sniff
+/// the tar magic, then stitch the peeked bytes back in front of the decoder.
+fn parse_decompressed<T>(
+    mut decoder: impl Read,
+    fallback_total: u64,
+    parse: impl FnOnce(&mut dyn Read, u64) -> T,
+) -> Result<T, String> {
+    let mut head = vec![0_u8; TAR_MAGIC_OFFSET + 5];
+    let mut filled = 0_usize;
+    while filled < head.len() {
+        match decoder.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) => return Err(format!("解压失败: {error}")),
+        }
+    }
+    head.truncate(filled);
+    let is_tar = tar_magic_present(&head);
+    let mut rejoined = io::Cursor::new(head).chain(decoder);
+    if is_tar {
+        parse_tar_stream(rejoined, fallback_total, parse)
+    } else {
+        Ok(parse(&mut rejoined, fallback_total))
+    }
+}
+
+fn parse_tar_stream<T>(
+    reader: impl Read,
+    fallback_total: u64,
+    parse: impl FnOnce(&mut dyn Read, u64) -> T,
+) -> Result<T, String> {
+    let mut archive = tar::Archive::new(reader);
+    let entries = archive
+        .entries()
+        .map_err(|error| format!("tar 解析失败: {error}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|error| format!("tar 解析失败: {error}"))?;
+        let is_file = entry.header().entry_type().is_file();
+        let name = entry
+            .path()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if is_file && is_stdf_entry_name(&name) {
+            let total = if entry.size() == 0 {
+                fallback_total
+            } else {
+                entry.size()
+            };
+            return Ok(parse(&mut entry, total));
+        }
+    }
+    Err("tar 包内没有 .stdf/.std 文件".to_string())
+}
+
+fn parse_sevenz<T>(
+    path: &Path,
+    fallback_total: u64,
+    parse: impl FnOnce(&mut dyn Read, u64) -> T,
+) -> Result<T, String> {
+    let mut reader = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
+        .map_err(|error| format!("7z 解析失败: {error}"))?;
+    let mut parse = Some(parse);
+    let mut output: Option<T> = None;
+    reader
+        .for_each_entries(|entry, entry_reader| {
+            if entry.is_directory() || !is_stdf_entry_name(entry.name()) {
+                // Drain unconditionally: solid blocks decode sequentially and
+                // the iterator must not be left mid-entry.
+                std::io::copy(entry_reader, &mut std::io::sink())?;
+                return Ok(true);
+            }
+            let total = if entry.size() == 0 {
+                fallback_total
+            } else {
+                entry.size()
+            };
+            let parse = parse.take().expect("target entry visited once");
+            output = Some(parse(entry_reader, total));
+            Ok(false)
+        })
+        .map_err(|error| format!("7z 解压失败: {error}"))?;
+    output.ok_or_else(|| "7z 包内没有 .stdf/.std 文件".to_string())
+}
+
+fn parse_rar<T>(
+    path: &Path,
+    fallback_total: u64,
+    parse: impl FnOnce(&mut dyn Read, u64) -> T,
+) -> Result<T, String> {
+    let mut archive = unrar::Archive::new(path)
+        .open_for_processing()
+        .map_err(|error| format!("rar 解析失败: {error}"))?;
+    while let Some(before_file) = archive
+        .read_header()
+        .map_err(|error| format!("rar 解析失败: {error}"))?
+    {
+        let entry = before_file.entry();
+        let name = entry.filename.to_string_lossy().to_string();
+        let unpacked = entry.unpacked_size;
+        if entry.is_file() && is_stdf_entry_name(&name) {
+            // unrar's C API pushes data through callbacks rather than exposing
+            // a Read, so stage the entry in the temp workspace and stream from
+            // there. Startup cleanup already covers crash leftovers.
+            let staged = temp_workspace_dir().join(format!("{}.rar.stdf", Uuid::new_v4()));
+            if let Some(parent) = staged.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let outcome = match before_file.extract_to(&staged) {
+                Ok(_) => {
+                    let total = if unpacked == 0 { fallback_total } else { unpacked };
+                    File::open(&staged)
+                        .map_err(|error| error.to_string())
+                        .map(|mut file| parse(&mut file, total))
+                }
+                Err(error) => Err(format!("rar 解压失败: {error}")),
+            };
+            let _ = std::fs::remove_file(&staged);
+            return outcome;
+        }
+        archive = before_file
+            .skip()
+            .map_err(|error| format!("rar 解析失败: {error}"))?;
+    }
+    Err("rar 包内没有 .stdf/.std 文件".to_string())
 }
 
 fn incomplete_zip_message(path: &Path) -> Option<String> {
@@ -4029,6 +4283,143 @@ mod tests {
             existing_decompressed,
             decompressed_temp_files(),
             "zip parsing should not create a decompressed stdf temp file"
+        );
+    }
+
+    #[test]
+    fn session_opens_every_supported_archive_container() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stdf_path = dir.path().join("fixture.std");
+
+        let mut bytes = Vec::new();
+        bytes.extend(record(0, 10, &[2, 4]));
+        let mut ptr = Vec::new();
+        ptr.extend_from_slice(&202_u32.to_le_bytes());
+        ptr.extend_from_slice(&[1, 1, 0, 0]);
+        ptr.extend_from_slice(&1.8_f32.to_le_bytes());
+        ptr.extend(cn("VDD_ARCHIVE"));
+        ptr.extend(cn(""));
+        bytes.extend(record(15, 10, &ptr));
+        std::fs::write(&stdf_path, &bytes).expect("write stdf");
+        let plain = parse_fixture_session(&stdf_path);
+
+        let sevenz_path = dir.path().join("fixture.std.7z");
+        {
+            let mut writer =
+                sevenz_rust2::ArchiveWriter::create(&sevenz_path).expect("create 7z");
+            writer
+                .push_archive_entry(
+                    sevenz_rust2::ArchiveEntry::new_file("fixture.std"),
+                    Some(bytes.as_slice()),
+                )
+                .expect("push 7z entry");
+            writer.finish().expect("finish 7z");
+        }
+
+        let gz_path = dir.path().join("fixture.std.gz");
+        {
+            let file = File::create(&gz_path).expect("create gz");
+            let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            std::io::Write::write_all(&mut encoder, &bytes).expect("write gz");
+            encoder.finish().expect("finish gz");
+        }
+
+        let xz_path = dir.path().join("fixture.std.xz");
+        {
+            let file = File::create(&xz_path).expect("create xz");
+            let mut encoder = liblzma::write::XzEncoder::new(file, 6);
+            std::io::Write::write_all(&mut encoder, &bytes).expect("write xz");
+            encoder.finish().expect("finish xz");
+        }
+
+        let bz2_path = dir.path().join("fixture.std.bz2");
+        {
+            let file = File::create(&bz2_path).expect("create bz2");
+            let mut encoder = bzip2::write::BzEncoder::new(file, bzip2::Compression::default());
+            std::io::Write::write_all(&mut encoder, &bytes).expect("write bz2");
+            encoder.finish().expect("finish bz2");
+        }
+
+        let zst_path = dir.path().join("fixture.std.zst");
+        {
+            let file = File::create(&zst_path).expect("create zst");
+            let mut encoder = zstd::stream::write::Encoder::new(file, 0).expect("zst encoder");
+            std::io::Write::write_all(&mut encoder, &bytes).expect("write zst");
+            encoder.finish().expect("finish zst");
+        }
+
+        let tar_path = dir.path().join("fixture.tar");
+        {
+            let file = File::create(&tar_path).expect("create tar");
+            let mut builder = tar::Builder::new(file);
+            // bsdtar-style AppleDouble companion BEFORE the real file: its
+            // name also ends in ".std", so the picker must skip it by the
+            // "._" prefix, not by extension.
+            let junk = b"AppleDouble resource fork bytes, not STDF";
+            let mut junk_header = tar::Header::new_gnu();
+            junk_header.set_size(junk.len() as u64);
+            junk_header.set_mode(0o644);
+            junk_header.set_cksum();
+            builder
+                .append_data(&mut junk_header, "._fixture.std", junk.as_slice())
+                .expect("append junk entry");
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "fixture.std", bytes.as_slice())
+                .expect("append tar entry");
+            builder.finish().expect("finish tar");
+        }
+
+        // tar wrapped in gzip: the compressor magic sits outside, the ustar
+        // magic only appears inside the decompressed stream.
+        let targz_path = dir.path().join("fixture.tar.gz");
+        {
+            let file = File::create(&targz_path).expect("create tar.gz");
+            let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "fixture.std", bytes.as_slice())
+                .expect("append tar.gz entry");
+            builder
+                .into_inner()
+                .expect("finish tar stream")
+                .finish()
+                .expect("finish gz stream");
+        }
+
+        for path in [
+            &sevenz_path,
+            &gz_path,
+            &xz_path,
+            &bz2_path,
+            &zst_path,
+            &tar_path,
+            &targz_path,
+        ] {
+            let unpacked = parse_fixture_session(path);
+            assert_eq!(plain.groups, unpacked.groups, "groups mismatch for {path:?}");
+            assert_eq!(plain.fields, unpacked.fields, "fields mismatch for {path:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires STDF_RAR_SAMPLE_PATH (rar has no open-source encoder to build a fixture with)"]
+    fn session_opens_rar_sample_from_env() {
+        let Ok(path) = std::env::var("STDF_RAR_SAMPLE_PATH") else {
+            eprintln!("skipped: set STDF_RAR_SAMPLE_PATH to a .rar holding a .stdf/.std");
+            return;
+        };
+        let result = parse_fixture_session(Path::new(&path));
+        assert!(
+            result.groups.iter().any(|group| group.count > 0),
+            "rar sample parsed no records"
         );
     }
 

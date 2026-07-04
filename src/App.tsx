@@ -1029,7 +1029,9 @@ function WaferMark({ className }: { className?: string }) {
   );
 }
 
-const FILE_EXT_CHIPS = [".stdf", ".std", ".gz", ".zip"];
+// Launch-screen chips show the common ones; bz2 / zst / tar.* combos work
+// too (the backend sniffs magic bytes, the picker filter lists everything).
+const FILE_EXT_CHIPS = [".stdf", ".std", ".zip", ".gz", ".7z", ".rar", ".tar", ".xz"];
 
 function NoFileView({
   onOpen,
@@ -1095,7 +1097,10 @@ function NoFileView({
               <FolderOpen size={15} />
             </span>
           </button>
-          <div className="flex flex-wrap items-center justify-center gap-1.5 text-xs text-muted-foreground">
+          <div
+            className="flex flex-wrap items-center justify-center gap-1.5 text-xs text-muted-foreground"
+            title="也支持 bz2 / zst，以及 tar.gz / tar.xz 等组合包"
+          >
             {FILE_EXT_CHIPS.map((ext) => (
               <span
                 key={ext}
@@ -1104,8 +1109,7 @@ function NoFileView({
                 {ext}
               </span>
             ))}
-            <span className="px-0.5">·</span>
-            <span>STDF V4 / V4-2007</span>
+            <span className="px-0.5">STDF V4 / V4-2007</span>
           </div>
           {error && (
             <p

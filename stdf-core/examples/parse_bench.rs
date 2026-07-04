@@ -30,9 +30,11 @@ fn main() {
     let mb = size as f64 / 1048576.0;
     println!("file: {path} ({mb:.1} MB), {runs} run(s)");
 
-    // (a) raw parser. Only meaningful for bare .stdf/.std inputs — compressed
-    // inputs would mostly measure the decompressor.
-    if !path.ends_with(".gz") && !path.ends_with(".zip") {
+    // (a) raw parser. Only meaningful for bare .stdf/.std inputs — anything
+    // else (archives, compressed streams) would feed container bytes into the
+    // record framing and measure garbage.
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".stdf") || lower.ends_with(".std") {
         for run in 0..runs {
             let file = File::open(&path).expect("open input");
             let mut reader = BufReader::with_capacity(4 << 20, file);
