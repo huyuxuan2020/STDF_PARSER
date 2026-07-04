@@ -141,6 +141,37 @@ jobs:
             exit 1
           fi
 
+      # 启动冒烟：把构建产物真正跑起来，活过 8 秒才算「打得开」。
+      # 静态检查抓不到的启动即崩（缺动态库之外的资源缺失、初始化
+      # panic、签名损坏）都在这里拦住；失败则 Release 停留在草稿。
+      - name: Smoke-launch the built app (macOS)
+        if: matrix.platform == 'macos-latest'
+        run: |
+          BIN=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -path "*.app/Contents/MacOS/*" -type f | head -1)
+          echo "launching: $BIN"
+          "$BIN" &
+          PID=$!
+          sleep 8
+          if ! kill -0 "$PID" 2>/dev/null; then
+            echo "::error::App exited within 8s of launch — it would not open on user machines"
+            exit 1
+          fi
+          kill "$PID"
+
+      - name: Smoke-launch the built app (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $bin = "src-tauri/target/release/stdf-viewer-mac.exe"
+          Write-Host "launching: $bin"
+          $p = Start-Process -FilePath $bin -PassThru
+          Start-Sleep -Seconds 8
+          if ($p.HasExited) {
+            Write-Error "App exited within 8s of launch - it would not open on user machines"
+            exit 1
+          }
+          Stop-Process -Id $p.Id -Force
+
   # ── 3) 两个平台都成功后，才正式发布（取消草稿）──
   publish-release:
     needs: [create-release, build-tauri]
