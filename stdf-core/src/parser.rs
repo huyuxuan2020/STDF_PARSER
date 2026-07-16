@@ -18,7 +18,7 @@ pub struct ParseErrorEvent {
     pub offset: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ParsedRecord {
     /// Static name from the REC_TYP/REC_SUB table — `&'static str` on purpose:
     /// a per-record `String` was one of the top allocations on 26M-record files.
@@ -31,6 +31,13 @@ pub struct ParsedRecord {
     pub length: u16,
     pub fields: Vec<ParsedField>,
     pub status: RecordStatus,
+    /// Full RTN_RSLT array for MPR records. The generic field pipeline caps
+    /// array previews at 16 elements to bound the session index, but the
+    /// test-item accumulator must judge P/F and summarize over EVERY pin, so
+    /// MPR records carry the raw floats out-of-band. In-process only — never
+    /// serialized or stored.
+    #[serde(skip)]
+    pub mpr_results: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -160,6 +167,11 @@ fn parse_record(
     } else {
         RecordStatus::Parsed
     };
+    let mpr_results = if (rec_typ, rec_sub) == (15, 15) {
+        extract_mpr_results(payload_start, &fields, payload)
+    } else {
+        None
+    };
     ParsedRecord {
         record_type,
         rec_typ,
@@ -168,7 +180,31 @@ fn parse_record(
         length,
         fields,
         status,
+        mpr_results,
     }
+}
+
+/// Decode the complete RTN_RSLT float array from an MPR payload, using the
+/// parsed field's recorded offset/length to locate the bytes (the field VALUE
+/// itself only carries the capped preview).
+fn extract_mpr_results(
+    payload_start: u64,
+    fields: &[ParsedField],
+    payload: &[u8],
+) -> Option<Vec<f32>> {
+    let field = fields.iter().find(|field| field.name == "RTN_RSLT")?;
+    let length = field.length? as usize;
+    if length == 0 {
+        return None;
+    }
+    let start = field.offset?.checked_sub(payload_start)? as usize;
+    let bytes = payload.get(start..start.checked_add(length)?)?;
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+    )
 }
 
 fn raw_preview_field(payload_start: u64, length: u16, payload: &[u8]) -> Vec<ParsedField> {

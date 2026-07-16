@@ -149,6 +149,12 @@ pub struct TestItemCell {
     /// this cell (e.g. a placeholder for a missing test on this part).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record_position: Option<usize>,
+    /// Whole-array stats for MPR cells ("n=… min=… max=… avg=… fail=…"),
+    /// computed over EVERY pin at parse time. The CSV export writes this
+    /// instead of the 16-element preview; the grid keeps the preview, so
+    /// serde skips it and the IPC wire shape is unchanged.
+    #[serde(skip)]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -205,6 +211,36 @@ pub struct TestItemColumnLite {
     pub record_type: String,
     pub test_num: u32,
     pub test_name: String,
+}
+
+/// One pin's measurement inside an MPR record, fully expanded for the
+/// cell-click pin dialog. The grid cell only carries the parser's 16-element
+/// array preview; this is the complete row.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MprPinValue {
+    /// RTN_INDX entry (PMR index) at this position, "" when the file carries
+    /// no pin-index array.
+    pub pmr_index: String,
+    /// PMR PHY_NAM (falling back to LOG_NAM) resolved through the session's
+    /// pin map, "" when unknown.
+    pub pin_name: String,
+    /// Display-scaled measured value, formatted exactly like the grid cell.
+    pub value: String,
+    /// Per-pin verdict against the column's shared limits ("P"/"F"/"").
+    pub status: String,
+}
+
+/// Full per-pin expansion of one MPR cell, served on demand by re-reading the
+/// source file (see [`SessionManager::get_mpr_pin_details`]).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MprPinDetails {
+    pub session_id: String,
+    pub test_num: u32,
+    pub test_name: String,
+    pub unit: String,
+    pub low_limit: String,
+    pub high_limit: String,
+    pub pins: Vec<MprPinValue>,
 }
 
 /// One bin's share of the parsed parts, for the overview's yield section.
@@ -1183,6 +1219,298 @@ impl SessionManager {
             .map(|_| ())
             .map_err(|error| format!("写入 TXT 失败: {error}"))
     }
+
+    /// Expand one MPR cell into its full per-pin results. The session index
+    /// only keeps the parser's 16-element array preview, so this re-reads the
+    /// source file (plain or compressed alike, same as parse_dtr_text) up to
+    /// the record at `record_position` within the MPR group and parses its
+    /// complete RTN_RSLT / RTN_INDX arrays.
+    pub fn get_mpr_pin_details(
+        &self,
+        session_id: &str,
+        test_num: u32,
+        record_position: usize,
+    ) -> Result<MprPinDetails, String> {
+        let (file_path, file_size, column, meta, pmr_lookup) = {
+            let guard = self.sessions.lock().map_err(|_| "session lock poisoned")?;
+            let state = guard
+                .get(session_id)
+                .ok_or_else(|| "解析会话不存在".to_string())?;
+            let key = ("MPR".to_string(), test_num);
+            let column = state
+                .test_items
+                .columns_by_key
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| "测试项不存在".to_string())?;
+            let meta = state
+                .test_items
+                .column_meta
+                .get(&key)
+                .copied()
+                .unwrap_or_default();
+            (
+                state.session.file_path.clone(),
+                state.session.file_size,
+                column,
+                meta,
+                state.test_items.pmr_lookup.clone(),
+            )
+        };
+        let rec_offset = self.with_read_conn(session_id, |conn| {
+            conn.query_row(
+                "SELECT rec_offset FROM records WHERE record_type = 'MPR' AND group_idx = ?1",
+                params![record_position as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "MPR 记录不存在".to_string())
+        })? as u64;
+        let (raw, rtn_indx) = with_input_reader(Path::new(&file_path), file_size, |reader, _| {
+            scan_mpr_arrays(reader, rec_offset, test_num)
+        })??;
+        if raw.test_num != test_num {
+            return Err("记录与测试项不匹配，源文件可能已被修改".to_string());
+        }
+        let pins = raw
+            .rslt_values
+            .iter()
+            .enumerate()
+            .map(|(position, stored)| {
+                // Match the grid cell digit-for-digit: the general parser
+                // stringifies R4 through f32 Display and the cell scales that
+                // decimal, so going straight f32→f64 here would drag the
+                // binary representation error into the shown digits.
+                let raw_text = stored.to_string();
+                let parsed = parse_float(&raw_text);
+                let status = parsed
+                    .map(|value| judge(to_base(value, meta.res_scal), meta.low_base, meta.high_base))
+                    .unwrap_or_default();
+                let value = match parsed {
+                    Some(value) if meta.res_scal != 0 => format_num(to_display(value, meta.res_scal)),
+                    _ => raw_text,
+                };
+                let pmr_index = rtn_indx
+                    .get(position)
+                    .map(|index| index.to_string())
+                    .unwrap_or_default();
+                let pin_name = pmr_lookup
+                    .get(&pmr_index)
+                    .map(|entry| {
+                        if entry.phy_nam.is_empty() {
+                            entry.log_nam.clone()
+                        } else {
+                            entry.phy_nam.clone()
+                        }
+                    })
+                    .unwrap_or_default();
+                MprPinValue {
+                    pmr_index,
+                    pin_name,
+                    value,
+                    status,
+                }
+            })
+            .collect();
+        Ok(MprPinDetails {
+            session_id: session_id.to_string(),
+            test_num,
+            test_name: column.test_name,
+            unit: column.unit,
+            low_limit: column.low_limit,
+            high_limit: column.high_limit,
+            pins,
+        })
+    }
+
+    /// Export one MPR cell's full pin expansion as a styled .xlsx workbook.
+    /// `part_id` / `site_num` only label the metadata block — the pin data
+    /// itself comes from the same on-demand re-read as the pin dialog.
+    pub fn export_mpr_pins_xlsx(
+        &self,
+        session_id: &str,
+        test_num: u32,
+        record_position: usize,
+        part_id: &str,
+        site_num: &str,
+        path: &str,
+    ) -> Result<(), String> {
+        let details = self.get_mpr_pin_details(session_id, test_num, record_position)?;
+        write_mpr_pins_xlsx(&details, part_id, site_num, Path::new(path))
+    }
+}
+
+/// Render the pin table as a styled workbook: title + metadata block, a dark
+/// header row with autofilter and frozen panes, zebra-striped rows, and
+/// out-of-limit pins highlighted in red.
+fn write_mpr_pins_xlsx(
+    details: &MprPinDetails,
+    part_id: &str,
+    site_num: &str,
+    path: &Path,
+) -> Result<(), String> {
+    use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook};
+
+    const HEADER_BG: u32 = 0x1F4E79; // dark blue
+    const ZEBRA_BG: u32 = 0xF2F6FA; // faint blue-gray
+    const FAIL_BG: u32 = 0xFDE8E8; // light red
+    const FAIL_FG: u32 = 0xB91C1C; // red
+    const PASS_FG: u32 = 0x15803D; // green
+    const LABEL_FG: u32 = 0x64748B; // slate gray
+
+    let err = |error: rust_xlsxwriter::XlsxError| format!("写入 Excel 失败: {error}");
+
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_worksheet();
+    sheet.set_name("MPR Pins").map_err(err)?;
+
+    let title_fmt = Format::new().set_bold().set_font_size(14);
+    let sub_fmt = Format::new().set_font_color(Color::RGB(LABEL_FG));
+    let label_fmt = Format::new().set_bold().set_font_color(Color::RGB(LABEL_FG));
+    let header_fmt = Format::new()
+        .set_bold()
+        .set_font_color(Color::White)
+        .set_background_color(Color::RGB(HEADER_BG))
+        .set_border(FormatBorder::Thin)
+        .set_border_color(Color::RGB(HEADER_BG))
+        .set_align(FormatAlign::Center);
+
+    // Base / zebra / fail variants for each visual column kind. Numbers keep
+    // Excel-native formatting so the values stay computable.
+    let base = || Format::new().set_border(FormatBorder::Thin).set_border_color(Color::RGB(0xE2E8F0));
+    let cell = base();
+    let cell_zebra = base().set_background_color(Color::RGB(ZEBRA_BG));
+    let cell_fail = base().set_background_color(Color::RGB(FAIL_BG));
+    let num = base().set_align(FormatAlign::Right);
+    let num_zebra = base().set_align(FormatAlign::Right).set_background_color(Color::RGB(ZEBRA_BG));
+    let num_fail = base()
+        .set_align(FormatAlign::Right)
+        .set_bold()
+        .set_font_color(Color::RGB(FAIL_FG))
+        .set_background_color(Color::RGB(FAIL_BG));
+    let status_pass = base().set_align(FormatAlign::Center).set_font_color(Color::RGB(PASS_FG));
+    let status_pass_zebra = base()
+        .set_align(FormatAlign::Center)
+        .set_font_color(Color::RGB(PASS_FG))
+        .set_background_color(Color::RGB(ZEBRA_BG));
+    let status_fail = base()
+        .set_align(FormatAlign::Center)
+        .set_bold()
+        .set_font_color(Color::RGB(FAIL_FG))
+        .set_background_color(Color::RGB(FAIL_BG));
+
+    let title = if details.test_name.is_empty() {
+        format!("MPR #{}", details.test_num)
+    } else {
+        details.test_name.clone()
+    };
+    sheet.merge_range(0, 0, 0, 4, &title, &title_fmt).map_err(err)?;
+    let subtitle = format!(
+        "MPR 测试编号 {} · Part {} · Site {}",
+        details.test_num,
+        if part_id.is_empty() { "-" } else { part_id },
+        if site_num.is_empty() { "-" } else { site_num },
+    );
+    sheet.merge_range(1, 0, 1, 4, &subtitle, &sub_fmt).map_err(err)?;
+
+    let fail_count = details.pins.iter().filter(|pin| pin.status == "F").count();
+    let unit_suffix = if details.unit.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", details.unit)
+    };
+    let meta_rows: [(String, String); 4] = [
+        (format!("下限{unit_suffix}"), display_or_dash(&details.low_limit)),
+        (format!("上限{unit_suffix}"), display_or_dash(&details.high_limit)),
+        ("Pin 数".to_string(), details.pins.len().to_string()),
+        ("Fail 数".to_string(), fail_count.to_string()),
+    ];
+    for (offset, (label, value)) in meta_rows.iter().enumerate() {
+        let row = 3 + offset as u32;
+        sheet
+            .write_with_format(row, 0, label.as_str(), &label_fmt)
+            .map_err(err)?;
+        match value.parse::<f64>() {
+            Ok(number) => sheet.write(row, 1, number).map_err(err)?,
+            Err(_) => sheet.write(row, 1, value.as_str()).map_err(err)?,
+        };
+    }
+
+    const TABLE_HEADER_ROW: u32 = 8;
+    let value_header = format!("值{unit_suffix}");
+    let headers = ["#", "PMR 索引", "Pin 名称", value_header.as_str(), "P/F"];
+    for (col, header) in headers.iter().enumerate() {
+        sheet
+            .write_with_format(TABLE_HEADER_ROW, col as u16, *header, &header_fmt)
+            .map_err(err)?;
+    }
+
+    for (index, pin) in details.pins.iter().enumerate() {
+        let row = TABLE_HEADER_ROW + 1 + index as u32;
+        let failed = pin.status == "F";
+        let zebra = index % 2 == 1;
+        let text_fmt = if failed {
+            &cell_fail
+        } else if zebra {
+            &cell_zebra
+        } else {
+            &cell
+        };
+        let num_fmt = if failed {
+            &num_fail
+        } else if zebra {
+            &num_zebra
+        } else {
+            &num
+        };
+        let status_fmt = if failed {
+            &status_fail
+        } else if zebra {
+            &status_pass_zebra
+        } else {
+            &status_pass
+        };
+        sheet
+            .write_with_format(row, 0, (index + 1) as u32, num_fmt)
+            .map_err(err)?;
+        sheet
+            .write_with_format(row, 1, display_or_dash(&pin.pmr_index), text_fmt)
+            .map_err(err)?;
+        sheet
+            .write_with_format(row, 2, display_or_dash(&pin.pin_name), text_fmt)
+            .map_err(err)?;
+        match pin.value.parse::<f64>() {
+            Ok(number) => sheet.write_with_format(row, 3, number, num_fmt).map_err(err)?,
+            Err(_) => sheet
+                .write_with_format(row, 3, display_or_dash(&pin.value), num_fmt)
+                .map_err(err)?,
+        };
+        sheet
+            .write_with_format(row, 4, display_or_dash(&pin.status), status_fmt)
+            .map_err(err)?;
+    }
+
+    let last_row = TABLE_HEADER_ROW + details.pins.len() as u32;
+    sheet.set_column_width(0, 7).map_err(err)?;
+    sheet.set_column_width(1, 11).map_err(err)?;
+    sheet.set_column_width(2, 24).map_err(err)?;
+    sheet.set_column_width(3, 14).map_err(err)?;
+    sheet.set_column_width(4, 7).map_err(err)?;
+    sheet.set_freeze_panes(TABLE_HEADER_ROW + 1, 0).map_err(err)?;
+    if !details.pins.is_empty() {
+        sheet.autofilter(TABLE_HEADER_ROW, 0, last_row, 4).map_err(err)?;
+    }
+
+    workbook.save(path).map_err(err)
+}
+
+fn display_or_dash(value: &str) -> String {
+    if value.trim().is_empty() {
+        "-".to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 /// Walk record headers, skipping every payload except DTR (50,30), whose
@@ -1310,7 +1638,13 @@ fn apply_record_to_session(
     };
     let changed =
         update_session_snapshot(&mut state.snapshot, session_id, record, idx, bytes_read, total_bytes);
-    update_test_item_accumulator(&mut state.test_items, record.record_type, idx, &record.fields);
+    update_test_item_accumulator(
+        &mut state.test_items,
+        record.record_type,
+        idx,
+        &record.fields,
+        record.mpr_results.as_deref(),
+    );
     changed
 }
 
@@ -1368,6 +1702,7 @@ fn update_test_item_accumulator(
     record_type: &'static str,
     idx: usize,
     fields: &[RecordField],
+    mpr_results: Option<&[f32]>,
 ) {
     match record_type {
         "PMR" => {
@@ -1471,7 +1806,7 @@ fn update_test_item_accumulator(
             };
             let mut cell = match record_type {
                 "PTR" => build_ptr_cell(fields, &meta),
-                "MPR" => build_mpr_cell(fields, &meta),
+                "MPR" => build_mpr_cell(fields, &meta, mpr_results),
                 _ => build_ftr_cell(fields),
             };
             cell.record_position = Some(position);
@@ -1957,7 +2292,9 @@ fn build_test_item_csv(snapshot: &SessionSnapshot, acc: &TestItemAccumulator) ->
             fields.push(
                 row.results
                     .get(index)
-                    .map(|cell| cell.value.clone())
+                    // MPR cells export their whole-array stats; the grid's
+                    // 16-element preview would silently misreport 400-pin tests.
+                    .map(|cell| cell.summary.clone().unwrap_or_else(|| cell.value.clone()))
                     .unwrap_or_default(),
             );
         }
@@ -2041,6 +2378,7 @@ fn build_test_item_page(
                         value: String::new(),
                         status: String::new(),
                         record_position: None,
+                        summary: None,
                     })
                 })
                 .collect(),
@@ -2180,6 +2518,11 @@ fn parse_scale(value: &str) -> i32 {
     value.trim().parse::<i32>().unwrap_or(0)
 }
 
+/// Parse a stringified B*1 flag byte ("0b11001110"); absent/garbage -> None.
+fn parse_b1(value: &str) -> Option<u8> {
+    u8::from_str_radix(value.trim().strip_prefix("0b")?, 2).ok()
+}
+
 /// Convert a stored value to a scale-normalized magnitude for limit comparison.
 /// Result and limit share the same exponent (limit scales default to the result
 /// scale), so this factor cancels and the verdict is unaffected by its direction.
@@ -2259,7 +2602,23 @@ fn resolve_column(
         );
     }
 
-    let res_scal = parse_scale(&field_value(fields, "RES_SCAL"));
+    // STDF v4 §7.1/§7.2 OPT_FLAG: the LO_LIMIT / HI_LIMIT / RES_SCAL fields
+    // are ONLY meaningful when their validity bits are clear. Files routinely
+    // write placeholder 0.0 limits with bits 6/7 ("no low/high limit for this
+    // test") set — treating those as real limits judges every value F.
+    //   bit 0 (0x01): RES_SCAL invalid
+    //   bit 4 (0x10): LO_LIMIT + LLM_SCAL invalid   bit 6 (0x40): no low limit
+    //   bit 5 (0x20): HI_LIMIT + HLM_SCAL invalid   bit 7 (0x80): no high limit
+    let opt_flag = parse_b1(&field_value(fields, "OPT_FLAG"));
+    let low_valid = opt_flag.is_none_or(|flag| flag & 0b0101_0000 == 0);
+    let high_valid = opt_flag.is_none_or(|flag| flag & 0b1010_0000 == 0);
+    let res_scal_valid = opt_flag.is_none_or(|flag| flag & 0b0000_0001 == 0);
+
+    let res_scal = if res_scal_valid {
+        parse_scale(&field_value(fields, "RES_SCAL"))
+    } else {
+        0
+    };
     // Limit scales default to the result scale when the file omits them.
     let llm_raw_scal = field_value(fields, "LLM_SCAL");
     let llm_scal = if llm_raw_scal.trim().is_empty() {
@@ -2274,8 +2633,16 @@ fn resolve_column(
         parse_scale(&hlm_raw_scal)
     };
     let units = field_value(fields, "UNITS");
-    let lo_raw = field_value(fields, "LO_LIMIT");
-    let hi_raw = field_value(fields, "HI_LIMIT");
+    let lo_raw = if low_valid {
+        field_value(fields, "LO_LIMIT")
+    } else {
+        ""
+    };
+    let hi_raw = if high_valid {
+        field_value(fields, "HI_LIMIT")
+    } else {
+        ""
+    };
 
     let unit = if units.is_empty() {
         String::new()
@@ -2320,59 +2687,229 @@ fn build_ptr_cell(fields: &[RecordField], meta: &ColumnMeta) -> TestItemCell {
         value,
         status,
         record_position: None,
+        summary: None,
     }
 }
 
-/// MPR collapses its multi-pin result array into one cell: values are shown joined,
-/// and the verdict fails if any pin falls outside the shared limits. The result
-/// array is capped at 16 elements upstream in the parser.
-fn build_mpr_cell(fields: &[RecordField], meta: &ColumnMeta) -> TestItemCell {
-    let results = field_values_from_array(fields, "RTN_RSLT");
+/// How many array elements an MPR grid cell previews. Matches the parser's
+/// array-preview cap so full-array cells render exactly like preview-only ones.
+const MPR_CELL_PREVIEW: usize = 16;
+
+/// MPR collapses its multi-pin result array into one cell. With the parser's
+/// full RTN_RSLT array at hand, P/F and the CSV summary cover EVERY pin (the
+/// preview-string fallback only sees the first 16); the shown value stays a
+/// 16-element preview either way.
+fn build_mpr_cell(
+    fields: &[RecordField],
+    meta: &ColumnMeta,
+    full_results: Option<&[f32]>,
+) -> TestItemCell {
+    // Stringify raw floats exactly like the parser (f32 Display) so the full
+    // path renders byte-identical previews to the legacy preview path.
+    let results: Vec<String> = match full_results {
+        Some(values) if !values.is_empty() => values.iter().map(|v| v.to_string()).collect(),
+        _ => field_values_from_array(fields, "RTN_RSLT"),
+    };
     if results.is_empty() {
         return TestItemCell {
             value: field_value(fields, "TEST_FLG").to_string(),
             status: String::new(),
             record_position: None,
+            summary: None,
         };
     }
     let mut judged = false;
-    let mut failed = false;
+    let mut fail_count = 0_usize;
+    let mut numeric = 0_usize;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut sum = 0.0_f64;
     for raw in &results {
-        if let Some(value) = parse_float(raw) {
-            match judge(to_base(value, meta.res_scal), meta.low_base, meta.high_base).as_str() {
-                "P" => judged = true,
-                "F" => {
-                    judged = true;
-                    failed = true;
-                }
-                _ => {}
+        let Some(value) = parse_float(raw) else { continue };
+        match judge(to_base(value, meta.res_scal), meta.low_base, meta.high_base).as_str() {
+            "P" => judged = true,
+            "F" => {
+                judged = true;
+                fail_count += 1;
             }
+            _ => {}
         }
+        let display = to_display(value, meta.res_scal);
+        min = min.min(display);
+        max = max.max(display);
+        sum += display;
+        numeric += 1;
     }
     let status = if !judged {
         String::new()
-    } else if failed {
+    } else if fail_count > 0 {
         "F".to_string()
     } else {
         "P".to_string()
     };
-    let value = if meta.res_scal == 0 {
-        results.join(", ")
-    } else {
-        results
-            .iter()
-            .map(|raw| match parse_float(raw) {
-                Some(v) => format_num(to_display(v, meta.res_scal)),
-                None => raw.clone(),
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    // Preview: first 16 values, "..." marking the cut — same shape whether the
+    // items came from the full array or from the parser's preview string
+    // (which carries its own trailing "..." token past the cap).
+    let truncated = results.len() > MPR_CELL_PREVIEW;
+    let value = results
+        .iter()
+        .take(MPR_CELL_PREVIEW)
+        .map(|raw| match parse_float(raw) {
+            Some(v) if meta.res_scal != 0 => format_num(to_display(v, meta.res_scal)),
+            _ => raw.clone(),
+        })
+        .chain(truncated.then(|| "...".to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // CSV summary only when the whole array was available — a preview-derived
+    // "summary" would silently describe just the first 16 pins.
+    let summary = (full_results.is_some() && numeric > 0).then(|| {
+        let mut out = format!(
+            "n={} min={} max={} avg={}",
+            numeric,
+            format_num(min),
+            format_num(max),
+            format_num(sum / numeric as f64),
+        );
+        if meta.low_base.is_some() || meta.high_base.is_some() {
+            out.push_str(&format!(" fail={fail_count}"));
+        }
+        out
+    });
     TestItemCell {
         value,
         status,
         record_position: None,
+        summary,
     }
+}
+
+/// The pieces of one raw MPR payload the pin-detail view needs: the full
+/// result array (the general parser keeps only a 16-element preview) and the
+/// full RTN_INDX pin-index array.
+struct MprRawArrays {
+    test_num: u32,
+    rslt_values: Vec<f32>,
+    rtn_indx: Vec<u16>,
+}
+
+/// Decode an MPR payload's arrays without the preview cap. Follows the same
+/// tolerance as the general parser: the optional tail may legally end at any
+/// point, so a payload that stops early just leaves the later arrays empty.
+fn read_mpr_arrays(payload: &[u8]) -> Option<MprRawArrays> {
+    fn take<'a>(payload: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a [u8]> {
+        let end = pos.checked_add(len)?;
+        let slice = payload.get(*pos..end)?;
+        *pos = end;
+        Some(slice)
+    }
+    fn skip_cn(payload: &[u8], pos: &mut usize) -> Option<()> {
+        let len = usize::from(*payload.get(*pos)?);
+        let end = pos.checked_add(1 + len)?;
+        (end <= payload.len()).then(|| *pos = end)
+    }
+    let mut pos = 0_usize;
+    let test_num = u32::from_le_bytes(take(payload, &mut pos, 4)?.try_into().ok()?);
+    take(payload, &mut pos, 4)?; // HEAD_NUM, SITE_NUM, TEST_FLG, PARM_FLG
+    let rtn_icnt = usize::from(u16::from_le_bytes(take(payload, &mut pos, 2)?.try_into().ok()?));
+    let rslt_cnt = usize::from(u16::from_le_bytes(take(payload, &mut pos, 2)?.try_into().ok()?));
+    let mut arrays = MprRawArrays {
+        test_num,
+        rslt_values: Vec::new(),
+        rtn_indx: Vec::new(),
+    };
+    // RTN_STAT nibbles precede the results.
+    if take(payload, &mut pos, rtn_icnt.div_ceil(2)).is_none() {
+        return Some(arrays);
+    }
+    let Some(bytes) = take(payload, &mut pos, rslt_cnt * 4) else {
+        return Some(arrays);
+    };
+    arrays.rslt_values = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    // Walk the rest of the optional tail up to RTN_INDX: TEST_TXT + ALARM_ID
+    // (Cn), OPT_FLAG + RES_SCAL + LLM_SCAL + HLM_SCAL (4×1 byte), LO_LIMIT +
+    // HI_LIMIT + START_IN + INCR_IN (4×4 bytes).
+    let indx_bytes = (|| {
+        skip_cn(payload, &mut pos)?;
+        skip_cn(payload, &mut pos)?;
+        take(payload, &mut pos, 4)?;
+        take(payload, &mut pos, 16)?;
+        take(payload, &mut pos, rtn_icnt * 2)
+    })();
+    if let Some(bytes) = indx_bytes {
+        arrays.rtn_indx = bytes
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+    }
+    Some(arrays)
+}
+
+/// Stream the STDF payload up to `target_offset` and return the full arrays of
+/// the MPR record there, plus its effective RTN_INDX. STDF lets every MPR
+/// after the first of a test omit RTN_INDX, so the scan also captures the
+/// array from the first same-test MPR it passes on the way.
+fn scan_mpr_arrays(
+    reader: &mut dyn Read,
+    target_offset: u64,
+    test_num: u32,
+) -> Result<(MprRawArrays, Vec<u16>), String> {
+    let mut reader = BufReader::with_capacity(PARSE_BUFFER_SIZE, reader);
+    let mut offset = 0_u64;
+    let mut payload = Vec::<u8>::new();
+    let mut inherited_indx = Vec::<u16>::new();
+    loop {
+        let mut header = [0_u8; 4];
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(format!("读取 STDF 失败: {error}")),
+        }
+        if offset > target_offset {
+            break;
+        }
+        let length = usize::from(u16::from_le_bytes([header[0], header[1]]));
+        let is_target = offset == target_offset;
+        let is_mpr = header[2] == 15 && header[3] == 15;
+        // Only target/candidate MPR payloads are decoded; everything else is
+        // skipped straight to the next header.
+        if is_mpr && (is_target || inherited_indx.is_empty()) {
+            if payload.len() < length {
+                payload.resize(length, 0);
+            }
+            match reader.read_exact(&mut payload[..length]) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(format!("读取 STDF 失败: {error}")),
+            }
+            let parsed = read_mpr_arrays(&payload[..length]);
+            if is_target {
+                let raw = parsed.ok_or_else(|| "MPR 记录不完整，无法展开".to_string())?;
+                let indx = if raw.rtn_indx.is_empty() {
+                    inherited_indx
+                } else {
+                    raw.rtn_indx.clone()
+                };
+                return Ok((raw, indx));
+            }
+            if let Some(raw) = parsed {
+                if raw.test_num == test_num && !raw.rtn_indx.is_empty() {
+                    inherited_indx = raw.rtn_indx;
+                }
+            }
+        } else {
+            let skipped = io::copy(&mut (&mut reader).take(length as u64), &mut io::sink())
+                .map_err(|error| format!("读取 STDF 失败: {error}"))?;
+            if skipped < length as u64 {
+                break;
+            }
+        }
+        offset += 4 + length as u64;
+    }
+    Err("MPR 记录不存在，源文件可能已被修改".to_string())
 }
 
 fn build_ftr_cell(fields: &[RecordField]) -> TestItemCell {
@@ -2382,6 +2919,7 @@ fn build_ftr_cell(fields: &[RecordField]) -> TestItemCell {
         value: flag.to_string(),
         status: status.to_string(),
         record_position: None,
+        summary: None,
     }
 }
 
@@ -2400,6 +2938,7 @@ fn materialize_results(
                 value: String::new(),
                 status: String::new(),
                 record_position: None,
+                summary: None,
             })
         })
         .collect()
@@ -4133,6 +4672,7 @@ mod tests {
                     value: "1.5".to_string(),
                     status: "P".to_string(),
                     record_position: None,
+                    summary: None,
                 }],
             },
         );
@@ -4793,6 +5333,377 @@ mod tests {
             "a page should not force the UI to render {} columns at once",
             page.columns.len()
         );
+    }
+
+    /// FAR + 20 PMRs (PIN101..PIN120) + three parts, each with one 20-pin MPR
+    /// of test 500. The first MPR carries the full optional tail (scale 3,
+    /// limits 0.2/0.8 V, RTN_INDX, UNITS); the later ones legally omit
+    /// everything after TEST_TXT, so their pin indices must inherit from the
+    /// first. Pin 10 of part 2 and pin 17 of part 3 measure 0.9 V — outside
+    /// the shared limits (part 3's failure sits beyond the 16-element preview).
+    fn mpr_pin_fixture_bytes() -> Vec<u8> {
+        fn mpr_payload(test_num: u32, values: &[f32], indices: &[u16], with_tail: bool) -> Vec<u8> {
+            let mut mpr = Vec::new();
+            push_payload(&mut mpr, &[u4(test_num), u1(1), u1(1), u1(0), u1(0)]);
+            push_payload(&mut mpr, &[u2(values.len() as u16), u2(values.len() as u16)]);
+            mpr.extend(vec![0_u8; values.len().div_ceil(2)]); // RTN_STAT nibbles
+            for value in values {
+                mpr.extend(r4(*value));
+            }
+            mpr.extend(cn("CONT:Continuity[1]"));
+            if with_tail {
+                mpr.extend(cn("")); // ALARM_ID
+                push_payload(&mut mpr, &[u1(0), i1(3), i1(3), i1(3)]);
+                push_payload(&mut mpr, &[r4(0.2), r4(0.8), r4(0.0), r4(0.0)]);
+                for index in indices {
+                    mpr.extend(u2(*index));
+                }
+                mpr.extend(cn("V"));
+            }
+            mpr
+        }
+        /// MPR whose OPT_FLAG bits 6/7 declare "no low/high limit" while the
+        /// LO/HI fields carry placeholder 0.0 — the placeholders must be
+        /// ignored, not treated as a 0~0 window that fails every pin.
+        fn mpr_payload_no_limits(test_num: u32, values: &[f32]) -> Vec<u8> {
+            let mut mpr = Vec::new();
+            push_payload(&mut mpr, &[u4(test_num), u1(1), u1(1), u1(0), u1(0)]);
+            push_payload(&mut mpr, &[u2(values.len() as u16), u2(values.len() as u16)]);
+            mpr.extend(vec![0_u8; values.len().div_ceil(2)]);
+            for value in values {
+                mpr.extend(r4(*value));
+            }
+            mpr.extend(cn("NoLimit"));
+            mpr.extend(cn("")); // ALARM_ID
+            push_payload(&mut mpr, &[u1(0b1100_0000), i1(3), i1(3), i1(3)]);
+            push_payload(&mut mpr, &[r4(0.0), r4(0.0)]);
+            mpr
+        }
+        fn prr_payload(part_id: &str) -> Vec<u8> {
+            let mut prr = vec![1, 1, 0];
+            push_payload(
+                &mut prr,
+                &[u2(1), u2(1), u2(1), i2(0), i2(0), u4(50), cn(part_id), cn("")],
+            );
+            prr.push(0);
+            prr
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend(record(0, 10, &[2, 4]));
+        for pin in 0..20_u16 {
+            let mut pmr = Vec::new();
+            push_payload(
+                &mut pmr,
+                &[
+                    u2(101 + pin),
+                    u2(0),
+                    cn(""),
+                    cn(&format!("PIN{}", 101 + pin)),
+                    cn(""),
+                    u1(1),
+                    u1(1),
+                ],
+            );
+            bytes.extend(record(1, 60, &pmr));
+        }
+        let indices: Vec<u16> = (101..121).collect();
+        // Parse decimal literals so every f32 round-trips to the same short
+        // string the assertions expect ("0.31" etc.).
+        let first_values: Vec<f32> = (0..20)
+            .map(|i| format!("0.{}", 30 + i).parse::<f32>().expect("literal"))
+            .collect();
+        let mut second_values = first_values.clone();
+        second_values[10] = 0.9;
+        let mut third_values = first_values.clone();
+        third_values[17] = 0.9;
+
+        bytes.extend(record(5, 10, &[1, 1]));
+        bytes.extend(record(15, 15, &mpr_payload(500, &first_values, &indices, true)));
+        bytes.extend(record(5, 20, &prr_payload("PART-1")));
+        bytes.extend(record(5, 10, &[1, 1]));
+        bytes.extend(record(15, 15, &mpr_payload(500, &second_values, &[], false)));
+        bytes.extend(record(5, 20, &prr_payload("PART-2")));
+        bytes.extend(record(5, 10, &[1, 1]));
+        bytes.extend(record(15, 15, &mpr_payload(500, &third_values, &[], false)));
+        bytes.extend(record(15, 15, &mpr_payload_no_limits(600, &first_values)));
+        bytes.extend(record(5, 20, &prr_payload("PART-3")));
+        bytes
+    }
+
+    fn open_and_wait_complete(manager: &SessionManager, path: &Path) -> ParseSession {
+        let (tx, rx) = mpsc::channel();
+        let session = manager
+            .open_stdf(path.to_string_lossy().to_string(), move |event| {
+                let _ = tx.send(event);
+            })
+            .expect("open session");
+        let mut completed = false;
+        for _ in 0..500 {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(SessionEvent::Complete(_)) => {
+                    completed = true;
+                    break;
+                }
+                Ok(SessionEvent::Error(error)) => panic!("unexpected parse error: {error:?}"),
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert!(completed, "parser should complete");
+        session
+    }
+
+    #[test]
+    fn mpr_pin_details_expand_full_arrays_beyond_preview_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("mpr-pins.stdf");
+        std::fs::write(&file_path, mpr_pin_fixture_bytes()).expect("write fixture");
+
+        let manager = SessionManager::default();
+        let session = open_and_wait_complete(&manager, &file_path);
+
+        let details = manager
+            .get_mpr_pin_details(&session.session_id, 500, 0)
+            .expect("first record pin details");
+        assert_eq!(details.test_name, "CONT:Continuity[1]");
+        assert_eq!(details.unit, "mV");
+        assert_eq!(details.low_limit, "200");
+        assert_eq!(details.high_limit, "800");
+        assert_eq!(
+            details.pins.len(),
+            20,
+            "must return the full array, not the 16-element preview"
+        );
+        assert_eq!(details.pins[0].pmr_index, "101");
+        assert_eq!(details.pins[0].pin_name, "PIN101");
+        assert_eq!(details.pins[0].value, "300");
+        assert_eq!(details.pins[0].status, "P");
+        assert_eq!(details.pins[19].pmr_index, "120");
+        assert_eq!(details.pins[19].pin_name, "PIN120");
+        assert_eq!(details.pins[19].value, "490");
+
+        // The second record omits RTN_INDX: indices inherit from the first
+        // same-test MPR while the values stay its own.
+        let second = manager
+            .get_mpr_pin_details(&session.session_id, 500, 1)
+            .expect("second record pin details");
+        assert_eq!(second.pins.len(), 20);
+        assert_eq!(second.pins[10].pmr_index, "111");
+        assert_eq!(second.pins[10].pin_name, "PIN111");
+        assert_eq!(second.pins[10].value, "900");
+        assert_eq!(second.pins[10].status, "F");
+        assert_eq!(second.pins[9].status, "P");
+
+        assert!(
+            manager
+                .get_mpr_pin_details(&session.session_id, 500, 9)
+                .is_err(),
+            "out-of-range record position should error"
+        );
+        assert!(
+            manager
+                .get_mpr_pin_details(&session.session_id, 999, 0)
+                .is_err(),
+            "unknown test number should error"
+        );
+    }
+
+    #[test]
+    fn mpr_cells_judge_and_summarize_over_every_pin_not_just_the_preview() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("mpr-pins.stdf");
+        std::fs::write(&file_path, mpr_pin_fixture_bytes()).expect("write fixture");
+
+        let manager = SessionManager::default();
+        let session = open_and_wait_complete(&manager, &file_path);
+
+        let page = manager
+            .get_test_item_page(&session.session_id, 0, 10, 0, 10, &[], "")
+            .expect("test item page");
+        let row = |part: &str| {
+            page.rows
+                .iter()
+                .find(|row| row.part_id == part)
+                .unwrap_or_else(|| panic!("{part} row"))
+        };
+        // Part 3's only failing pin is #18 — beyond the 16-element preview.
+        // Judging from the preview alone used to misreport this cell as P.
+        assert_eq!(row("PART-3").results[0].status, "F");
+        assert_eq!(row("PART-1").results[0].status, "P");
+        // The grid preview still shows 16 values plus the truncation marker.
+        assert!(row("PART-1").results[0].value.ends_with(", ..."));
+        assert_eq!(row("PART-1").results[0].value.matches(", ").count(), 16);
+
+        // The CSV swaps the preview for whole-array stats.
+        let csv_path = dir.path().join("matrix.csv");
+        manager
+            .export_test_item_csv(&session.session_id, &csv_path.to_string_lossy())
+            .expect("export csv");
+        let csv = std::fs::read_to_string(&csv_path).expect("read csv");
+        assert!(
+            csv.contains("n=20 min=300 max=490 avg=395 fail=0"),
+            "pass row summary missing: {csv}"
+        );
+        assert!(
+            csv.contains("n=20 min=300 max=900 avg=416.5 fail=1"),
+            "part-3 summary missing: {csv}"
+        );
+        assert!(
+            !csv.contains("300, 310"),
+            "CSV should no longer carry the joined preview values"
+        );
+    }
+
+    #[test]
+    fn opt_flag_no_limit_bits_suppress_placeholder_limits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("mpr-pins.stdf");
+        std::fs::write(&file_path, mpr_pin_fixture_bytes()).expect("write fixture");
+
+        let manager = SessionManager::default();
+        let session = open_and_wait_complete(&manager, &file_path);
+        let page = manager
+            .get_test_item_page(&session.session_id, 0, 10, 0, 10, &[], "")
+            .expect("test item page");
+
+        let column = page
+            .columns
+            .iter()
+            .find(|column| column.test_num == 600)
+            .expect("no-limit column");
+        assert_eq!(column.low_limit, "", "placeholder LO_LIMIT must be ignored");
+        assert_eq!(column.high_limit, "", "placeholder HI_LIMIT must be ignored");
+
+        let index = page
+            .columns
+            .iter()
+            .position(|column| column.test_num == 600)
+            .expect("column index");
+        let row = page
+            .rows
+            .iter()
+            .find(|row| row.part_id == "PART-3")
+            .expect("PART-3 row");
+        let cell = &row.results[index];
+        assert_eq!(cell.status, "", "no limits -> no verdict, not all-fail");
+        let summary = cell.summary.as_deref().expect("summary");
+        assert!(summary.starts_with("n=20"), "summary: {summary}");
+        assert!(
+            !summary.contains("fail="),
+            "no limits -> no fail count: {summary}"
+        );
+    }
+
+    #[test]
+    fn mpr_pins_export_a_valid_xlsx_workbook() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("mpr-pins.stdf");
+        std::fs::write(&file_path, mpr_pin_fixture_bytes()).expect("write fixture");
+
+        let manager = SessionManager::default();
+        let session = open_and_wait_complete(&manager, &file_path);
+
+        let xlsx_path = dir.path().join("pins.xlsx");
+        manager
+            .export_mpr_pins_xlsx(
+                &session.session_id,
+                500,
+                1,
+                "PART-2",
+                "1",
+                &xlsx_path.to_string_lossy(),
+            )
+            .expect("export xlsx");
+        let bytes = std::fs::read(&xlsx_path).expect("read xlsx");
+        // xlsx is a zip container: magic + non-trivial payload is enough to
+        // prove a workbook was written without pulling in a reader crate.
+        assert!(bytes.starts_with(b"PK"), "xlsx should be a zip container");
+        assert!(bytes.len() > 2_000, "workbook should carry the styled pin table");
+    }
+
+    #[test]
+    fn mpr_pin_details_work_through_compressed_sources() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("mpr-pins.stdf.gz");
+        let file = File::create(&file_path).expect("create gz fixture");
+        let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        encoder
+            .write_all(&mpr_pin_fixture_bytes())
+            .expect("write gz payload");
+        encoder.finish().expect("finish gz");
+
+        let manager = SessionManager::default();
+        let session = open_and_wait_complete(&manager, &file_path);
+
+        let second = manager
+            .get_mpr_pin_details(&session.session_id, 500, 1)
+            .expect("pin details through gz re-read");
+        assert_eq!(second.pins.len(), 20);
+        assert_eq!(second.pins[10].pmr_index, "111");
+        assert_eq!(second.pins[10].value, "900");
+        assert_eq!(second.pins[10].status, "F");
+    }
+
+    #[test]
+    #[ignore = "needs STDF_SAMPLE_PATH pointing at a local sample with MPR records"]
+    fn mpr_pin_details_expand_configured_sample() {
+        let path = std::env::var("STDF_SAMPLE_PATH")
+            .map(PathBuf::from)
+            .expect("set STDF_SAMPLE_PATH to a local sample containing MPR records");
+        let manager = SessionManager::default();
+        let session = open_and_wait_complete(&manager, &path);
+        let column = manager
+            .get_test_item_columns(&session.session_id)
+            .expect("columns")
+            .into_iter()
+            .find(|column| column.record_type == "MPR")
+            .expect("sample should contain an MPR test");
+        let started = std::time::Instant::now();
+        let details = manager
+            .get_mpr_pin_details(&session.session_id, column.test_num, 0)
+            .expect("pin details");
+        eprintln!(
+            "expanded '{}' (#{}) in {:?}: {} pins, first={:?} last={:?}",
+            details.test_name,
+            details.test_num,
+            started.elapsed(),
+            details.pins.len(),
+            details.pins.first().map(|pin| (&pin.pmr_index, &pin.pin_name, &pin.value)),
+            details.pins.last().map(|pin| (&pin.pmr_index, &pin.pin_name, &pin.value)),
+        );
+        assert!(!details.pins.is_empty());
+
+        // Also exercise the styled export against real data; the workbook lands
+        // in the temp workspace for manual inspection.
+        let xlsx = temp_workspace_dir().join("sample-mpr-pins.xlsx");
+        manager
+            .export_mpr_pins_xlsx(
+                &session.session_id,
+                column.test_num,
+                0,
+                "SAMPLE",
+                "1",
+                &xlsx.to_string_lossy(),
+            )
+            .expect("export sample xlsx");
+        eprintln!("sample workbook written to {}", xlsx.display());
+
+        // And the matrix CSV, whose MPR cells carry whole-array summaries.
+        let csv_path = temp_workspace_dir().join("sample-matrix.csv");
+        manager
+            .export_test_item_csv(&session.session_id, &csv_path.to_string_lossy())
+            .expect("export sample csv");
+        let csv = std::fs::read_to_string(&csv_path).expect("read sample csv");
+        let sample_summary = csv
+            .lines()
+            .filter(|line| line.contains("n="))
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("\n");
+        eprintln!("sample csv written to {}", csv_path.display());
+        eprintln!("summary rows preview:\n{sample_summary}");
+        assert!(csv.contains("n="), "sample CSV should carry MPR summaries");
     }
 
     #[test]

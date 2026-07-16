@@ -144,6 +144,25 @@ export interface DtrParseResult {
   count: number;
 }
 
+// One pin row of an expanded MPR cell. The grid cell only shows the parser's
+// 16-element preview; the pin dialog fetches the complete array on demand.
+export interface MprPinValue {
+  pmr_index: string;
+  pin_name: string;
+  value: string;
+  status: string;
+}
+
+export interface MprPinDetails {
+  session_id: string;
+  test_num: number;
+  test_name: string;
+  unit: string;
+  low_limit: string;
+  high_limit: string;
+  pins: MprPinValue[];
+}
+
 export interface SearchResult {
   record: RecordSummary;
   field: RecordField;
@@ -193,6 +212,20 @@ export interface StdfApi {
   saveCsvDialog(defaultName: string): Promise<string | null>;
   exportTestItemCsv(sessionId: string, path: string): Promise<void>;
   parseDtrText(sessionId: string): Promise<DtrParseResult>;
+  getMprPinDetails(
+    sessionId: string,
+    testNum: number,
+    recordPosition: number
+  ): Promise<MprPinDetails>;
+  saveXlsxDialog(defaultName: string): Promise<string | null>;
+  exportMprPinsXlsx(
+    sessionId: string,
+    testNum: number,
+    recordPosition: number,
+    partId: string,
+    siteNum: string,
+    path: string
+  ): Promise<void>;
   saveTxtDialog(defaultName: string): Promise<string | null>;
   saveDtrText(sessionId: string, path: string): Promise<void>;
   getRecordGroups(sessionId: string): Promise<RecordGroup[]>;

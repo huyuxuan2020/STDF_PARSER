@@ -130,6 +130,61 @@ describe("App", () => {
     expect(screen.getByText("SCAN_OK")).toBeInTheDocument();
   });
 
+  it("expands an MPR cell into the full pin dialog", async () => {
+    const api = createMockApi();
+    const getMprPinDetails = vi.spyOn(api, "getMprPinDetails");
+    const saveXlsxDialog = vi.spyOn(api, "saveXlsxDialog");
+    const exportMprPinsXlsx = vi.spyOn(api, "exportMprPinsXlsx");
+    const user = userEvent.setup();
+
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
+    await screen.findByRole("main", { name: "文件摘要" });
+
+    act(() => {
+      api.emitComplete("session-1");
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "测试项" })).not.toBeDisabled());
+    await user.click(screen.getByRole("button", { name: "测试项" }));
+    await screen.findByRole("table", { name: "测试项矩阵" });
+
+    // The MPR cell only shows the 16-element preview; clicking it fetches the
+    // complete per-pin expansion from the backend.
+    await user.click(screen.getByText(/^300, 320/));
+    expect(getMprPinDetails).toHaveBeenCalledWith("session-1", 300, 0);
+
+    const dialog = await screen.findByRole("dialog", { name: "MPR pin 结果" });
+    expect(await within(dialog).findByText("PIN101")).toBeInTheDocument();
+    expect(within(dialog).getByText(/共 40 pin/)).toBeInTheDocument();
+    // Pins beyond the grid preview cap are listed with their names.
+    expect(within(dialog).getByText("PIN140")).toBeInTheDocument();
+    expect(within(dialog).getByText(/14 fail/)).toBeInTheDocument();
+
+    // Limits render as separate labeled boxes instead of an inline range.
+    expect(within(dialog).getByText("下限 Low")).toBeInTheDocument();
+    expect(within(dialog).getByText("上限 High")).toBeInTheDocument();
+
+    // The fail filter narrows the table to failing pins only.
+    await user.click(within(dialog).getByLabelText("仅看 Fail"));
+    expect(within(dialog).queryByText("PIN101")).not.toBeInTheDocument();
+    expect(within(dialog).getByText("PIN140")).toBeInTheDocument();
+
+    // Export goes through the save dialog and the backend xlsx writer.
+    await user.click(within(dialog).getByRole("button", { name: /导出 Excel/ }));
+    expect(saveXlsxDialog).toHaveBeenCalledWith("demo-1_MPR300_PART-1_pins.xlsx");
+    await waitFor(() =>
+      expect(exportMprPinsXlsx).toHaveBeenCalledWith(
+        "session-1",
+        300,
+        0,
+        "PART-1",
+        "1",
+        "/tmp/pins.xlsx"
+      )
+    );
+    expect(await within(dialog).findByText("已导出 ✓")).toBeInTheDocument();
+  });
+
   it("virtualizes the test-item matrix instead of mounting every cell", async () => {
     const ROWS = 200;
     const COLS = 60;

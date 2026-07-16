@@ -1,4 +1,5 @@
 import type {
+  MprPinDetails,
   ParseErrorEvent,
   ParseProgress,
   ParseSession,
@@ -175,6 +176,15 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
         high_limit: "",
         unit: "",
         pmr_indices: []
+      },
+      {
+        record_type: "MPR",
+        test_num: 300,
+        test_name: "Continuity:Continuity[1]",
+        low_limit: "200",
+        high_limit: "800",
+        unit: "mV",
+        pmr_indices: ["101", "102", "103"]
       }
     ],
     rows: [
@@ -193,11 +203,16 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
         part_txt: "demo part",
         results: [
           { value: "1.05", status: "P" },
-          { value: "0b00000000", status: "P" }
+          { value: "0b00000000", status: "P" },
+          {
+            value: "300, 320, 340, 360, 380, 400, 420, 440, 460, 480, 500, 520, 540, 560, 580, 600, ...",
+            status: "F",
+            record_position: 0
+          }
         ]
       }
     ],
-    total_columns: 2,
+    total_columns: 3,
     total_rows: 1,
     row_offset: 0,
     col_offset: 0,
@@ -235,6 +250,24 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
       status: "complete" as const
     }),
     getTestItemPage: async () => testItemPage,
+    // 40 pins so the dialog exercises the ">16 preview" case in dev/mock mode.
+    getMprPinDetails: async (): Promise<MprPinDetails> => ({
+      session_id: "session-1",
+      test_num: 300,
+      test_name: "Continuity:Continuity[1]",
+      unit: "mV",
+      low_limit: "200",
+      high_limit: "800",
+      pins: Array.from({ length: 40 }, (_, index) => {
+        const value = 300 + index * 20;
+        return {
+          pmr_index: String(101 + index),
+          pin_name: `PIN${101 + index}`,
+          value: String(value),
+          status: value > 800 ? "F" : "P"
+        };
+      })
+    }),
     getTestItemColumns: async () =>
       testItemPage.columns.map((column) => ({
         key: `${column.record_type}:${column.test_num}`,
@@ -244,6 +277,8 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
       })),
     saveCsvDialog: async () => "/tmp/export.csv",
     exportTestItemCsv: async () => undefined,
+    saveXlsxDialog: async () => "/tmp/pins.xlsx",
+    exportMprPinsXlsx: async () => undefined,
     parseDtrText: async () => ({ session_id: "session-1", count: 3 }),
     saveTxtDialog: async () => "/tmp/export.txt",
     saveDtrText: async () => undefined,

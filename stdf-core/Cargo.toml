@@ -28,6 +28,7 @@ zstd = "0.13.3"
 # crashes at launch (dyld "Library not loaded") on machines without it.
 # That exact failure shipped as v1.0.0.
 liblzma = { version = "0.4.7", features = ["static"] }
+rust_xlsxwriter = "0.96.0"
 
 [dev-dependencies]
 tempfile = "3"

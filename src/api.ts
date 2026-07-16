@@ -5,6 +5,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   BinSummary,
   DtrParseResult,
+  MprPinDetails,
   ParseErrorEvent,
   ParseProgress,
   ParseSession,
@@ -104,6 +105,39 @@ export const tauriApi: StdfApi = {
 
   parseDtrText(sessionId: string) {
     return invoke<DtrParseResult>("parse_dtr_text", { sessionId });
+  },
+
+  getMprPinDetails(sessionId: string, testNum: number, recordPosition: number) {
+    return invoke<MprPinDetails>("get_mpr_pin_details", {
+      sessionId,
+      testNum,
+      recordPosition
+    });
+  },
+
+  saveXlsxDialog(defaultName: string) {
+    return save({
+      defaultPath: defaultName,
+      filters: [{ name: "Excel", extensions: ["xlsx"] }]
+    });
+  },
+
+  exportMprPinsXlsx(
+    sessionId: string,
+    testNum: number,
+    recordPosition: number,
+    partId: string,
+    siteNum: string,
+    path: string
+  ) {
+    return invoke<void>("export_mpr_pins_xlsx", {
+      sessionId,
+      testNum,
+      recordPosition,
+      partId,
+      siteNum,
+      path
+    });
   },
 
   saveTxtDialog(defaultName: string) {
