@@ -29,6 +29,7 @@ import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { computeMatrixWindow } from "./matrixWindow";
 import type {
+  MprPinDetails,
   ParseErrorEvent,
   ParseProgress,
   ParseSession,
@@ -929,6 +930,27 @@ export default function App({ api = tauriApi }: AppProps) {
                   setSelectedGroup(recordType);
                   setCursor(position);
                   setNav("records");
+                }}
+                fetchMprPins={(testNum, position) =>
+                  api.getMprPinDetails(session.session_id, testNum, position)
+                }
+                exportMprPins={async (testNum, position, partId, siteNum) => {
+                  // Default name mirrors the CSV export convention; part id may
+                  // carry characters macOS filenames reject, so sanitize it.
+                  const safePart = (partId || "part").replace(/[^\w.-]+/g, "_");
+                  const path = await api.saveXlsxDialog(
+                    `${sessionBaseName()}_MPR${testNum}_${safePart}_pins.xlsx`
+                  );
+                  if (!path) return false;
+                  await api.exportMprPinsXlsx(
+                    session.session_id,
+                    testNum,
+                    position,
+                    partId,
+                    siteNum,
+                    path
+                  );
+                  return true;
                 }}
               />
               {tiFilterOpen && (
@@ -2296,7 +2318,9 @@ function TestItemsView({
   onColSizeChange,
   onOpenFilter,
   onLoadMore,
-  onJumpToRecord
+  onJumpToRecord,
+  fetchMprPins,
+  exportMprPins
 }: {
   session: ParseSession;
   loaded: boolean;
@@ -2319,6 +2343,14 @@ function TestItemsView({
   onOpenFilter: () => void;
   onLoadMore: () => void;
   onJumpToRecord: (recordType: string, position: number) => void;
+  fetchMprPins: (testNum: number, recordPosition: number) => Promise<MprPinDetails>;
+  /** Save-dialog + backend xlsx write; resolves false when the user cancels. */
+  exportMprPins: (
+    testNum: number,
+    recordPosition: number,
+    partId: string,
+    siteNum: string
+  ) => Promise<boolean>;
 }) {
   // Custom right-click menu on test-value cells so we can offer a "跳转到源记录"
   // action alongside "复制" (browser's default menu wouldn't have the jump).
@@ -2330,12 +2362,22 @@ function TestItemsView({
     value: string;
     recordType: string;
     recordPosition: number | undefined;
+    column: TestItemColumn;
+    row: TestItemPartRow;
   } | null>(null);
   // Column detail card: opened by clicking any header cell of a test column.
   // Shows the full (grid-truncated) name selectable, plus copy shortcuts.
   const [colInfo, setColInfo] = useState<{ x: number; y: number; column: TestItemColumn } | null>(
     null
   );
+  // MPR pin dialog: an MPR cell only previews its multi-pin result array, so
+  // clicking one opens a modal that fetches and lists the complete per-pin
+  // values (the backend re-reads the source file on demand).
+  const [pinDialog, setPinDialog] = useState<{
+    column: TestItemColumn;
+    row: TestItemPartRow;
+    recordPosition: number;
+  } | null>(null);
   useEffect(() => {
     if (!cellMenu && !colInfo) return;
     const close = () => {
@@ -2636,10 +2678,25 @@ function TestItemsView({
                             : status === "P"
                               ? "text-success"
                               : "text-muted-foreground";
+                        // An MPR cell only previews its multi-pin array — clicking
+                        // it opens the full per-pin dialog.
+                        const expandable =
+                          column.record_type === "MPR" && cell?.record_position !== undefined;
                         return (
                           <td
                             key={`${row.part_id}:${row.site_num}:${column.record_type}:${column.test_num}`}
-                            className={`overflow-hidden px-2 py-0 align-middle ${status === "F" ? "bg-danger-soft" : ""}`}
+                            className={`overflow-hidden px-2 py-0 align-middle ${status === "F" ? "bg-danger-soft" : ""} ${
+                              expandable ? "cursor-pointer hover:bg-primary-soft/50" : ""
+                            }`}
+                            onClick={() => {
+                              if (expandable) {
+                                setPinDialog({
+                                  column,
+                                  row,
+                                  recordPosition: cell.record_position as number
+                                });
+                              }
+                            }}
                             onContextMenu={(e) => {
                               e.preventDefault();
                               setCellMenu({
@@ -2647,12 +2704,18 @@ function TestItemsView({
                                 y: e.clientY,
                                 value: cell?.value ?? "",
                                 recordType: column.record_type,
-                                recordPosition: cell?.record_position
+                                recordPosition: cell?.record_position,
+                                column,
+                                row
                               });
                             }}
                           >
                             <span
-                              title={cell?.value || undefined}
+                              title={
+                                expandable
+                                  ? `${cell?.value || ""}\n点击查看全部 pin 结果`
+                                  : cell?.value || undefined
+                              }
                               className={`block w-full truncate text-right font-mono text-xs tabular-nums ${textTone}`}
                             >
                               {display}
@@ -2761,6 +2824,26 @@ function TestItemsView({
           }}
           onMouseDown={(e) => e.stopPropagation()}
         >
+          {cellMenu.recordType === "MPR" && (
+            <button
+              type="button"
+              role="menuitem"
+              disabled={cellMenu.recordPosition === undefined}
+              onClick={() => {
+                if (cellMenu.recordPosition !== undefined) {
+                  setPinDialog({
+                    column: cellMenu.column,
+                    row: cellMenu.row,
+                    recordPosition: cellMenu.recordPosition
+                  });
+                }
+                setCellMenu(null);
+              }}
+              className="block w-full px-3 py-1.5 text-left hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              查看全部 pin 结果
+            </button>
+          )}
           <button
             type="button"
             role="menuitem"
@@ -2792,7 +2875,343 @@ function TestItemsView({
         </div>,
         document.body
       )}
+      {pinDialog && (
+        <MprPinDialog
+          column={pinDialog.column}
+          row={pinDialog.row}
+          recordPosition={pinDialog.recordPosition}
+          fetchPins={fetchMprPins}
+          onExport={() =>
+            exportMprPins(
+              pinDialog.column.test_num,
+              pinDialog.recordPosition,
+              pinDialog.row.part_id,
+              pinDialog.row.site_num
+            )
+          }
+          onClose={() => setPinDialog(null)}
+        />
+      )}
     </section>
+  );
+}
+
+// The pin table renders in chunks: an MPR can carry tens of thousands of
+// pins, and mounting that many rows at once would freeze the dialog.
+const PIN_DISPLAY_CAP = 1000;
+
+// Full per-pin expansion of one MPR cell. Fetches on open — the backend
+// re-reads the source file (decompressing if needed), so a spinner covers
+// the sub-second-to-seconds wait on large files.
+function MprPinDialog({
+  column,
+  row,
+  recordPosition,
+  fetchPins,
+  onExport,
+  onClose
+}: {
+  column: TestItemColumn;
+  row: TestItemPartRow;
+  recordPosition: number;
+  fetchPins: (testNum: number, recordPosition: number) => Promise<MprPinDetails>;
+  /** Resolves true when a file was written, false when the user cancelled. */
+  onExport: () => Promise<boolean>;
+  onClose: () => void;
+}) {
+  const [details, setDetails] = useState<MprPinDetails | null>(null);
+  const [error, setError] = useState("");
+  const [failOnly, setFailOnly] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exported, setExported] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const [displayLimit, setDisplayLimit] = useState(PIN_DISPLAY_CAP);
+
+  useEffect(() => {
+    let cancelled = false;
+    setDetails(null);
+    setError("");
+    fetchPins(column.test_num, recordPosition)
+      .then((result) => {
+        if (!cancelled) setDetails(result);
+      })
+      .catch((reason) => {
+        if (!cancelled) setError(String(reason));
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [column.test_num, recordPosition]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const pins = details?.pins ?? [];
+  const failCount = useMemo(() => pins.filter((pin) => pin.status === "F").length, [pins]);
+  const stats = useMemo(() => {
+    const values = pins
+      .map((pin) => Number(pin.value))
+      .filter((value) => Number.isFinite(value));
+    if (values.length === 0) return null;
+    let min = values[0];
+    let max = values[0];
+    let sum = 0;
+    for (const value of values) {
+      if (value < min) min = value;
+      if (value > max) max = value;
+      sum += value;
+    }
+    const round = (value: number) => String(Number(value.toPrecision(6)));
+    return { min: round(min), max: round(max), avg: round(sum / values.length) };
+  }, [pins]);
+  // Keep each pin's 1-based position stable when the fail filter hides rows.
+  const shown = useMemo(() => {
+    const indexed = pins.map((pin, index) => ({ pin, index }));
+    return (failOnly ? indexed.filter(({ pin }) => pin.status === "F") : indexed).slice(
+      0,
+      displayLimit
+    );
+  }, [pins, failOnly, displayLimit]);
+  const hiddenCount = (failOnly ? failCount : pins.length) - shown.length;
+
+  const exportXlsx = async () => {
+    if (exporting) return;
+    setExporting(true);
+    setExportError("");
+    try {
+      const saved = await onExport();
+      if (saved) {
+        setExported(true);
+        setTimeout(() => setExported(false), 2500);
+      }
+    } catch (reason) {
+      setExportError(`导出 Excel 失败：${String(reason)}`);
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  return createPortal(
+    <div
+      className="overlay-fade fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
+      onClick={onClose}
+      role="presentation"
+    >
+      <div
+        className="pop-in flex max-h-[85vh] w-[640px] max-w-full flex-col overflow-hidden rounded-xl border border-border bg-card shadow-overlay"
+        onClick={(event) => event.stopPropagation()}
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+        aria-label="MPR pin 结果"
+      >
+        <div className="border-b border-border px-4 py-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="rounded-sm bg-primary-soft px-1.5 py-px text-[11px] font-medium text-primary">
+                  MPR
+                </span>
+                <span className="font-mono text-xs tabular-nums text-muted-foreground">
+                  {column.test_num}
+                </span>
+              </div>
+              <p
+                className="mt-1 select-text truncate text-[14px] font-semibold text-foreground"
+                title={column.test_name || undefined}
+              >
+                {column.test_name || `#${column.test_num}`}
+              </p>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                Part {row.part_id || "-"} · Site {row.site_num || "-"}
+              </p>
+            </div>
+            <button type="button" className={PAGER_BTN} onClick={onClose} aria-label="关闭">
+              <X size={14} />
+            </button>
+          </div>
+          {/* Limits split into labeled boxes — the inline "low ~ high" line was
+              easy to misread with long numbers. Mirrors the column detail card. */}
+          <div className="mt-2.5 grid grid-cols-3 gap-2 rounded-md bg-muted px-2.5 py-2 text-xs">
+            <div>
+              <div className="text-muted-foreground">下限 Low</div>
+              <div
+                className="mt-0.5 select-text truncate font-mono text-foreground"
+                title={column.low_limit || undefined}
+              >
+                {column.low_limit || "-"}
+              </div>
+            </div>
+            <div>
+              <div className="text-muted-foreground">上限 High</div>
+              <div
+                className="mt-0.5 select-text truncate font-mono text-foreground"
+                title={column.high_limit || undefined}
+              >
+                {column.high_limit || "-"}
+              </div>
+            </div>
+            <div>
+              <div className="text-muted-foreground">单位 Unit</div>
+              <div className="mt-0.5 select-text truncate text-foreground">
+                {column.unit || "-"}
+              </div>
+            </div>
+          </div>
+        </div>
+        {!details && !error && (
+          <div className="flex items-center justify-center gap-2 px-4 py-14 text-sm text-muted-foreground">
+            <Loader2 size={16} className="animate-spin" />
+            正在从源文件读取全部 pin 结果…
+          </div>
+        )}
+        {error && (
+          <div className="flex items-center justify-center gap-2 px-4 py-14 text-sm text-danger">
+            <AlertCircle size={16} />
+            <span className="select-text break-all">{error}</span>
+          </div>
+        )}
+        {details && (
+          <>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-border px-4 py-2 text-xs text-muted-foreground">
+              <span className="tabular-nums">
+                共 {pins.length.toLocaleString()} pin
+                {failCount > 0 ? (
+                  <>
+                    {" "}
+                    · <span className="font-semibold text-danger">{failCount} fail</span>
+                  </>
+                ) : (
+                  " · 全部通过"
+                )}
+              </span>
+              {stats && (
+                <span className="font-mono tabular-nums">
+                  min {stats.min} / avg {stats.avg} / max {stats.max}
+                  {details.unit ? ` ${details.unit}` : ""}
+                </span>
+              )}
+              {failCount > 0 && (
+                <label className="ml-auto flex cursor-pointer select-none items-center gap-1.5">
+                  <input
+                    type="checkbox"
+                    checked={failOnly}
+                    onChange={(event) => setFailOnly(event.target.checked)}
+                    className="accent-primary"
+                  />
+                  仅看 Fail
+                </label>
+              )}
+            </div>
+            <div className="min-h-0 flex-1 overflow-auto">
+              {shown.length === 0 ? (
+                <div className="px-4 py-10 text-center text-xs text-muted-foreground">
+                  没有匹配的 pin。
+                </div>
+              ) : (
+                <table className="w-full border-collapse text-xs" aria-label="pin 结果列表">
+                  <thead className="sticky top-0 bg-muted">
+                    <tr className="text-left text-[11px] text-muted-foreground">
+                      <th className="px-4 py-1.5 font-medium">#</th>
+                      <th className="px-2 py-1.5 font-medium">PMR</th>
+                      <th className="px-2 py-1.5 font-medium">Pin 名称</th>
+                      <th className="px-2 py-1.5 text-right font-medium">
+                        值{details.unit ? ` (${details.unit})` : ""}
+                      </th>
+                      <th className="px-4 py-1.5 text-right font-medium">P/F</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {shown.map(({ pin, index }) => (
+                      <tr
+                        key={index}
+                        className={`border-t border-border ${pin.status === "F" ? "bg-danger-soft" : ""}`}
+                      >
+                        <td className="px-4 py-1 font-mono tabular-nums text-muted-foreground">
+                          {index + 1}
+                        </td>
+                        <td className="px-2 py-1 font-mono tabular-nums text-muted-foreground">
+                          {pin.pmr_index || "-"}
+                        </td>
+                        <td
+                          className="max-w-[180px] select-text truncate px-2 py-1 text-foreground"
+                          title={pin.pin_name || undefined}
+                        >
+                          {pin.pin_name || "-"}
+                        </td>
+                        <td
+                          className={`select-text px-2 py-1 text-right font-mono tabular-nums ${
+                            pin.status === "F" ? "font-semibold text-danger" : "text-foreground"
+                          }`}
+                        >
+                          {pin.value || "-"}
+                        </td>
+                        <td
+                          className={`px-4 py-1 text-right font-mono ${
+                            pin.status === "F"
+                              ? "font-semibold text-danger"
+                              : pin.status === "P"
+                                ? "text-success"
+                                : "text-muted-foreground"
+                          }`}
+                        >
+                          {pin.status || "-"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              {hiddenCount > 0 && (
+                <div className="px-2 py-2 text-center">
+                  <button
+                    type="button"
+                    onClick={() => setDisplayLimit((limit) => limit + PIN_DISPLAY_CAP)}
+                    className="rounded-md border border-border-strong bg-card px-3 py-1 text-[11px] text-muted-foreground transition hover:bg-muted hover:text-foreground"
+                  >
+                    继续加载 {PIN_DISPLAY_CAP.toLocaleString()} 个（剩余 {hiddenCount.toLocaleString()}）
+                  </button>
+                </div>
+              )}
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-border px-4 py-3">
+              {exportError && (
+                <span className="mr-auto select-text text-xs text-danger">{exportError}</span>
+              )}
+              <button
+                type="button"
+                className={BTN_SECONDARY}
+                onClick={() => void exportXlsx()}
+                disabled={exporting || pins.length === 0}
+              >
+                {exporting ? (
+                  <>
+                    <Loader2 size={14} className="animate-spin" />
+                    导出中…
+                  </>
+                ) : exported ? (
+                  "已导出 ✓"
+                ) : (
+                  <>
+                    <Download size={14} />
+                    导出 Excel
+                  </>
+                )}
+              </button>
+              <button type="button" className={BTN_PRIMARY} onClick={onClose}>
+                关闭
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>,
+    document.body
   );
 }
 

@@ -1,7 +1,8 @@
 use stdf_core::parser::{ParseErrorEvent, ParseProgress};
 use stdf_core::sessions::{
-    BinSummary, DtrParseResult, EnrichedField, RecordGroup, RecordSummaryPage, SearchProgress,
-    SearchResultPage, SessionManager, SessionSnapshot, TestItemColumnLite, TestItemPage,
+    BinSummary, DtrParseResult, EnrichedField, MprPinDetails, RecordGroup, RecordSummaryPage,
+    SearchProgress, SearchResultPage, SessionManager, SessionSnapshot, TestItemColumnLite,
+    TestItemPage,
 };
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, State};
@@ -114,6 +115,41 @@ fn save_dtr_text(
     manager.save_dtr_text(&session_id, &path)
 }
 
+// `(async)`: expanding an MPR cell re-reads (and possibly re-decompresses)
+// the source file up to the clicked record — IO-heavy like parse_dtr_text.
+#[tauri::command(async)]
+fn get_mpr_pin_details(
+    session_id: String,
+    test_num: u32,
+    record_position: usize,
+    manager: State<'_, SessionManager>,
+) -> Result<MprPinDetails, String> {
+    manager.get_mpr_pin_details(&session_id, test_num, record_position)
+}
+
+// `(async)`: same on-demand source re-read as get_mpr_pin_details, plus the
+// xlsx write itself.
+#[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
+fn export_mpr_pins_xlsx(
+    session_id: String,
+    test_num: u32,
+    record_position: usize,
+    part_id: String,
+    site_num: String,
+    path: String,
+    manager: State<'_, SessionManager>,
+) -> Result<(), String> {
+    manager.export_mpr_pins_xlsx(
+        &session_id,
+        test_num,
+        record_position,
+        &part_id,
+        &site_num,
+        &path,
+    )
+}
+
 #[tauri::command(async)]
 fn get_record_groups(
     session_id: String,
@@ -186,6 +222,8 @@ pub fn run() {
             export_test_item_csv,
             parse_dtr_text,
             save_dtr_text,
+            get_mpr_pin_details,
+            export_mpr_pins_xlsx,
             get_record_groups,
             get_records,
             get_record_fields,
