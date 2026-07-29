@@ -10,18 +10,21 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 APP_NAME="STDF Parser"
-APP_BUNDLE="target/release/bundle/macos/${APP_NAME}.app"
-DMG_DIR="target/release/bundle/dmg"
-DMG_NAME="STDF_Parser_1.1.1_aarch64.dmg"
+APP_VERSION="${APP_VERSION:-$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json', 'utf8')).version")}"
+APP_BUNDLE="${APP_BUNDLE:-target/release/bundle/macos/${APP_NAME}.app}"
+DMG_ARCH="${DMG_ARCH:-aarch64}"
+DMG_DIR="${DMG_DIR:-target/release/bundle/dmg}"
+DMG_NAME="${DMG_NAME:-STDF_Parser_${APP_VERSION}_${DMG_ARCH}.dmg}"
 SRC_DIR="target/release/bundle/dmg-unsigned-src"
 
 export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 if [[ "${SKIP_APP_BUILD:-0}" == "1" && -d "$APP_BUNDLE" ]]; then
   echo "==> Reusing existing app bundle (SKIP_APP_BUILD=1)"
 else
   echo "==> Building app bundle"
-  npm run tauri -- build --bundles app
+  npm run tauri -- build --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
 fi
 
 if [[ ! -d "$APP_BUNDLE" ]]; then
@@ -32,9 +35,9 @@ fi
 
 echo "==> Generating DMG background"
 mkdir -p packaging/dmg
-python3 packaging/dmg/install-background.py
+"$PYTHON_BIN" packaging/dmg/install-background.py
 BG="packaging/dmg/install-background.tiff"
-[[ -f "$BG" ]] || BG="packaging/dmg/install-background.png"
+[[ -f "$BG" ]] || { echo "DMG background not found at $BG" >&2; exit 1; }
 echo "    background: $BG"
 
 echo "==> Staging app into a clean source folder"
@@ -46,8 +49,14 @@ echo "==> Creating unsigned DMG via bundled create-dmg script"
 mkdir -p "$DMG_DIR"
 rm -f "$DMG_DIR/$DMG_NAME"
 
+CREATE_DMG_BIN="${CREATE_DMG_BIN:-target/release/bundle/dmg/bundle_dmg.sh}"
+if [[ ! -x "$CREATE_DMG_BIN" ]] && command -v create-dmg >/dev/null 2>&1; then
+  CREATE_DMG_BIN="$(command -v create-dmg)"
+fi
+[[ -x "$CREATE_DMG_BIN" ]] || { echo "create-dmg executable not found" >&2; exit 1; }
+
 env -u LC_ALL -u LC_CTYPE -u LANG LC_ALL=C LANG=C \
-target/release/bundle/dmg/bundle_dmg.sh \
+  "$CREATE_DMG_BIN" \
   --volname "$APP_NAME" \
   --background "$BG" \
   --window-size 680 440 \
@@ -57,6 +66,8 @@ target/release/bundle/dmg/bundle_dmg.sh \
   --app-drop-link 500 220 \
   "$DMG_DIR/$DMG_NAME" \
   "$SRC_DIR"
+
+[[ -f "$DMG_DIR/$DMG_NAME" ]] || { echo "DMG was not created" >&2; exit 1; }
 
 echo ""
 echo "✅ Unsigned DMG created:"

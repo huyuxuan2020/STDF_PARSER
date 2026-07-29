@@ -37,7 +37,8 @@ else
   bash packaging/build-dmg.sh
 fi
 
-DMG="target/release/bundle/dmg/STDF_Parser_1.1.1_aarch64.dmg"
+APP_VERSION="$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json', 'utf8')).version")"
+DMG="target/release/bundle/dmg/STDF_Parser_${APP_VERSION}_aarch64.dmg"
 echo ""
 if [ -f "$DMG" ]; then
   echo "✅ 打包完成！DMG 位置："
