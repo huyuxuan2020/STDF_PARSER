@@ -75,7 +75,7 @@ jobs:
       matrix:
         include:
           - platform: macos-latest
-            args: "--target universal-apple-darwin"
+            args: "--target universal-apple-darwin --bundles app"
             rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
           - platform: windows-latest
             args: ""
@@ -92,6 +92,12 @@ jobs:
         with:
           node-version: 20
 
+      - name: Setup Python
+        if: matrix.platform == 'macos-latest'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -105,6 +111,21 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
+      - name: Import Apple signing certificate
+        if: matrix.platform == 'macos-latest'
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Install create-dmg
+        if: matrix.platform == 'macos-latest'
+        run: brew install create-dmg
+
+      - name: Install DMG background dependencies
+        if: matrix.platform == 'macos-latest'
+        run: python3 -m pip install -r packaging/dmg/requirements.txt
+
       - name: Build, sign & upload
         uses: tauri-apps/tauri-action@v0
         env:
@@ -113,8 +134,6 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # —— macOS 代码签名 + 公证（仅 mac 任务用到，windows 任务忽略）——
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -162,6 +181,59 @@ jobs:
           fi
           kill "$PID"
 
+      - name: Build styled signed and notarized DMG (macOS)
+        if: matrix.platform == 'macos-latest'
+        env:
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          NOTARY_PROFILE: stdf-parser-ci
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APP_BUNDLE: target/universal-apple-darwin/release/bundle/macos/STDF Parser.app
+          DMG_ARCH: universal
+          SKIP_APP_BUILD: "1"
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          xcrun notarytool store-credentials "$NOTARY_PROFILE" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_PASSWORD"
+          CREATE_DMG_BIN="$(command -v create-dmg)" npm run dmg:signed
+          UPDATER_DIR="target/release/bundle/final-updater"
+          UPDATER_ARCHIVE="$UPDATER_DIR/STDF.Parser_universal.app.tar.gz"
+          mkdir -p "$UPDATER_DIR"
+          COPYFILE_DISABLE=1 tar -czf "$UPDATER_ARCHIVE" \
+            -C "$(dirname "$APP_BUNDLE")" "$(basename "$APP_BUNDLE")"
+          npm run tauri -- signer sign "$UPDATER_ARCHIVE"
+          echo "SIGNED_DMG=target/release/bundle/dmg/STDF_Parser_${TAG_NAME#v}_universal_developer_id.dmg" >> "$GITHUB_ENV"
+          echo "SIGNED_APP_ARCHIVE=$UPDATER_ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Smoke-launch final signed app (macOS)
+        if: matrix.platform == 'macos-latest'
+        run: |
+          BIN=$(find target/universal-apple-darwin/release/bundle/macos -path "*.app/Contents/MacOS/*" -type f | head -1)
+          echo "launching final signed app: $BIN"
+          "$BIN" &
+          PID=$!
+          sleep 8
+          if ! kill -0 "$PID" 2>/dev/null; then
+            echo "::error::Final signed app exited within 8s of launch"
+            exit 1
+          fi
+          kill "$PID"
+
+      - name: Upload final macOS artifacts
+        if: matrix.platform == 'macos-latest'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$TAG_NAME" \
+            "$SIGNED_DMG" \
+            "$SIGNED_APP_ARCHIVE" \
+            "$SIGNED_APP_ARCHIVE.sig" \
+            --clobber
+
       - name: Smoke-launch the built app (Windows)
         if: matrix.platform == 'windows-latest'
         shell: pwsh
@@ -183,12 +255,66 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Rebuild updater manifest with final macOS signature
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p release-manifest
+          gh release download "$TAG_NAME" \
+            --pattern latest.json \
+            --pattern STDF.Parser_universal.app.tar.gz.sig \
+            --dir release-manifest
+          MAC_SIGNATURE="$(cat release-manifest/STDF.Parser_universal.app.tar.gz.sig)"
+          jq --arg signature "$MAC_SIGNATURE" '
+            .platforms["darwin-aarch64"].signature = $signature |
+            .platforms["darwin-x86_64"].signature = $signature |
+            .platforms["darwin-aarch64-app"].signature = $signature |
+            .platforms["darwin-x86_64-app"].signature = $signature
+          ' release-manifest/latest.json > release-manifest/latest.final.json
+          mv release-manifest/latest.final.json release-manifest/latest.json
+          jq -e --arg version "${TAG_NAME#v}" --arg signature "$MAC_SIGNATURE" '
+            .version == $version and
+            ([
+              .platforms["darwin-aarch64"],
+              .platforms["darwin-x86_64"],
+              .platforms["darwin-aarch64-app"],
+              .platforms["darwin-x86_64-app"]
+            ] | all(
+              .signature == $signature and
+              (.url | endswith("/STDF.Parser_universal.app.tar.gz"))
+            ))
+          ' release-manifest/latest.json
+          gh release upload "$TAG_NAME" release-manifest/latest.json --clobber
+
       - name: Publish release
         uses: actions/github-script@v7
         env:
           release_id: ${{ needs.create-release.outputs.release_id }}
         with:
           script: |
+            const tag = process.env.TAG_NAME;
+            const version = tag.replace(/^v/, '');
+            const { data: assets } = await github.rest.repos.listReleaseAssets({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: Number(process.env.release_id),
+              per_page: 100,
+            });
+            const names = new Set(assets.map((asset) => asset.name));
+            const required = [
+              'latest.json',
+              `STDF_Parser_${version}_universal_developer_id.dmg`,
+              'STDF.Parser_universal.app.tar.gz',
+              'STDF.Parser_universal.app.tar.gz.sig',
+              `STDF.Parser_${version}_x64-setup.exe`,
+              `STDF.Parser_${version}_x64-setup.exe.sig`,
+              `STDF.Parser_${version}_x64_en-US.msi`,
+              `STDF.Parser_${version}_x64_en-US.msi.sig`,
+            ];
+            const missing = required.filter((name) => !names.has(name));
+            if (missing.length > 0) {
+              throw new Error(`Refusing to publish; missing assets: ${missing.join(', ')}`);
+            }
             await github.rest.repos.updateRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
