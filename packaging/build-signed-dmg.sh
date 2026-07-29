@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 APP_NAME="STDF Parser"
 APP_BUNDLE="target/release/bundle/macos/${APP_NAME}.app"
 DMG_DIR="target/release/bundle/dmg"
-DMG_NAME="STDF_Parser_0.1.1_aarch64_developer_id.dmg"
+DMG_NAME="STDF_Parser_1.1.1_aarch64_developer_id.dmg"
 # Set these in your local environment; no identity is hardcoded in the repo.
 #   export SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
 #   export NOTARY_PROFILE="your-notary-profile"
