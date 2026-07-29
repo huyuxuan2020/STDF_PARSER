@@ -37,7 +37,7 @@ else
   bash packaging/build-dmg.sh
 fi
 
-DMG="target/release/bundle/dmg/STDF_Parser_0.1.1_aarch64.dmg"
+DMG="target/release/bundle/dmg/STDF_Parser_1.1.1_aarch64.dmg"
 echo ""
 if [ -f "$DMG" ]; then
   echo "✅ 打包完成！DMG 位置："

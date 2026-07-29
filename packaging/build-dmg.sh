@@ -12,7 +12,7 @@ cd "$ROOT_DIR"
 APP_NAME="STDF Parser"
 APP_BUNDLE="target/release/bundle/macos/${APP_NAME}.app"
 DMG_DIR="target/release/bundle/dmg"
-DMG_NAME="STDF_Parser_0.1.1_aarch64.dmg"
+DMG_NAME="STDF_Parser_1.1.1_aarch64.dmg"
 SRC_DIR="target/release/bundle/dmg-unsigned-src"
 
 export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"

@@ -296,6 +296,90 @@ describe("App", () => {
     await waitFor(() => expect(getTestItemColumns).toHaveBeenCalledTimes(1));
   });
 
+  it("keeps test-item selections across searches and restores all when cleared", async () => {
+    const api = createMockApi();
+    const getTestItemPage = vi.spyOn(api, "getTestItemPage");
+    const user = userEvent.setup();
+
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
+    await screen.findByRole("main", { name: "文件摘要" });
+    act(() => {
+      api.emitComplete("session-1");
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "测试项" })).not.toBeDisabled());
+    await user.click(screen.getByRole("button", { name: "测试项" }));
+    await screen.findByRole("table", { name: "测试项矩阵" });
+
+    // No explicit selection means show every matrix column, but the filter
+    // dialog starts with every checkbox visually clear.
+    await user.click(screen.getByRole("button", { name: /筛选测试项/ }));
+    let dialog = await screen.findByRole("dialog", { name: "筛选测试项" });
+    await waitFor(() => expect(within(dialog).getAllByRole("checkbox")).toHaveLength(3));
+    expect(within(dialog).getByText("未筛选，当前显示全部")).toBeInTheDocument();
+    within(dialog).getAllByRole("checkbox").forEach((checkbox) => expect(checkbox).not.toBeChecked());
+
+    const search = within(dialog).getByRole("textbox", { name: "模糊匹配测试项" });
+    await user.type(search, "VDD");
+    await user.click(within(dialog).getByRole("checkbox", { name: /VDD_CORE/ }));
+    await user.clear(search);
+    await user.type(search, "SCAN");
+    await user.click(within(dialog).getByRole("checkbox", { name: /SCAN_OK/ }));
+    await user.clear(search);
+
+    // Changing the search only changes the visible candidates; earlier picks remain.
+    expect(within(dialog).getByRole("checkbox", { name: /VDD_CORE/ })).toBeChecked();
+    expect(within(dialog).getByRole("checkbox", { name: /SCAN_OK/ })).toBeChecked();
+    expect(within(dialog).getByRole("checkbox", { name: /Continuity/ })).not.toBeChecked();
+
+    // Match actions only affect the current search and preserve hidden choices.
+    await user.type(search, "VDD");
+    await user.click(within(dialog).getByRole("button", { name: "取消匹配项" }));
+    await user.clear(search);
+    expect(within(dialog).getByRole("checkbox", { name: /VDD_CORE/ })).not.toBeChecked();
+    expect(within(dialog).getByRole("checkbox", { name: /SCAN_OK/ })).toBeChecked();
+    await user.type(search, "VDD");
+    await user.click(within(dialog).getByRole("button", { name: "选择匹配项" }));
+    await user.clear(search);
+    await user.click(within(dialog).getByRole("button", { name: "确认" }));
+
+    await waitFor(() =>
+      expect(getTestItemPage).toHaveBeenLastCalledWith(
+        "session-1",
+        0,
+        500,
+        0,
+        200,
+        ["PTR:100", "FTR:220"],
+        ""
+      )
+    );
+
+    // Applied choices are restored when reopening, and a new search appends to them.
+    await user.click(screen.getByRole("button", { name: /筛选测试项/ }));
+    dialog = await screen.findByRole("dialog", { name: "筛选测试项" });
+    expect(within(dialog).getByRole("checkbox", { name: /VDD_CORE/ })).toBeChecked();
+    expect(within(dialog).getByRole("checkbox", { name: /SCAN_OK/ })).toBeChecked();
+    const reopenedSearch = within(dialog).getByRole("textbox", { name: "模糊匹配测试项" });
+    await user.type(reopenedSearch, "Continuity");
+    await user.click(within(dialog).getByRole("checkbox", { name: /Continuity/ }));
+    await user.clear(reopenedSearch);
+    expect(
+      within(dialog)
+        .getAllByRole("checkbox")
+        .filter((checkbox) => checkbox.matches(":checked"))
+    ).toHaveLength(3);
+
+    // Clearing every explicit choice and confirming restores the unfiltered matrix.
+    await user.click(within(dialog).getByRole("button", { name: "取消全部" }));
+    expect(within(dialog).getByText("未筛选，当前显示全部")).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "确认" }));
+    await waitFor(() =>
+      expect(getTestItemPage).toHaveBeenLastCalledWith("session-1", 0, 500, 0, 200, [], "")
+    );
+    expect(screen.getByRole("button", { name: /筛选测试项 全部/ })).toBeInTheDocument();
+  });
+
   it("opens a column detail card with the full test name and copies it", async () => {
     const api = createMockApi();
     const user = userEvent.setup();

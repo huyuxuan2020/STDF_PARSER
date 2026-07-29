@@ -606,15 +606,20 @@ export default function App({ api = tauriApi }: AppProps) {
     api
       .getTestItemColumns(sessionId)
       .then((cols) => {
-        if (active) setTiAllColumns(cols);
+        if (!active) return;
+        setTiAllColumns(cols);
+        setTiColumnsLoading(false);
       })
-      .finally(() => {
+      .catch(() => {
         if (active) setTiColumnsLoading(false);
       });
     return () => {
       active = false;
     };
-  }, [api, session?.session_id, tiFilterOpen, tiAllColumns.length]);
+    // tiAllColumns is intentionally checked but not observed: changing it after
+    // a successful request must not clean up that same request before loading clears.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api, session?.session_id, tiFilterOpen]);
 
   // Append the next batch of rows for infinite scroll. Tagged with the current
   // epoch so a response that arrives after a column/selection change is discarded.
@@ -3216,8 +3221,8 @@ function MprPinDialog({
 }
 
 // Modal multi-select for choosing which test-item columns to show. Fuzzy search
-// narrows the list; select-all/clear act on the matches; the selection applies on
-// confirm. An empty result ([] passed up) means "show all".
+// narrows the list; select/clear act on the matches without discarding selections
+// from earlier searches. An empty selection means "show all".
 const FILTER_DISPLAY_CAP = 500;
 
 function TestItemFilterDialog({
@@ -3233,16 +3238,16 @@ function TestItemFilterDialog({
   onClose: () => void;
   onConfirm: (selected: string[]) => void;
 }) {
-  const allKeys = useMemo(() => columns.map((c) => c.key), [columns]);
-  const [draft, setDraft] = useState<Set<string>>(() => new Set(applied.length === 0 ? allKeys : applied));
+  const [draft, setDraft] = useState<Set<string>>(() => new Set(applied));
   const [query, setQuery] = useState("");
   const [displayLimit, setDisplayLimit] = useState(FILTER_DISPLAY_CAP);
 
   // Re-seed the draft once the column list arrives (it may load after the dialog opens).
+  // An empty applied selection stays visually empty because it means "no filter".
   useEffect(() => {
-    setDraft(new Set(applied.length === 0 ? allKeys : applied));
+    setDraft(new Set(applied));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allKeys]);
+  }, [columns]);
 
   const needle = query.trim().toLowerCase();
   const filtered = useMemo(() => {
@@ -3308,14 +3313,16 @@ function TestItemFilterDialog({
           />
           <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
             <span className="tabular-nums">
-              已选 {draft.size.toLocaleString()} / {columns.length.toLocaleString()}
+              {draft.size === 0
+                ? "未筛选，当前显示全部"
+                : `已选 ${draft.size.toLocaleString()} / ${columns.length.toLocaleString()}`}
             </span>
             <span className="flex gap-3">
               <button type="button" className="text-primary hover:underline" onClick={selectMatches}>
-                全选{needle ? "（匹配）" : ""}
+                {needle ? "选择匹配项" : "选择全部"}
               </button>
               <button type="button" className="text-primary hover:underline" onClick={clearMatches}>
-                取消全选{needle ? "（匹配）" : ""}
+                {needle ? "取消匹配项" : "取消全部"}
               </button>
             </span>
           </div>
@@ -3364,8 +3371,11 @@ function TestItemFilterDialog({
           <button
             type="button"
             className={BTN_PRIMARY}
-            disabled={draft.size === 0}
-            onClick={() => onConfirm(draft.size === columns.length ? [] : Array.from(draft))}
+            onClick={() =>
+              onConfirm(
+                columns.filter((column) => draft.has(column.key)).map((column) => column.key)
+              )
+            }
           >
             确认
           </button>
