@@ -38,6 +38,28 @@ pub struct ParsedRecord {
     /// serialized or stored.
     #[serde(skip)]
     pub mpr_results: Option<Vec<f32>>,
+    /// Structural problem found while decoding this record. Kept out of the
+    /// stored/serialized record shape; the session-level diagnostics collector
+    /// turns it into a bounded, human-readable file issue summary.
+    #[serde(skip)]
+    pub parse_issue: Option<RecordParseIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordParseIssue {
+    pub kind: RecordParseIssueKind,
+    pub field_name: &'static str,
+    pub expected_bytes: usize,
+    pub remaining_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordParseIssueKind {
+    RequiredFieldMissing,
+    FixedFieldTruncated,
+    DeclaredLengthExceedsRecord,
+    ArrayExceedsRecord,
+    UnexpectedTrailingBytes,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -92,8 +114,22 @@ pub enum RecordStatus {
 pub enum ParserError {
     #[error("读取 STDF 失败: {0}")]
     Io(#[from] io::Error),
-    #[error("record payload 不完整: offset {offset}, 需要 {expected} 字节")]
-    TruncatedPayload { offset: u64, expected: usize },
+    #[error(
+        "文件末尾的 record header 不完整: offset {offset}, 需要 4 字节，实际只有 {available} 字节"
+    )]
+    TruncatedHeader { offset: u64, available: usize },
+    #[error(
+        "record payload 不完整: offset {offset}, REC_TYP={rec_typ}, REC_SUB={rec_sub}, 声明需要 {expected} 字节，实际只有 {available} 字节"
+    )]
+    TruncatedPayload {
+        offset: u64,
+        expected: usize,
+        available: usize,
+        rec_typ: u8,
+        rec_sub: u8,
+    },
+    #[error("文件使用了当前版本不支持的 big-endian STDF 字节序: offset {offset}")]
+    UnsupportedByteOrder { offset: u64 },
 }
 
 pub fn parse_reader<R: Read>(
@@ -109,31 +145,63 @@ pub fn parse_reader<R: Read>(
     let mut payload = Vec::<u8>::new();
     loop {
         let mut header = [0_u8; 4];
-        match reader.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(error) => return Err(ParserError::Io(error)),
+        let mut header_read = 0_usize;
+        while header_read < header.len() {
+            match reader.read(&mut header[header_read..]) {
+                Ok(0) if header_read == 0 => return Ok(()),
+                Ok(0) => {
+                    return Err(ParserError::TruncatedHeader {
+                        offset,
+                        available: header_read,
+                    });
+                }
+                Ok(read) => header_read += read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(ParserError::Io(error)),
+            }
         }
 
         let length = u16::from_le_bytes([header[0], header[1]]);
         let rec_typ = header[2];
         let rec_sub = header[3];
+        if offset == 0
+            && (rec_typ, rec_sub) == (0, 10)
+            && length != 2
+            && u16::from_be_bytes([header[0], header[1]]) == 2
+        {
+            return Err(ParserError::UnsupportedByteOrder { offset });
+        }
         let len = length as usize;
         if payload.len() < len {
             payload.resize(len, 0);
         }
         let payload_start = offset + 4;
-        if let Err(error) = reader.read_exact(&mut payload[..len]) {
-            if error.kind() == io::ErrorKind::UnexpectedEof {
-                return Err(ParserError::TruncatedPayload {
-                    offset,
-                    expected: len,
-                });
+        let mut payload_read = 0_usize;
+        while payload_read < len {
+            match reader.read(&mut payload[payload_read..len]) {
+                Ok(0) => {
+                    return Err(ParserError::TruncatedPayload {
+                        offset,
+                        expected: len,
+                        available: payload_read,
+                        rec_typ,
+                        rec_sub,
+                    });
+                }
+                Ok(read) => payload_read += read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(ParserError::Io(error)),
             }
-            return Err(ParserError::Io(error));
         }
 
-        let record = parse_record(rec_typ, rec_sub, offset, length, payload_start, &payload[..len]);
+        let record = parse_record(
+            rec_typ,
+            rec_sub,
+            offset,
+            length,
+            payload_start,
+            &payload[..len],
+        );
         offset += 4 + u64::from(length);
         if !on_record(record) {
             break;
@@ -153,13 +221,18 @@ fn parse_record(
 ) -> ParsedRecord {
     let record_type = record_name(rec_typ, rec_sub);
     let mut cursor = FieldCursor::new(payload_start, payload);
-    let (fields, has_required_error) = if matches!((rec_typ, rec_sub), (50, 10) | (50, 30)) {
-        (Vec::new(), false)
-    } else if let Some(specs) = record_specs(rec_typ, rec_sub) {
-        cursor.parse_specs(specs)
-    } else {
-        (raw_preview_field(payload_start, length, payload), false)
-    };
+    let (fields, has_required_error, parse_issue) =
+        if matches!((rec_typ, rec_sub), (50, 10) | (50, 30)) {
+            (Vec::new(), false, None)
+        } else if let Some(specs) = record_specs(rec_typ, rec_sub) {
+            cursor.parse_specs(specs)
+        } else {
+            (
+                raw_preview_field(payload_start, length, payload),
+                false,
+                None,
+            )
+        };
     let status = if has_required_error {
         RecordStatus::Error
     } else if record_type == "UNKNOWN" {
@@ -181,6 +254,7 @@ fn parse_record(
         fields,
         status,
         mpr_results,
+        parse_issue,
     }
 }
 
@@ -681,6 +755,7 @@ struct FieldCursor<'a> {
     cursor: usize,
     payload: &'a [u8],
     had_truncation: bool,
+    first_issue: Option<RecordParseIssue>,
 }
 
 impl<'a> FieldCursor<'a> {
@@ -690,10 +765,14 @@ impl<'a> FieldCursor<'a> {
             cursor: 0,
             payload,
             had_truncation: false,
+            first_issue: None,
         }
     }
 
-    fn parse_specs(&mut self, specs: &[FieldSpec]) -> (Vec<ParsedField>, bool) {
+    fn parse_specs(
+        &mut self,
+        specs: &[FieldSpec],
+    ) -> (Vec<ParsedField>, bool, Option<RecordParseIssue>) {
         let mut values = Vec::<(&'static str, usize)>::new();
         let mut fields = Vec::with_capacity(specs.len());
         let mut has_required_error = false;
@@ -701,20 +780,53 @@ impl<'a> FieldCursor<'a> {
             let field = self.read_spec(spec, &values);
             if spec.required && field.offset.is_none() {
                 has_required_error = true;
+                if self.first_issue.is_none() {
+                    self.first_issue = Some(RecordParseIssue {
+                        kind: RecordParseIssueKind::RequiredFieldMissing,
+                        field_name: spec.name,
+                        expected_bytes: minimum_field_bytes(spec.kind),
+                        remaining_bytes: self.payload.len().saturating_sub(self.cursor),
+                    });
+                }
             }
             if let Some(value) = field.value.parse::<usize>().ok() {
                 values.push((spec.name, value));
             }
             fields.push(field);
         }
-        (fields, has_required_error || self.had_truncation)
+        if self.first_issue.is_none() && self.cursor < self.payload.len() {
+            self.first_issue = Some(RecordParseIssue {
+                kind: RecordParseIssueKind::UnexpectedTrailingBytes,
+                field_name: "RECORD_END",
+                expected_bytes: 0,
+                remaining_bytes: self.payload.len() - self.cursor,
+            });
+        }
+        (
+            fields,
+            has_required_error || self.had_truncation,
+            self.first_issue.clone(),
+        )
     }
 
-    fn read_spec(
+    fn mark_issue(
         &mut self,
-        spec: &FieldSpec,
-        values: &[(&'static str, usize)],
-    ) -> ParsedField {
+        kind: RecordParseIssueKind,
+        field_name: &'static str,
+        expected_bytes: usize,
+        remaining_bytes: usize,
+    ) {
+        if self.first_issue.is_none() {
+            self.first_issue = Some(RecordParseIssue {
+                kind,
+                field_name,
+                expected_bytes,
+                remaining_bytes,
+            });
+        }
+    }
+
+    fn read_spec(&mut self, spec: &FieldSpec, values: &[(&'static str, usize)]) -> ParsedField {
         match spec.kind {
             FieldKind::U1 => self.u1(spec.name, spec.field_type, spec.description),
             FieldKind::U2 => self.u2(spec.name, spec.field_type, spec.description),
@@ -767,61 +879,116 @@ impl<'a> FieldCursor<'a> {
         }
     }
 
-    fn u1(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
+    fn u1(
+        &mut self,
+        name: &'static str,
+        field_type: &'static str,
+        description: &'static str,
+    ) -> ParsedField {
         self.fixed(name, field_type, description, 1, |bytes| {
             itoa_string(bytes[0])
         })
     }
 
-    fn u2(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
+    fn u2(
+        &mut self,
+        name: &'static str,
+        field_type: &'static str,
+        description: &'static str,
+    ) -> ParsedField {
         self.fixed(name, field_type, description, 2, |bytes| {
             itoa_string(u16::from_le_bytes([bytes[0], bytes[1]]))
         })
     }
 
-    fn u4(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
+    fn u4(
+        &mut self,
+        name: &'static str,
+        field_type: &'static str,
+        description: &'static str,
+    ) -> ParsedField {
         self.fixed(name, field_type, description, 4, |bytes| {
             itoa_string(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
         })
     }
 
-    fn i1(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
+    fn i1(
+        &mut self,
+        name: &'static str,
+        field_type: &'static str,
+        description: &'static str,
+    ) -> ParsedField {
         self.fixed(name, field_type, description, 1, |bytes| {
             itoa_string(bytes[0] as i8)
         })
     }
 
-    fn i2(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
+    fn i2(
+        &mut self,
+        name: &'static str,
+        field_type: &'static str,
+        description: &'static str,
+    ) -> ParsedField {
         self.fixed(name, field_type, description, 2, |bytes| {
             itoa_string(i16::from_le_bytes([bytes[0], bytes[1]]))
         })
     }
 
-    fn i4(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
+    fn i4(
+        &mut self,
+        name: &'static str,
+        field_type: &'static str,
+        description: &'static str,
+    ) -> ParsedField {
         self.fixed(name, field_type, description, 4, |bytes| {
             itoa_string(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
         })
     }
 
-    fn r4(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
+    fn r4(
+        &mut self,
+        name: &'static str,
+        field_type: &'static str,
+        description: &'static str,
+    ) -> ParsedField {
         self.fixed(name, field_type, description, 4, |bytes| {
             // fmt Display on purpose (not ryu): output must stay byte-identical
             // to the previous to_string() ("1", not "1.0"; no exponent form).
-            format_compact!("{}", f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            format_compact!(
+                "{}",
+                f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            )
         })
     }
 
-    fn c1(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
-        self.fixed(name, field_type, description, 1, |bytes| lossy_compact(bytes))
+    fn c1(
+        &mut self,
+        name: &'static str,
+        field_type: &'static str,
+        description: &'static str,
+    ) -> ParsedField {
+        self.fixed(name, field_type, description, 1, |bytes| {
+            lossy_compact(bytes)
+        })
     }
 
-    fn b1(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
+    fn b1(
+        &mut self,
+        name: &'static str,
+        field_type: &'static str,
+        description: &'static str,
+    ) -> ParsedField {
         self.fixed(name, field_type, description, 1, |bytes| {
             format_compact!("0b{:08b}", bytes[0])
         })
     }
 
-    fn cn(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
+    fn cn(
+        &mut self,
+        name: &'static str,
+        field_type: &'static str,
+        description: &'static str,
+    ) -> ParsedField {
         let start = self.cursor;
         if start >= self.payload.len() {
             return self.missing(name, field_type, description);
@@ -831,6 +998,12 @@ impl<'a> FieldCursor<'a> {
         let expected_end = value_start.saturating_add(len);
         if expected_end > self.payload.len() {
             self.had_truncation = true;
+            self.mark_issue(
+                RecordParseIssueKind::DeclaredLengthExceedsRecord,
+                name,
+                len,
+                self.payload.len().saturating_sub(value_start),
+            );
         }
         let value_end = expected_end.min(self.payload.len());
         self.cursor = value_end;
@@ -844,7 +1017,12 @@ impl<'a> FieldCursor<'a> {
         }
     }
 
-    fn bn(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
+    fn bn(
+        &mut self,
+        name: &'static str,
+        field_type: &'static str,
+        description: &'static str,
+    ) -> ParsedField {
         let start = self.cursor;
         if start >= self.payload.len() {
             return self.missing(name, field_type, description);
@@ -854,6 +1032,12 @@ impl<'a> FieldCursor<'a> {
         let expected_end = value_start.saturating_add(len);
         if expected_end > self.payload.len() {
             self.had_truncation = true;
+            self.mark_issue(
+                RecordParseIssueKind::DeclaredLengthExceedsRecord,
+                name,
+                len,
+                self.payload.len().saturating_sub(value_start),
+            );
         }
         let value_end = expected_end.min(self.payload.len());
         self.cursor = value_end;
@@ -867,11 +1051,22 @@ impl<'a> FieldCursor<'a> {
         }
     }
 
-    fn dn(&mut self, name: &'static str, field_type: &'static str, description: &'static str) -> ParsedField {
+    fn dn(
+        &mut self,
+        name: &'static str,
+        field_type: &'static str,
+        description: &'static str,
+    ) -> ParsedField {
         let start = self.cursor;
         if start + 2 > self.payload.len() {
             if start < self.payload.len() {
                 self.had_truncation = true;
+                self.mark_issue(
+                    RecordParseIssueKind::FixedFieldTruncated,
+                    name,
+                    2,
+                    self.payload.len() - start,
+                );
             }
             self.cursor = self.payload.len();
             return self.missing(name, field_type, description);
@@ -882,6 +1077,12 @@ impl<'a> FieldCursor<'a> {
         let expected_end = value_start.saturating_add(byte_count);
         if expected_end > self.payload.len() {
             self.had_truncation = true;
+            self.mark_issue(
+                RecordParseIssueKind::DeclaredLengthExceedsRecord,
+                name,
+                byte_count,
+                self.payload.len().saturating_sub(value_start),
+            );
         }
         let value_end = expected_end.min(self.payload.len());
         self.cursor = value_end;
@@ -918,6 +1119,12 @@ impl<'a> FieldCursor<'a> {
         if end > self.payload.len() {
             if start < self.payload.len() {
                 self.had_truncation = true;
+                self.mark_issue(
+                    RecordParseIssueKind::ArrayExceedsRecord,
+                    name,
+                    total_len,
+                    self.payload.len() - start,
+                );
             }
             self.cursor = self.payload.len();
             return self.missing(name, field_type, description);
@@ -960,6 +1167,12 @@ impl<'a> FieldCursor<'a> {
             let expected_end = value_start.saturating_add(len);
             if expected_end > self.payload.len() {
                 self.had_truncation = true;
+                self.mark_issue(
+                    RecordParseIssueKind::ArrayExceedsRecord,
+                    name,
+                    len,
+                    self.payload.len().saturating_sub(value_start),
+                );
             }
             let value_end = expected_end.min(self.payload.len());
             values.push(String::from_utf8_lossy(&self.payload[value_start..value_end]).to_string());
@@ -991,6 +1204,12 @@ impl<'a> FieldCursor<'a> {
         if end > self.payload.len() {
             if start < self.payload.len() {
                 self.had_truncation = true;
+                self.mark_issue(
+                    RecordParseIssueKind::ArrayExceedsRecord,
+                    name,
+                    byte_count,
+                    self.payload.len() - start,
+                );
             }
             self.cursor = self.payload.len();
             return self.missing(name, field_type, description);
@@ -1043,6 +1262,12 @@ impl<'a> FieldCursor<'a> {
         if end > self.payload.len() {
             if start < self.payload.len() {
                 self.had_truncation = true;
+                self.mark_issue(
+                    RecordParseIssueKind::FixedFieldTruncated,
+                    name,
+                    len,
+                    self.payload.len() - start,
+                );
             }
             self.cursor = self.payload.len();
             return self.missing(name, field_type, description);
@@ -1072,6 +1297,20 @@ impl<'a> FieldCursor<'a> {
             offset: None,
             length: None,
         }
+    }
+}
+
+fn minimum_field_bytes(kind: FieldKind) -> usize {
+    match kind {
+        FieldKind::U1 | FieldKind::I1 | FieldKind::C1 | FieldKind::B1 => 1,
+        FieldKind::U2 | FieldKind::I2 | FieldKind::Dn => 2,
+        FieldKind::U4 | FieldKind::I4 | FieldKind::R4 => 4,
+        FieldKind::Cn | FieldKind::Bn => 1,
+        FieldKind::ArrayU1(_)
+        | FieldKind::ArrayU2(_)
+        | FieldKind::ArrayR4(_)
+        | FieldKind::ArrayCn(_)
+        | FieldKind::ArrayN1(_) => 0,
     }
 }
 

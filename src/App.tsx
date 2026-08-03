@@ -1,9 +1,11 @@
 import {
   AlertCircle,
+  AlertTriangle,
   ArrowLeftRight,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   CircleDot,
   Download,
   FileText,
@@ -30,6 +32,7 @@ import { createPortal } from "react-dom";
 import { computeMatrixWindow } from "./matrixWindow";
 import type {
   MprPinDetails,
+  FileIssue,
   ParseErrorEvent,
   ParseProgress,
   ParseSession,
@@ -898,6 +901,7 @@ export default function App({ api = tauriApi }: AppProps) {
                 keyFields={keyFields}
                 groups={groups}
                 binSummary={binSummary}
+                issues={snapshot?.issues ?? []}
                 onOpenRecordType={(type) => {
                   setSelectedGroup(type);
                   setCursor(0);
@@ -1318,12 +1322,14 @@ function OverviewView({
   keyFields,
   groups,
   binSummary,
+  issues,
   onOpenRecordType
 }: {
   session: ParseSession;
   keyFields: Record<string, RecordField[]>;
   groups: RecordGroup[];
   binSummary: BinSummary | null;
+  issues: FileIssue[];
   onOpenRecordType(recordType: string): void;
 }) {
   // Auto-detect: CP files carry wafer records (WIR/WRR); otherwise FT. The
@@ -1354,6 +1360,7 @@ function OverviewView({
     // so the whole page scrolls instead of squeezing sections into the viewport.
     // Section enter is staggered via --stagger for a light "灵动" cascade.
     <section className={`flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto ${PAGE_PAD}`}>
+      <FileIssuesPanel issues={issues} complete={complete} />
       <BinYieldCard summary={binSummary} complete={complete} />
       <section
         className="fade-rise flex min-w-0 shrink-0 flex-col rounded-xl border border-border/60 bg-card p-4 shadow-card"
@@ -1420,6 +1427,129 @@ function OverviewView({
         </div>
       </section>
       <PairStats groups={groups} complete={complete} />
+    </section>
+  );
+}
+
+function FileIssuesPanel({ issues, complete }: { issues: FileIssue[]; complete: boolean }) {
+  if (issues.length === 0) return null;
+
+  const errorCount = issues
+    .filter((issue) => issue.severity === "error")
+    .reduce((sum, issue) => sum + issue.count, 0);
+  const warningCount = issues
+    .filter((issue) => issue.severity === "warning")
+    .reduce((sum, issue) => sum + issue.count, 0);
+  const affectsAccuracy = issues.some((issue) => issue.affects_accuracy);
+
+  return (
+    <section
+      className="fade-rise shrink-0 overflow-hidden rounded-xl border border-danger-border/70 bg-card shadow-card"
+      aria-label="文件检查"
+      style={{ ["--stagger" as string]: 0 }}
+    >
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-danger-border/60 bg-danger-soft px-4 py-3.5">
+        <div className="flex min-w-0 items-start gap-3">
+          <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-danger text-white">
+            <AlertTriangle size={18} aria-hidden="true" />
+          </span>
+          <div className="min-w-0">
+            <h2 className="text-[15px] font-semibold text-foreground">文件检查发现问题</h2>
+            <p className="mt-0.5 max-w-[760px] text-sm leading-5 text-muted-foreground">
+              {complete ? "文件已继续解析完成。" : "软件正在继续解析文件。"}
+              {affectsAccuracy
+                ? "部分位置之后的记录、良率和统计结果可能不准确，请优先查看第一处错误。"
+                : "已读取的内容仍可查看，下面列出了需要留意的位置。"}
+            </p>
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-2 text-xs tabular-nums">
+          {errorCount > 0 && (
+            <span className="inline-flex items-center gap-1.5 rounded-md border border-danger-border bg-card px-2 py-1 font-medium text-danger">
+              <AlertCircle size={13} aria-hidden="true" />
+              {errorCount.toLocaleString()} 个错误
+            </span>
+          )}
+          {warningCount > 0 && (
+            <span className="inline-flex items-center gap-1.5 rounded-md border border-warning-border bg-card px-2 py-1 font-medium text-warning">
+              <AlertTriangle size={13} aria-hidden="true" />
+              {warningCount.toLocaleString()} 个提醒
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="divide-y divide-border">
+        {issues.map((issue, index) => {
+          const error = issue.severity === "error";
+          const Icon = error ? AlertCircle : AlertTriangle;
+          return (
+            <article key={issue.code} className="px-4 py-3.5">
+              <div className="flex items-start gap-3">
+                <Icon
+                  size={17}
+                  aria-hidden="true"
+                  className={`mt-0.5 shrink-0 ${error ? "text-danger" : "text-warning"}`}
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <h3 className="text-sm font-semibold text-foreground">{issue.title}</h3>
+                    {issue.count > 1 && (
+                      <span className="text-xs tabular-nums text-muted-foreground">
+                        共 {issue.count.toLocaleString()} 处
+                      </span>
+                    )}
+                    {index === 0 && issue.affects_accuracy && (
+                      <span className="rounded bg-danger-soft px-1.5 py-0.5 text-[11px] font-medium text-danger">
+                        建议优先处理
+                      </span>
+                    )}
+                  </div>
+                  <p className="mt-1 text-sm leading-6 text-muted-foreground">{issue.message}</p>
+                  <p className="mt-1 text-sm leading-6 text-foreground">
+                    <span className="font-medium">建议：</span>
+                    {issue.suggestion}
+                  </p>
+
+                  {issue.samples.length > 0 && (
+                    <details className="group mt-2.5">
+                      <summary className="inline-flex cursor-pointer list-none items-center gap-1 text-xs font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+                        查看位置与技术信息
+                        <ChevronDown
+                          size={14}
+                          aria-hidden="true"
+                          className="transition-transform group-open:rotate-180"
+                        />
+                      </summary>
+                      <div className="mt-2 overflow-hidden rounded-md border border-border bg-muted/45">
+                        {issue.samples.map((sample, sampleIndex) => (
+                          <div
+                            key={`${sample.offset}-${sampleIndex}`}
+                            className="border-b border-border px-3 py-2.5 last:border-b-0"
+                          >
+                            <div className="flex flex-wrap gap-x-2 text-xs text-muted-foreground">
+                              {sample.record_index != null && (
+                                <span>第 {(sample.record_index + 1).toLocaleString()} 条 record</span>
+                              )}
+                              <span>{sample.record_type}</span>
+                              <span>
+                                文件位置 {formatBytes(sample.offset)}（byte {sample.offset.toLocaleString()}）
+                              </span>
+                            </div>
+                            <p className="mt-1 break-words font-mono text-[11px] leading-5 text-foreground">
+                              {sample.detail}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  )}
+                </div>
+              </div>
+            </article>
+          );
+        })}
+      </div>
     </section>
   );
 }

@@ -153,7 +153,8 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
     },
     bytes_read: 128,
     total_bytes: 1024,
-    status: "running"
+    status: "running",
+    issues: []
   };
 
   const testItemPage: TestItemPage = {
