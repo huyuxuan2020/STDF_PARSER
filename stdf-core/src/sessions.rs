@@ -1,9 +1,11 @@
+use crate::diagnostics::{FileIssue, FileIssueCollector};
 use crate::parser::{
     parse_reader, ParseErrorEvent, ParseProgress, ParsedRecord, ParserError, RecordStatus,
 };
 use serde::Deserialize;
 use serde::Serialize;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::{
     collections::HashMap,
     fs::File,
@@ -22,8 +24,8 @@ use flate2::read::ZlibDecoder;
 // FxHashMap on the per-record maps: SipHash showed up in parse profiles at
 // 26M records × several map touches each; Fx is a keyed-DoS-free context
 // (local temp index), so the cheaper hash is a straight win.
-use rustc_hash::FxHashMap;
 use rusqlite::{params, Connection, OptionalExtension};
+use rustc_hash::FxHashMap;
 
 const SQLITE_COMMIT_BATCH_SIZE: usize = 50_000;
 const PROGRESS_STEP_BYTES: u64 = 8 * 1_048_576;
@@ -114,6 +116,7 @@ pub struct SessionSnapshot {
     pub bytes_read: u64,
     pub total_bytes: u64,
     pub status: ParseStatus,
+    pub issues: Vec<FileIssue>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -337,18 +340,8 @@ struct TestItemAccumulator {
 /// TEST_TXT/ALARM_ID. C_*FMT / LO_SPEC / HI_SPEC are included because they
 /// share the same inheritance rule even though most files omit them.
 const INHERITABLE_FIELD_NAMES: &[&str] = &[
-    "OPT_FLAG",
-    "RES_SCAL",
-    "LLM_SCAL",
-    "HLM_SCAL",
-    "LO_LIMIT",
-    "HI_LIMIT",
-    "UNITS",
-    "C_RESFMT",
-    "C_LLMFMT",
-    "C_HLMFMT",
-    "LO_SPEC",
-    "HI_SPEC",
+    "OPT_FLAG", "RES_SCAL", "LLM_SCAL", "HLM_SCAL", "LO_LIMIT", "HI_LIMIT", "UNITS", "C_RESFMT",
+    "C_LLMFMT", "C_HLMFMT", "LO_SPEC", "HI_SPEC",
 ];
 
 /// Wrapper returned by `get_record_fields`. `inherited_value` is populated
@@ -370,14 +363,7 @@ enum StoredField {
 }
 
 #[derive(Deserialize)]
-struct CompactFieldOwned(
-    String,
-    String,
-    String,
-    String,
-    Option<u64>,
-    Option<u16>,
-);
+struct CompactFieldOwned(String, String, String, String, Option<u64>, Option<u16>);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SearchResult {
@@ -509,6 +495,7 @@ impl SessionManager {
             bytes_read: 0,
             total_bytes: metadata.len(),
             status: ParseStatus::Running,
+            issues: Vec::new(),
         };
         let cancel_flag = Arc::new(AtomicBool::new(false));
         // The viewer shows one file at a time: opening a new file evicts every
@@ -563,13 +550,13 @@ impl SessionManager {
             };
 
             let mut index = 0_usize;
-            let mut first_record_type: Option<&'static str> = None;
             // Per-record-type position counters (parse order). Stored as
             // `group_idx` so record pages seek by (record_type, group_idx)
             // instead of walking an OFFSET.
             let mut group_counters: FxHashMap<&'static str, usize> = FxHashMap::default();
             let mut last_progress_bytes = 0_u64;
             let mut last_snapshot_bytes = 0_u64;
+            let issue_collector = RefCell::new(FileIssueCollector::default());
 
             // Validate the insert against the fresh schema up front so a broken
             // schema still aborts the parse with an error event (per-row insert
@@ -630,9 +617,7 @@ impl SessionManager {
                         if cancel_flag.load(Ordering::SeqCst) {
                             return false;
                         }
-                        if first_record_type.is_none() {
-                            first_record_type = Some(record.record_type);
-                        }
+                        issue_collector.borrow_mut().observe(&record, index);
                         // Snapshot bookkeeping and the test-item accumulator share
                         // one lock acquisition — this runs once per record.
                         let snapshot_changed = apply_record_to_session(
@@ -644,15 +629,15 @@ impl SessionManager {
                             parse_total,
                         );
                         if snapshot_changed {
+                            let issues = issue_collector.borrow();
+                            update_snapshot_issues(&sessions, &session_id, issues.issues());
                             if let Some(snapshot) = get_snapshot_clone(&sessions, &session_id) {
                                 on_event(SessionEvent::Snapshot(snapshot));
                             }
                         }
                         let fields_blob = encode_fields_blob(&record);
                         let group_idx = {
-                            let counter = group_counters
-                                .entry(record.record_type)
-                                .or_insert(0);
+                            let counter = group_counters.entry(record.record_type).or_insert(0);
                             let position = *counter;
                             *counter += 1;
                             position
@@ -681,17 +666,18 @@ impl SessionManager {
                                 bytes_read,
                                 total_bytes,
                             }));
-                            let should_emit_snapshot =
-                                bytes_read == total_bytes
-                                    || bytes_read.saturating_sub(last_snapshot_bytes)
-                                        >= PROGRESS_STEP_BYTES;
+                            let should_emit_snapshot = bytes_read == total_bytes
+                                || bytes_read.saturating_sub(last_snapshot_bytes)
+                                    >= PROGRESS_STEP_BYTES;
                             if should_emit_snapshot {
                                 last_snapshot_bytes = bytes_read;
+                                let issues = issue_collector.borrow();
                                 if let Some(snapshot) = update_snapshot_progress(
                                     &sessions,
                                     &session_id,
                                     bytes_read,
                                     total_bytes,
+                                    issues.issues(),
                                 ) {
                                     on_event(SessionEvent::Snapshot(snapshot));
                                 }
@@ -718,27 +704,17 @@ impl SessionManager {
             };
 
             let cancelled = cancel_flag.load(Ordering::SeqCst);
-            // A truncated tail (incomplete touchdown record) is NOT fatal — keep what parsed.
-            // Only real I/O failures are fatal errors.
-            let fatal = matches!(&result, Err(ParserError::Io(_)));
-
-            // Collect non-fatal warnings about abnormal-but-parseable files.
-            let mut warnings: Vec<String> = Vec::new();
             if !cancelled {
-                if index == 0 {
-                    warnings.push("文件为空或未解析到任何标准 record。".to_string());
-                } else if first_record_type != Some("FAR") {
-                    warnings.push(format!(
-                        "文件未以 FAR 记录开头（首条为 {}），非标准 STDF；已按现有内容解析。",
-                        first_record_type.unwrap_or("未知")
-                    ));
-                }
-                if let Err(ParserError::TruncatedPayload { offset, expected }) = &result {
-                    warnings.push(format!(
-                        "文件末尾存在不完整记录（offset {offset} 处需要 {expected} 字节，可能是 touchdown 截断）；已解析前 {index} 条。"
-                    ));
-                }
+                let mut issues = issue_collector.borrow_mut();
+                issues.finish(result.as_ref().err());
+                update_snapshot_issues(&sessions, &session_id, issues.issues());
             }
+            // Truncated tails remain non-fatal so all complete records stay
+            // available. I/O and unsupported byte order cannot continue safely.
+            let fatal = matches!(
+                &result,
+                Err(ParserError::Io(_) | ParserError::UnsupportedByteOrder { .. })
+            );
 
             let status = if cancelled {
                 ParseStatus::Cancelled
@@ -753,14 +729,6 @@ impl SessionManager {
                     state.snapshot.status = status.clone();
                     state.session.status = status;
                 }
-            }
-
-            if !cancelled && !warnings.is_empty() {
-                on_event(SessionEvent::Warning(ParseErrorEvent {
-                    session_id: session_id.clone(),
-                    message: warnings.join("；"),
-                    offset: None,
-                }));
             }
 
             if fatal {
@@ -978,21 +946,17 @@ impl SessionManager {
         // For PTR/MPR, look up the first-record defaults keyed by TEST_NUM so
         // omitted RES_SCAL/UNITS/LO_LIMIT/... show what they effectively are.
         let inherited = if matches!(record_type.as_str(), "PTR" | "MPR") {
-            let test_num = field_value(&fields, "TEST_NUM")
-                .parse::<u32>()
-                .unwrap_or(0);
+            let test_num = field_value(&fields, "TEST_NUM").parse::<u32>().unwrap_or(0);
             self.sessions
                 .lock()
                 .ok()
                 .and_then(|guard| {
-                    guard
-                        .get(session_id)
-                        .and_then(|s| {
-                            s.test_items
-                                .inheritable_defaults
-                                .get(&(record_type.clone(), test_num))
-                                .cloned()
-                        })
+                    guard.get(session_id).and_then(|s| {
+                        s.test_items
+                            .inheritable_defaults
+                            .get(&(record_type.clone(), test_num))
+                            .cloned()
+                    })
                 })
                 .unwrap_or_default()
         } else {
@@ -1285,10 +1249,14 @@ impl SessionManager {
                 let raw_text = stored.to_string();
                 let parsed = parse_float(&raw_text);
                 let status = parsed
-                    .map(|value| judge(to_base(value, meta.res_scal), meta.low_base, meta.high_base))
+                    .map(|value| {
+                        judge(to_base(value, meta.res_scal), meta.low_base, meta.high_base)
+                    })
                     .unwrap_or_default();
                 let value = match parsed {
-                    Some(value) if meta.res_scal != 0 => format_num(to_display(value, meta.res_scal)),
+                    Some(value) if meta.res_scal != 0 => {
+                        format_num(to_display(value, meta.res_scal))
+                    }
                     _ => raw_text,
                 };
                 let pmr_index = rtn_indx
@@ -1367,7 +1335,9 @@ fn write_mpr_pins_xlsx(
 
     let title_fmt = Format::new().set_bold().set_font_size(14);
     let sub_fmt = Format::new().set_font_color(Color::RGB(LABEL_FG));
-    let label_fmt = Format::new().set_bold().set_font_color(Color::RGB(LABEL_FG));
+    let label_fmt = Format::new()
+        .set_bold()
+        .set_font_color(Color::RGB(LABEL_FG));
     let header_fmt = Format::new()
         .set_bold()
         .set_font_color(Color::White)
@@ -1378,18 +1348,26 @@ fn write_mpr_pins_xlsx(
 
     // Base / zebra / fail variants for each visual column kind. Numbers keep
     // Excel-native formatting so the values stay computable.
-    let base = || Format::new().set_border(FormatBorder::Thin).set_border_color(Color::RGB(0xE2E8F0));
+    let base = || {
+        Format::new()
+            .set_border(FormatBorder::Thin)
+            .set_border_color(Color::RGB(0xE2E8F0))
+    };
     let cell = base();
     let cell_zebra = base().set_background_color(Color::RGB(ZEBRA_BG));
     let cell_fail = base().set_background_color(Color::RGB(FAIL_BG));
     let num = base().set_align(FormatAlign::Right);
-    let num_zebra = base().set_align(FormatAlign::Right).set_background_color(Color::RGB(ZEBRA_BG));
+    let num_zebra = base()
+        .set_align(FormatAlign::Right)
+        .set_background_color(Color::RGB(ZEBRA_BG));
     let num_fail = base()
         .set_align(FormatAlign::Right)
         .set_bold()
         .set_font_color(Color::RGB(FAIL_FG))
         .set_background_color(Color::RGB(FAIL_BG));
-    let status_pass = base().set_align(FormatAlign::Center).set_font_color(Color::RGB(PASS_FG));
+    let status_pass = base()
+        .set_align(FormatAlign::Center)
+        .set_font_color(Color::RGB(PASS_FG));
     let status_pass_zebra = base()
         .set_align(FormatAlign::Center)
         .set_font_color(Color::RGB(PASS_FG))
@@ -1405,14 +1383,18 @@ fn write_mpr_pins_xlsx(
     } else {
         details.test_name.clone()
     };
-    sheet.merge_range(0, 0, 0, 4, &title, &title_fmt).map_err(err)?;
+    sheet
+        .merge_range(0, 0, 0, 4, &title, &title_fmt)
+        .map_err(err)?;
     let subtitle = format!(
         "MPR 测试编号 {} · Part {} · Site {}",
         details.test_num,
         if part_id.is_empty() { "-" } else { part_id },
         if site_num.is_empty() { "-" } else { site_num },
     );
-    sheet.merge_range(1, 0, 1, 4, &subtitle, &sub_fmt).map_err(err)?;
+    sheet
+        .merge_range(1, 0, 1, 4, &subtitle, &sub_fmt)
+        .map_err(err)?;
 
     let fail_count = details.pins.iter().filter(|pin| pin.status == "F").count();
     let unit_suffix = if details.unit.is_empty() {
@@ -1421,8 +1403,14 @@ fn write_mpr_pins_xlsx(
         format!(" ({})", details.unit)
     };
     let meta_rows: [(String, String); 4] = [
-        (format!("下限{unit_suffix}"), display_or_dash(&details.low_limit)),
-        (format!("上限{unit_suffix}"), display_or_dash(&details.high_limit)),
+        (
+            format!("下限{unit_suffix}"),
+            display_or_dash(&details.low_limit),
+        ),
+        (
+            format!("上限{unit_suffix}"),
+            display_or_dash(&details.high_limit),
+        ),
         ("Pin 数".to_string(), details.pins.len().to_string()),
         ("Fail 数".to_string(), fail_count.to_string()),
     ];
@@ -1481,7 +1469,9 @@ fn write_mpr_pins_xlsx(
             .write_with_format(row, 2, display_or_dash(&pin.pin_name), text_fmt)
             .map_err(err)?;
         match pin.value.parse::<f64>() {
-            Ok(number) => sheet.write_with_format(row, 3, number, num_fmt).map_err(err)?,
+            Ok(number) => sheet
+                .write_with_format(row, 3, number, num_fmt)
+                .map_err(err)?,
             Err(_) => sheet
                 .write_with_format(row, 3, display_or_dash(&pin.value), num_fmt)
                 .map_err(err)?,
@@ -1497,9 +1487,13 @@ fn write_mpr_pins_xlsx(
     sheet.set_column_width(2, 24).map_err(err)?;
     sheet.set_column_width(3, 14).map_err(err)?;
     sheet.set_column_width(4, 7).map_err(err)?;
-    sheet.set_freeze_panes(TABLE_HEADER_ROW + 1, 0).map_err(err)?;
+    sheet
+        .set_freeze_panes(TABLE_HEADER_ROW + 1, 0)
+        .map_err(err)?;
     if !details.pins.is_empty() {
-        sheet.autofilter(TABLE_HEADER_ROW, 0, last_row, 4).map_err(err)?;
+        sheet
+            .autofilter(TABLE_HEADER_ROW, 0, last_row, 4)
+            .map_err(err)?;
     }
 
     workbook.save(path).map_err(err)
@@ -1636,8 +1630,14 @@ fn apply_record_to_session(
     let Some(state) = guard.get_mut(session_id) else {
         return false;
     };
-    let changed =
-        update_session_snapshot(&mut state.snapshot, session_id, record, idx, bytes_read, total_bytes);
+    let changed = update_session_snapshot(
+        &mut state.snapshot,
+        session_id,
+        record,
+        idx,
+        bytes_read,
+        total_bytes,
+    );
     update_test_item_accumulator(
         &mut state.test_items,
         record.record_type,
@@ -1686,9 +1686,7 @@ fn update_session_snapshot(
         changed = true;
     }
 
-    if is_key_record(record.record_type)
-        && !snapshot.key_fields.contains_key(record.record_type)
-    {
+    if is_key_record(record.record_type) && !snapshot.key_fields.contains_key(record.record_type) {
         snapshot
             .key_fields
             .insert(record.record_type.to_string(), record.fields.to_vec());
@@ -1761,9 +1759,7 @@ fn update_test_item_accumulator(
             }
         }
         "PTR" | "FTR" | "MPR" => {
-            let test_num = field_value(fields, "TEST_NUM")
-                .parse::<u32>()
-                .unwrap_or(0);
+            let test_num = field_value(fields, "TEST_NUM").parse::<u32>().unwrap_or(0);
             let key = (record_type.to_string(), test_num);
             // The first PTR/MPR for a test establishes the column (limits, unit,
             // scaling). Later records for the same test usually omit those, so we
@@ -1785,8 +1781,13 @@ fn update_test_item_accumulator(
                 let test_name =
                     first_non_empty(fields, &["TEST_TXT", "TEST_NAM", "SEQ_NAME", "VECT_NAM"]);
                 let pmr_indices = first_non_empty_array(fields, &["RTN_INDX", "PGM_INDX"]);
-                let (column, meta) =
-                    resolve_column(record_type, test_num, test_name.to_string(), pmr_indices, fields);
+                let (column, meta) = resolve_column(
+                    record_type,
+                    test_num,
+                    test_name.to_string(),
+                    pmr_indices,
+                    fields,
+                );
                 acc.column_order.push(key.clone());
                 acc.columns_by_key.insert(key.clone(), column);
                 acc.column_meta.insert(key.clone(), meta);
@@ -1796,10 +1797,7 @@ fn update_test_item_accumulator(
             // group so the frontend can jump straight to this record in the
             // Records view. Counter increments in parse order (== rowid order).
             let position = {
-                let counter = acc
-                    .record_type_positions
-                    .entry(record_type)
-                    .or_insert(0);
+                let counter = acc.record_type_positions.entry(record_type).or_insert(0);
                 let p = *counter;
                 *counter += 1;
                 p
@@ -2182,10 +2180,22 @@ fn build_test_item_csv(snapshot: &SessionSnapshot, acc: &TestItemAccumulator) ->
     } else {
         format!("{} Rev {}", job, job_rev)
     };
-    let start_secs = key_field(snapshot, "MIR", "START_T").trim().parse::<i64>().ok();
-    let finish_secs = key_field(snapshot, "MRR", "FINISH_T").trim().parse::<i64>().ok();
-    let start = start_secs.filter(|s| *s > 0).map(format_unix).unwrap_or_default();
-    let finish = finish_secs.filter(|s| *s > 0).map(format_unix).unwrap_or_default();
+    let start_secs = key_field(snapshot, "MIR", "START_T")
+        .trim()
+        .parse::<i64>()
+        .ok();
+    let finish_secs = key_field(snapshot, "MRR", "FINISH_T")
+        .trim()
+        .parse::<i64>()
+        .ok();
+    let start = start_secs
+        .filter(|s| *s > 0)
+        .map(format_unix)
+        .unwrap_or_default();
+    let finish = finish_secs
+        .filter(|s| *s > 0)
+        .map(format_unix)
+        .unwrap_or_default();
     let total_time = match (start_secs, finish_secs) {
         (Some(s), Some(f)) if s > 0 && f >= s => format_duration(f - s),
         _ => String::new(),
@@ -2198,15 +2208,27 @@ fn build_test_item_csv(snapshot: &SessionSnapshot, acc: &TestItemAccumulator) ->
 
     push_meta(&mut out, &format!("Date:{}", start));
     push_meta(&mut out, &format!("Tester ID:{}", node));
-    push_meta(&mut out, &format!("User:{}", key_field(snapshot, "MIR", "OPER_NAM")));
+    push_meta(
+        &mut out,
+        &format!("User:{}", key_field(snapshot, "MIR", "OPER_NAM")),
+    );
     push_meta(&mut out, &format!("Program:{}", program));
     push_meta(&mut out, "Handler:");
     push_meta(&mut out, "Site: All Sites");
-    push_meta(&mut out, &format!("Lot Id:{}", key_field(snapshot, "MIR", "LOT_ID")));
+    push_meta(
+        &mut out,
+        &format!("Lot Id:{}", key_field(snapshot, "MIR", "LOT_ID")),
+    );
     if is_cp {
-        push_meta(&mut out, &format!("Wafer Id:{}", key_field(snapshot, "WIR", "WAFER_ID")));
+        push_meta(
+            &mut out,
+            &format!("Wafer Id:{}", key_field(snapshot, "WIR", "WAFER_ID")),
+        );
     } else {
-        push_meta(&mut out, &format!("Sblot Id:{}", key_field(snapshot, "MIR", "SBLOT_ID")));
+        push_meta(
+            &mut out,
+            &format!("Sblot Id:{}", key_field(snapshot, "MIR", "SBLOT_ID")),
+        );
     }
     push_meta(&mut out, "");
     push_meta(&mut out, &format!("Average Test Time(ms): {}", avg_t));
@@ -2217,22 +2239,45 @@ fn build_test_item_csv(snapshot: &SessionSnapshot, acc: &TestItemAccumulator) ->
     push_meta(&mut out, "");
     // Hard-bin summary section (its own Total / Pass / Fail).
     push_meta(&mut out, &format!("Total: {}", total));
-    push_meta(&mut out, &format!("Pass: {}   {}%", hbin_pass, pct(hbin_pass, total)));
-    push_meta(&mut out, &format!("Fail: {}   {}%", total - hbin_pass, pct(total - hbin_pass, total)));
+    push_meta(
+        &mut out,
+        &format!("Pass: {}   {}%", hbin_pass, pct(hbin_pass, total)),
+    );
+    push_meta(
+        &mut out,
+        &format!(
+            "Fail: {}   {}%",
+            total - hbin_pass,
+            pct(total - hbin_pass, total)
+        ),
+    );
     for bin in &bins.hbins {
         let label = if bin.name.is_empty() {
             format!("HBin[{}]", bin.num)
         } else {
             format!("HBin[{}] {}", bin.num, bin.name)
         };
-        push_meta(&mut out, &format!("{}  {}  {}%", label, bin.count, pct(bin.count, total)));
+        push_meta(
+            &mut out,
+            &format!("{}  {}  {}%", label, bin.count, pct(bin.count, total)),
+        );
     }
     push_meta(&mut out, "");
 
     // Soft-bin summary section (its own Total / Pass / Fail).
     push_meta(&mut out, &format!("Total: {}", total));
-    push_meta(&mut out, &format!("Pass: {}   {}%", sbin_pass, pct(sbin_pass, total)));
-    push_meta(&mut out, &format!("Fail: {}   {}%", total - sbin_pass, pct(total - sbin_pass, total)));
+    push_meta(
+        &mut out,
+        &format!("Pass: {}   {}%", sbin_pass, pct(sbin_pass, total)),
+    );
+    push_meta(
+        &mut out,
+        &format!(
+            "Fail: {}   {}%",
+            total - sbin_pass,
+            pct(total - sbin_pass, total)
+        ),
+    );
     for bin in &bins.sbins {
         let label = if bin.name.is_empty() {
             format!("SBin[{}]", bin.num)
@@ -2242,17 +2287,25 @@ fn build_test_item_csv(snapshot: &SessionSnapshot, acc: &TestItemAccumulator) ->
         let hbin = sbin_to_hbin.get(&bin.num).cloned().unwrap_or_default();
         push_meta(
             &mut out,
-            &format!("{}  {}  {}%  {}", label, bin.count, pct(bin.count, total), hbin),
+            &format!(
+                "{}  {}  {}%  {}",
+                label,
+                bin.count,
+                pct(bin.count, total),
+                hbin
+            ),
         );
     }
     push_meta(&mut out, "");
     push_meta(&mut out, "");
 
     // ----- header rows ----- (left columns: SITE_NUM, PART_ID, PASSFG, HARD_BIN, SOFT_BIN, T_TIME)
-    let mut labels: Vec<String> = ["SITE_NUM", "PART_ID", "PASSFG", "HARD_BIN", "SOFT_BIN", "T_TIME"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let mut labels: Vec<String> = [
+        "SITE_NUM", "PART_ID", "PASSFG", "HARD_BIN", "SOFT_BIN", "T_TIME",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     for col in &cols {
         labels.push(if col.test_name.is_empty() {
             format!("{}_{}", col.record_type, col.test_num)
@@ -2263,15 +2316,24 @@ fn build_test_item_csv(snapshot: &SessionSnapshot, acc: &TestItemAccumulator) ->
     push_row(&mut out, &labels);
 
     // "ms" sits under T_TIME (now the 6th left column).
-    let mut unit_row: Vec<String> = ["Unit", "", "", "", "", "ms"].iter().map(|s| s.to_string()).collect();
+    let mut unit_row: Vec<String> = ["Unit", "", "", "", "", "ms"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     unit_row.extend(cols.iter().map(|col| col.unit.clone()));
     push_row(&mut out, &unit_row);
 
-    let mut low_row: Vec<String> = ["LimitL", "", "", "", "", ""].iter().map(|s| s.to_string()).collect();
+    let mut low_row: Vec<String> = ["LimitL", "", "", "", "", ""]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     low_row.extend(cols.iter().map(|col| col.low_limit.clone()));
     push_row(&mut out, &low_row);
 
-    let mut high_row: Vec<String> = ["LimitU", "", "", "", "", ""].iter().map(|s| s.to_string()).collect();
+    let mut high_row: Vec<String> = ["LimitU", "", "", "", "", ""]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     high_row.extend(cols.iter().map(|col| col.high_limit.clone()));
     push_row(&mut out, &high_row);
 
@@ -2374,12 +2436,15 @@ fn build_test_item_page(
             results: page_cols
                 .iter()
                 .map(|(pos, _)| {
-                    row.results.get(*pos).cloned().unwrap_or_else(|| TestItemCell {
-                        value: String::new(),
-                        status: String::new(),
-                        record_position: None,
-                        summary: None,
-                    })
+                    row.results
+                        .get(*pos)
+                        .cloned()
+                        .unwrap_or_else(|| TestItemCell {
+                            value: String::new(),
+                            status: String::new(),
+                            record_position: None,
+                            summary: None,
+                        })
                 })
                 .collect(),
         })
@@ -2410,12 +2475,27 @@ fn update_snapshot_progress(
     session_id: &str,
     bytes_read: u64,
     total_bytes: u64,
+    issues: &[FileIssue],
 ) -> Option<SessionSnapshot> {
     let mut guard = sessions.lock().ok()?;
     let state = guard.get_mut(session_id)?;
     state.snapshot.bytes_read = bytes_read;
     state.snapshot.total_bytes = total_bytes;
+    state.snapshot.issues = issues.to_vec();
     Some(state.snapshot.clone())
+}
+
+fn update_snapshot_issues(
+    sessions: &Arc<Mutex<HashMap<String, SessionState>>>,
+    session_id: &str,
+    issues: &[FileIssue],
+) {
+    let Ok(mut guard) = sessions.lock() else {
+        return;
+    };
+    if let Some(state) = guard.get_mut(session_id) {
+        state.snapshot.issues = issues.to_vec();
+    }
 }
 
 fn get_snapshot_clone(
@@ -2725,7 +2805,9 @@ fn build_mpr_cell(
     let mut max = f64::NEG_INFINITY;
     let mut sum = 0.0_f64;
     for raw in &results {
-        let Some(value) = parse_float(raw) else { continue };
+        let Some(value) = parse_float(raw) else {
+            continue;
+        };
         match judge(to_base(value, meta.res_scal), meta.low_base, meta.high_base).as_str() {
             "P" => judged = true,
             "F" => {
@@ -2811,8 +2893,12 @@ fn read_mpr_arrays(payload: &[u8]) -> Option<MprRawArrays> {
     let mut pos = 0_usize;
     let test_num = u32::from_le_bytes(take(payload, &mut pos, 4)?.try_into().ok()?);
     take(payload, &mut pos, 4)?; // HEAD_NUM, SITE_NUM, TEST_FLG, PARM_FLG
-    let rtn_icnt = usize::from(u16::from_le_bytes(take(payload, &mut pos, 2)?.try_into().ok()?));
-    let rslt_cnt = usize::from(u16::from_le_bytes(take(payload, &mut pos, 2)?.try_into().ok()?));
+    let rtn_icnt = usize::from(u16::from_le_bytes(
+        take(payload, &mut pos, 2)?.try_into().ok()?,
+    ));
+    let rslt_cnt = usize::from(u16::from_le_bytes(
+        take(payload, &mut pos, 2)?.try_into().ok()?,
+    ));
     let mut arrays = MprRawArrays {
         test_num,
         rslt_values: Vec::new(),
@@ -2914,7 +3000,11 @@ fn scan_mpr_arrays(
 
 fn build_ftr_cell(fields: &[RecordField]) -> TestItemCell {
     let flag = field_value(fields, "TEST_FLG");
-    let status = if flag.contains("0b00000000") { "P" } else { "F" };
+    let status = if flag.contains("0b00000000") {
+        "P"
+    } else {
+        "F"
+    };
     TestItemCell {
         value: flag.to_string(),
         status: status.to_string(),
@@ -3034,7 +3124,9 @@ fn decode_fields_blob(fields_blob: &[u8]) -> Result<Vec<RecordField>, String> {
     let json = if fields_blob.first() == Some(&0x78) {
         let mut decoder = ZlibDecoder::new(fields_blob);
         let mut json = Vec::new();
-        decoder.read_to_end(&mut json).map_err(|error| error.to_string())?;
+        decoder
+            .read_to_end(&mut json)
+            .map_err(|error| error.to_string())?;
         json
     } else {
         fields_blob.to_vec()
@@ -3113,7 +3205,11 @@ fn read_blob_u16(blob: &[u8], cursor: &mut usize) -> Result<u16, String> {
     if end > blob.len() {
         return Err("字段缓存不完整".to_string());
     }
-    let value = u16::from_le_bytes(blob[*cursor..end].try_into().map_err(|_| "字段缓存不完整")?);
+    let value = u16::from_le_bytes(
+        blob[*cursor..end]
+            .try_into()
+            .map_err(|_| "字段缓存不完整")?,
+    );
     *cursor = end;
     Ok(value)
 }
@@ -3123,7 +3219,11 @@ fn read_blob_u32(blob: &[u8], cursor: &mut usize) -> Result<u32, String> {
     if end > blob.len() {
         return Err("字段缓存不完整".to_string());
     }
-    let value = u32::from_le_bytes(blob[*cursor..end].try_into().map_err(|_| "字段缓存不完整")?);
+    let value = u32::from_le_bytes(
+        blob[*cursor..end]
+            .try_into()
+            .map_err(|_| "字段缓存不完整")?,
+    );
     *cursor = end;
     Ok(value)
 }
@@ -3133,7 +3233,11 @@ fn read_blob_u64(blob: &[u8], cursor: &mut usize) -> Result<u64, String> {
     if end > blob.len() {
         return Err("字段缓存不完整".to_string());
     }
-    let value = u64::from_le_bytes(blob[*cursor..end].try_into().map_err(|_| "字段缓存不完整")?);
+    let value = u64::from_le_bytes(
+        blob[*cursor..end]
+            .try_into()
+            .map_err(|_| "字段缓存不完整")?,
+    );
     *cursor = end;
     Ok(value)
 }
@@ -3175,8 +3279,7 @@ fn with_input_reader<T>(
     }
     if magic.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
         let input = File::open(path).map_err(|error| error.to_string())?;
-        let decoder =
-            zstd::stream::read::Decoder::new(input).map_err(|error| error.to_string())?;
+        let decoder = zstd::stream::read::Decoder::new(input).map_err(|error| error.to_string())?;
         return parse_decompressed(decoder, fallback_total, parse);
     }
 
@@ -3281,8 +3384,7 @@ fn is_stdf_entry_name(name: &str) -> bool {
 const TAR_MAGIC_OFFSET: usize = 257;
 
 fn tar_magic_present(head: &[u8]) -> bool {
-    head.len() >= TAR_MAGIC_OFFSET + 5
-        && &head[TAR_MAGIC_OFFSET..TAR_MAGIC_OFFSET + 5] == b"ustar"
+    head.len() >= TAR_MAGIC_OFFSET + 5 && &head[TAR_MAGIC_OFFSET..TAR_MAGIC_OFFSET + 5] == b"ustar"
 }
 
 fn file_is_tar(path: &Path) -> Result<bool, String> {
@@ -3409,7 +3511,11 @@ fn parse_rar<T>(
             }
             let outcome = match before_file.extract_to(&staged) {
                 Ok(_) => {
-                    let total = if unpacked == 0 { fallback_total } else { unpacked };
+                    let total = if unpacked == 0 {
+                        fallback_total
+                    } else {
+                        unpacked
+                    };
                     File::open(&staged)
                         .map_err(|error| error.to_string())
                         .map(|mut file| parse(&mut file, total))
@@ -3455,8 +3561,8 @@ fn incomplete_zip_message(path: &Path) -> Option<String> {
         let mut cursor = 0_usize;
         while cursor + 4 <= extra.len() {
             let header_id = u16::from_le_bytes(extra[cursor..cursor + 2].try_into().ok()?);
-            let field_len = u16::from_le_bytes(extra[cursor + 2..cursor + 4].try_into().ok()?)
-                as usize;
+            let field_len =
+                u16::from_le_bytes(extra[cursor + 2..cursor + 4].try_into().ok()?) as usize;
             cursor += 4;
             if cursor + field_len > extra.len() {
                 break;
@@ -3825,45 +3931,17 @@ mod tests {
         bytes.extend(record(0, 10, &[2, 4]));
 
         let mut hbr = Vec::new();
-        push_payload(
-            &mut hbr,
-            &[
-                u1(1),
-                u1(0),
-                u2(3),
-                u4(2),
-                c1("P"),
-                cn("GOOD"),
-            ],
-        );
+        push_payload(&mut hbr, &[u1(1), u1(0), u2(3), u4(2), c1("P"), cn("GOOD")]);
         bytes.extend(record(1, 40, &hbr));
 
         let mut sbr = Vec::new();
-        push_payload(
-            &mut sbr,
-            &[
-                u1(1),
-                u1(0),
-                u2(2),
-                u4(2),
-                c1("P"),
-                cn("PASS"),
-            ],
-        );
+        push_payload(&mut sbr, &[u1(1), u1(0), u2(2), u4(2), c1("P"), cn("PASS")]);
         bytes.extend(record(1, 50, &sbr));
 
         let mut pmr = Vec::new();
         push_payload(
             &mut pmr,
-            &[
-                u2(1),
-                u2(0),
-                cn(""),
-                cn("PIN1"),
-                cn("L1"),
-                u1(1),
-                u1(2),
-            ],
+            &[u2(1), u2(0), cn(""), cn("PIN1"), cn("L1"), u1(1), u1(2)],
         );
         bytes.extend(record(1, 60, &pmr));
 
@@ -4012,7 +4090,11 @@ mod tests {
             let guard = manager.sessions.lock().expect("sessions lock");
             let state = guard.get(&session.session_id).expect("session state");
             assert_eq!(
-                state.test_items.pmr_lookup.get("1").map(|e| e.phy_nam.as_str()),
+                state
+                    .test_items
+                    .pmr_lookup
+                    .get("1")
+                    .map(|e| e.phy_nam.as_str()),
                 Some("PIN1")
             );
         }
@@ -4056,7 +4138,14 @@ mod tests {
             assert_eq!(row.sbin_name, "PASS");
             assert_eq!(row.hbin_num, "3");
             assert_eq!(row.hbin_name, "GOOD");
-            assert_eq!(row.part_txt, if row.site_num == "2" { "site two" } else { "site five" });
+            assert_eq!(
+                row.part_txt,
+                if row.site_num == "2" {
+                    "site two"
+                } else {
+                    "site five"
+                }
+            );
         }
     }
 
@@ -4119,7 +4208,9 @@ mod tests {
         let sid = session.session_id;
 
         // Full page: 2 columns (PTR, FTR) x 2 rows (sites 2, 5).
-        let full = manager.get_test_item_page(&sid, 0, 50, 0, 50, &[], "").expect("page");
+        let full = manager
+            .get_test_item_page(&sid, 0, 50, 0, 50, &[], "")
+            .expect("page");
         assert_eq!(full.total_columns, 2);
         assert_eq!(full.total_rows, 2);
         assert_eq!(full.columns.len(), 2);
@@ -4127,7 +4218,9 @@ mod tests {
 
         // Selecting a single column narrows the page and projects each row onto it.
         let only = [format!("FTR:{}", 22_000_001)];
-        let ftr = manager.get_test_item_page(&sid, 0, 50, 0, 50, &only, "").expect("page");
+        let ftr = manager
+            .get_test_item_page(&sid, 0, 50, 0, 50, &only, "")
+            .expect("page");
         assert_eq!(ftr.total_columns, 1);
         assert_eq!(ftr.columns[0].record_type, "FTR");
         assert_eq!(ftr.rows[0].results.len(), 1);
@@ -4138,19 +4231,25 @@ mod tests {
         assert!(cols.iter().any(|c| c.key == "FTR:22000001"));
 
         // Site filter narrows the rows.
-        let site5 = manager.get_test_item_page(&sid, 0, 50, 0, 50, &[], "5").expect("page");
+        let site5 = manager
+            .get_test_item_page(&sid, 0, 50, 0, 50, &[], "5")
+            .expect("page");
         assert_eq!(site5.total_rows, 1);
         assert_eq!(site5.rows[0].site_num, "5");
 
         // Column window: offset 1 yields only the 2nd column.
-        let win = manager.get_test_item_page(&sid, 0, 50, 1, 50, &[], "").expect("page");
+        let win = manager
+            .get_test_item_page(&sid, 0, 50, 1, 50, &[], "")
+            .expect("page");
         assert_eq!(win.col_offset, 1);
         assert_eq!(win.columns.len(), 1);
         assert_eq!(win.columns[0].record_type, "FTR");
         assert_eq!(win.rows[0].results.len(), 1);
 
         // Row offset past the end yields no rows but still reports the true total.
-        let past = manager.get_test_item_page(&sid, 10, 50, 0, 50, &[], "").expect("page");
+        let past = manager
+            .get_test_item_page(&sid, 10, 50, 0, 50, &[], "")
+            .expect("page");
         assert_eq!(past.total_rows, 2);
         assert!(past.rows.is_empty());
     }
@@ -4189,7 +4288,10 @@ mod tests {
 
         // The PMR map itself never crosses the IPC bridge — only its size does
         // (the UI renders just a "N PMR" pill).
-        assert!(json.get("pmr_lookup").is_none(), "pmr_lookup should not be serialized");
+        assert!(
+            json.get("pmr_lookup").is_none(),
+            "pmr_lookup should not be serialized"
+        );
         assert_eq!(
             json.get("pmr_count").and_then(|v| v.as_u64()),
             Some(1),
@@ -4200,7 +4302,10 @@ mod tests {
         // payload overhead (~20% of a page).
         let cell = &json["rows"][0]["results"][0];
         assert!(cell.get("value").is_some(), "cell keeps its value");
-        assert!(cell.get("test_num").is_none(), "cell test_num should not be serialized");
+        assert!(
+            cell.get("test_num").is_none(),
+            "cell test_num should not be serialized"
+        );
     }
 
     #[test]
@@ -4352,7 +4457,10 @@ mod tests {
             manager.get_session_snapshot(&first.session_id).is_err(),
             "first session should be evicted"
         );
-        assert!(!first_db.exists(), "evicted session's database should be deleted");
+        assert!(
+            !first_db.exists(),
+            "evicted session's database should be deleted"
+        );
         assert!(manager.get_session_snapshot(&second.session_id).is_ok());
         let second_db = temp_workspace_dir().join(format!("{}.db", second.session_id));
         assert!(second_db.exists(), "live session keeps its database");
@@ -4534,7 +4642,10 @@ mod tests {
         // Names/types/descriptions are static per record layout — storing them
         // per record blew a 3.2GB file up into a 35GB index. Only values (and
         // which layout to rebuild from) may hit the disk.
-        assert!(!contains("STDF 版本".as_bytes()), "description serialized into blob");
+        assert!(
+            !contains("STDF 版本".as_bytes()),
+            "description serialized into blob"
+        );
         assert!(!contains(b"STDF_VER"), "field name serialized into blob");
 
         let decoded = decode_fields_blob(&blob).expect("decode");
@@ -4612,9 +4723,11 @@ mod tests {
             },
         );
         // HBR/SBR arrive afterwards.
-        acc.sbin_names.insert("5".to_string(), "SOFT_PASS".to_string());
+        acc.sbin_names
+            .insert("5".to_string(), "SOFT_PASS".to_string());
         acc.sbin_pf.insert("5".to_string(), "P".to_string());
-        acc.hbin_names.insert("7".to_string(), "HARD_FAIL".to_string());
+        acc.hbin_names
+            .insert("7".to_string(), "HARD_FAIL".to_string());
         acc.hbin_pf.insert("7".to_string(), "F".to_string());
 
         let page = build_test_item_page("s", &acc, &ParseStatus::Complete, 0, 10, 0, 10, &[], "");
@@ -4685,6 +4798,7 @@ mod tests {
             bytes_read: 0,
             total_bytes: 0,
             status: ParseStatus::Complete,
+            issues: Vec::new(),
         };
 
         let csv = build_test_item_csv(&snapshot, &acc);
@@ -4785,6 +4899,29 @@ mod tests {
     }
 
     #[test]
+    fn session_snapshot_exposes_file_diagnostics_after_parse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("diagnostic.stdf");
+        let mut bytes = record(0, 10, &[2]);
+        bytes.extend(record(1, 20, &2_u32.to_le_bytes()));
+        std::fs::write(&file_path, bytes).expect("write fixture");
+
+        let manager = SessionManager::default();
+        let session = open_and_wait_complete(&manager, &file_path);
+        let snapshot = manager
+            .get_session_snapshot(&session.session_id)
+            .expect("snapshot");
+
+        assert_eq!(snapshot.status, ParseStatus::Complete);
+        assert!(snapshot.issues.iter().any(|issue| {
+            issue.code == "record_field_incomplete"
+                && issue.severity == crate::diagnostics::FileIssueSeverity::Error
+                && issue.affects_accuracy
+                && issue.samples.first().map(|sample| sample.offset) == Some(0)
+        }));
+    }
+
+    #[test]
     fn session_streams_zip_and_matches_plain_stdf_results() {
         let dir = tempfile::tempdir().expect("tempdir");
         let stdf_path = dir.path().join("fixture.std");
@@ -4845,8 +4982,7 @@ mod tests {
 
         let sevenz_path = dir.path().join("fixture.std.7z");
         {
-            let mut writer =
-                sevenz_rust2::ArchiveWriter::create(&sevenz_path).expect("create 7z");
+            let mut writer = sevenz_rust2::ArchiveWriter::create(&sevenz_path).expect("create 7z");
             writer
                 .push_archive_entry(
                     sevenz_rust2::ArchiveEntry::new_file("fixture.std"),
@@ -4944,8 +5080,14 @@ mod tests {
             &targz_path,
         ] {
             let unpacked = parse_fixture_session(path);
-            assert_eq!(plain.groups, unpacked.groups, "groups mismatch for {path:?}");
-            assert_eq!(plain.fields, unpacked.fields, "fields mismatch for {path:?}");
+            assert_eq!(
+                plain.groups, unpacked.groups,
+                "groups mismatch for {path:?}"
+            );
+            assert_eq!(
+                plain.fields, unpacked.fields,
+                "fields mismatch for {path:?}"
+            );
         }
     }
 
@@ -5070,7 +5212,10 @@ mod tests {
         let error = manager
             .save_dtr_text(&session.session_id, &dest.to_string_lossy())
             .expect_err("save before parse should fail");
-        assert!(error.contains("解析"), "error should mention parsing: {error}");
+        assert!(
+            error.contains("解析"),
+            "error should mention parsing: {error}"
+        );
         assert!(!dest.exists(), "no txt should be written before a parse");
 
         // A file without any DTR records still parses, with a zero count.
@@ -5327,7 +5472,10 @@ mod tests {
             page.total_rows,
             page.pmr_count
         );
-        assert!(elapsed < Duration::from_secs(3), "test-item page took {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "test-item page took {elapsed:?}"
+        );
         assert!(
             page.columns.len() <= 500,
             "a page should not force the UI to render {} columns at once",
@@ -5345,7 +5493,10 @@ mod tests {
         fn mpr_payload(test_num: u32, values: &[f32], indices: &[u16], with_tail: bool) -> Vec<u8> {
             let mut mpr = Vec::new();
             push_payload(&mut mpr, &[u4(test_num), u1(1), u1(1), u1(0), u1(0)]);
-            push_payload(&mut mpr, &[u2(values.len() as u16), u2(values.len() as u16)]);
+            push_payload(
+                &mut mpr,
+                &[u2(values.len() as u16), u2(values.len() as u16)],
+            );
             mpr.extend(vec![0_u8; values.len().div_ceil(2)]); // RTN_STAT nibbles
             for value in values {
                 mpr.extend(r4(*value));
@@ -5368,7 +5519,10 @@ mod tests {
         fn mpr_payload_no_limits(test_num: u32, values: &[f32]) -> Vec<u8> {
             let mut mpr = Vec::new();
             push_payload(&mut mpr, &[u4(test_num), u1(1), u1(1), u1(0), u1(0)]);
-            push_payload(&mut mpr, &[u2(values.len() as u16), u2(values.len() as u16)]);
+            push_payload(
+                &mut mpr,
+                &[u2(values.len() as u16), u2(values.len() as u16)],
+            );
             mpr.extend(vec![0_u8; values.len().div_ceil(2)]);
             for value in values {
                 mpr.extend(r4(*value));
@@ -5383,7 +5537,16 @@ mod tests {
             let mut prr = vec![1, 1, 0];
             push_payload(
                 &mut prr,
-                &[u2(1), u2(1), u2(1), i2(0), i2(0), u4(50), cn(part_id), cn("")],
+                &[
+                    u2(1),
+                    u2(1),
+                    u2(1),
+                    i2(0),
+                    i2(0),
+                    u4(50),
+                    cn(part_id),
+                    cn(""),
+                ],
             );
             prr.push(0);
             prr
@@ -5419,10 +5582,18 @@ mod tests {
         third_values[17] = 0.9;
 
         bytes.extend(record(5, 10, &[1, 1]));
-        bytes.extend(record(15, 15, &mpr_payload(500, &first_values, &indices, true)));
+        bytes.extend(record(
+            15,
+            15,
+            &mpr_payload(500, &first_values, &indices, true),
+        ));
         bytes.extend(record(5, 20, &prr_payload("PART-1")));
         bytes.extend(record(5, 10, &[1, 1]));
-        bytes.extend(record(15, 15, &mpr_payload(500, &second_values, &[], false)));
+        bytes.extend(record(
+            15,
+            15,
+            &mpr_payload(500, &second_values, &[], false),
+        ));
         bytes.extend(record(5, 20, &prr_payload("PART-2")));
         bytes.extend(record(5, 10, &[1, 1]));
         bytes.extend(record(15, 15, &mpr_payload(500, &third_values, &[], false)));
@@ -5573,7 +5744,10 @@ mod tests {
             .find(|column| column.test_num == 600)
             .expect("no-limit column");
         assert_eq!(column.low_limit, "", "placeholder LO_LIMIT must be ignored");
-        assert_eq!(column.high_limit, "", "placeholder HI_LIMIT must be ignored");
+        assert_eq!(
+            column.high_limit, "",
+            "placeholder HI_LIMIT must be ignored"
+        );
 
         let index = page
             .columns
@@ -5619,7 +5793,10 @@ mod tests {
         // xlsx is a zip container: magic + non-trivial payload is enough to
         // prove a workbook was written without pulling in a reader crate.
         assert!(bytes.starts_with(b"PK"), "xlsx should be a zip container");
-        assert!(bytes.len() > 2_000, "workbook should carry the styled pin table");
+        assert!(
+            bytes.len() > 2_000,
+            "workbook should carry the styled pin table"
+        );
     }
 
     #[test]
@@ -5669,8 +5846,14 @@ mod tests {
             details.test_num,
             started.elapsed(),
             details.pins.len(),
-            details.pins.first().map(|pin| (&pin.pmr_index, &pin.pin_name, &pin.value)),
-            details.pins.last().map(|pin| (&pin.pmr_index, &pin.pin_name, &pin.value)),
+            details
+                .pins
+                .first()
+                .map(|pin| (&pin.pmr_index, &pin.pin_name, &pin.value)),
+            details
+                .pins
+                .last()
+                .map(|pin| (&pin.pmr_index, &pin.pin_name, &pin.value)),
         );
         assert!(!details.pins.is_empty());
 
@@ -5735,7 +5918,10 @@ mod tests {
                 Err(error) => panic!("event channel closed before completion: {error}"),
             }
         }
-        assert!(completed, "parser should complete within the benchmark window");
+        assert!(
+            completed,
+            "parser should complete within the benchmark window"
+        );
         let elapsed = started.elapsed();
         let total_records: usize = manager
             .get_record_groups(&session.session_id)

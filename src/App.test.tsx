@@ -109,6 +109,61 @@ describe("App", () => {
     expect(screen.getByText("GOOD")).toBeInTheDocument();
   });
 
+  it("shows grouped file issues above yield and reveals technical locations", async () => {
+    const api = createMockApi();
+    const user = userEvent.setup();
+
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
+    await screen.findByRole("main", { name: "文件摘要" });
+    expect(screen.queryByRole("region", { name: "文件检查" })).not.toBeInTheDocument();
+
+    act(() => {
+      api.emitSnapshot({
+        session_id: "session-1",
+        groups: [{ record_type: "PTR", count: 100 }],
+        key_fields: {},
+        first_records: {},
+        bytes_read: 22_600_000,
+        total_bytes: 338_491_030,
+        status: "running",
+        issues: [
+          {
+            code: "nonstandard_record",
+            severity: "error",
+            title: "大量内容无法识别，文件边界可能已经错位",
+            message: "共发现 238,850 条无法识别的记录，软件仍会继续解析。",
+            suggestion: "请让文件生成方重新导出原始 STDF。",
+            count: 238850,
+            affects_accuracy: true,
+            samples: [
+              {
+                offset: 22548484,
+                record_index: 380000,
+                record_type: "UNKNOWN",
+                detail: "REC_TYP=50, REC_SUB=0, REC_LEN=26163。"
+              }
+            ]
+          }
+        ]
+      });
+    });
+
+    const report = await screen.findByRole("region", { name: "文件检查" });
+    expect(within(report).getByText("大量内容无法识别，文件边界可能已经错位")).toBeInTheDocument();
+    expect(within(report).getByText("238,850 个错误")).toBeInTheDocument();
+    expect(within(report).getByText(/良率和统计结果可能不准确/)).toBeInTheDocument();
+
+    const yieldLabel = screen.getByText("良率");
+    expect(
+      report.compareDocumentPosition(yieldLabel) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
+
+    await user.click(within(report).getByText("查看位置与技术信息"));
+    expect(within(report).getByText(/byte 22,548,484/)).toBeInTheDocument();
+    expect(within(report).getByText(/REC_TYP=50/)).toBeInTheDocument();
+  });
+
   it("opens the test-item matrix view after parsing completes", async () => {
     const api = createMockApi();
     const user = userEvent.setup();
@@ -425,7 +480,8 @@ describe("App", () => {
         first_records: {},
         bytes_read: 0,
         total_bytes: 1024,
-        status: "running"
+        status: "running",
+        issues: []
       }),
       getTestItemPage: async () => {
         throw new Error("should not be called before complete");
@@ -483,7 +539,8 @@ describe("App", () => {
         first_records: {},
         bytes_read: 0,
         total_bytes: 1000,
-        status: "running"
+        status: "running",
+        issues: []
       });
     });
 
@@ -499,7 +556,8 @@ describe("App", () => {
         first_records: {},
         bytes_read: 0,
         total_bytes: 1024,
-        status: "running"
+        status: "running",
+        issues: []
       })
     });
     const user = userEvent.setup();
@@ -525,7 +583,8 @@ describe("App", () => {
         first_records: {},
         bytes_read: 128,
         total_bytes: 1024,
-        status: "running"
+        status: "running",
+        issues: []
       });
     });
 

@@ -50,6 +50,26 @@ export interface FirstRecordSnapshot {
   fields: RecordField[];
 }
 
+export type FileIssueSeverity = "error" | "warning";
+
+export interface FileIssueLocation {
+  offset: number;
+  record_index: number | null;
+  record_type: string;
+  detail: string;
+}
+
+export interface FileIssue {
+  code: string;
+  severity: FileIssueSeverity;
+  title: string;
+  message: string;
+  suggestion: string;
+  count: number;
+  affects_accuracy: boolean;
+  samples: FileIssueLocation[];
+}
+
 export interface SessionSnapshot {
   session_id: string;
   groups: RecordGroup[];
@@ -58,6 +78,7 @@ export interface SessionSnapshot {
   bytes_read: number;
   total_bytes: number;
   status: ParseStatus;
+  issues: FileIssue[];
 }
 
 export interface TestItemColumn {
