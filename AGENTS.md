@@ -48,8 +48,8 @@ PATH="/opt/homebrew/opt/rustup/bin:$PATH" npm run tauri -- build --bundles app
 
 - 用户说“发布版本 / 正式发版 / GitHub Release / 推送更新”时，默认走 `.github/workflows/release.yml`，不要先在本地运行 `npm run dmg:signed`。
 - 开始发布前必须先阅读 `.github/workflows/release.yml` 和 `RELEASE_NOTES.md`，检查远端最新 Release、Tag 和 `main` 分支状态，不要凭上一次对话记忆发布。
-- 版本号必须统一更新到 `package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、根 `Cargo.lock` 和 `src-tauri/Cargo.lock`。Tag 使用相同版本并添加 `v` 前缀。
-- 每次发版前更新 `RELEASE_NOTES.md`，内容面向普通用户说明本次新增和修复；GitHub 工作流会直接读取该文件作为 Release 说明。
+- 每次发版前先根据改动范围向用户提出建议版本号并说明升级理由。只有用户明确确认版本号后，才能修改版本文件；未确认前不得自行决定版本号或创建版本 Tag。确认后必须将版本号统一更新到 `package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、根 `Cargo.lock` 和 `src-tauri/Cargo.lock`，Tag 使用相同版本并添加 `v` 前缀。
+- 每次发版前先根据本次改动拟定面向普通用户的 Release Notes 草稿，在对话中完整展示给用户，并根据用户反馈修改措辞。只有用户明确确认最终文案后，才能写入 `RELEASE_NOTES.md`；未确认前不得提交、推送 `main`、创建或推送版本 Tag，也不得触发正式发布工作流。GitHub 工作流会直接读取该文件作为 Release 说明。
 - 发布前至少运行 `cargo test -p stdf-core`、`npm test`、`npm run build` 和 `git diff --check`。真实 STDF 兼容性改动还要执行上面的真实样本测试。
 - 验证通过后提交预期文件，推送 `main`，创建注释 Tag `vX.Y.Z`，并将 `main` 与 Tag 推送到 GitHub。Tag 会触发正式发布工作流，不要再手工创建重复的 GitHub Release。
 - 推送 Tag 后必须持续检查 GitHub Actions，直到 `create-release`、macOS、Windows 和 `publish-release` 全部成功；不能把仅创建草稿或仅完成单个平台视为发布完成。
