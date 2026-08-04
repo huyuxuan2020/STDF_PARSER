@@ -38,11 +38,24 @@ npm run build
 cargo test -p stdf-core parser_reads_real_customer_sample_without_standard_raw_records -- --ignored --nocapture
 ```
 
-发布或交付 app 前运行：
+本地交付 `.app` 前运行：
 
 ```bash
 PATH="/opt/homebrew/opt/rustup/bin:$PATH" npm run tauri -- build --bundles app
 ```
+
+## 正式发布流程
+
+- 用户说“发布版本 / 正式发版 / GitHub Release / 推送更新”时，默认走 `.github/workflows/release.yml`，不要先在本地运行 `npm run dmg:signed`。
+- 开始发布前必须先阅读 `.github/workflows/release.yml` 和 `RELEASE_NOTES.md`，检查远端最新 Release、Tag 和 `main` 分支状态，不要凭上一次对话记忆发布。
+- 版本号必须统一更新到 `package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、根 `Cargo.lock` 和 `src-tauri/Cargo.lock`。Tag 使用相同版本并添加 `v` 前缀。
+- 每次发版前更新 `RELEASE_NOTES.md`，内容面向普通用户说明本次新增和修复；GitHub 工作流会直接读取该文件作为 Release 说明。
+- 发布前至少运行 `cargo test -p stdf-core`、`npm test`、`npm run build` 和 `git diff --check`。真实 STDF 兼容性改动还要执行上面的真实样本测试。
+- 验证通过后提交预期文件，推送 `main`，创建注释 Tag `vX.Y.Z`，并将 `main` 与 Tag 推送到 GitHub。Tag 会触发正式发布工作流，不要再手工创建重复的 GitHub Release。
+- 推送 Tag 后必须持续检查 GitHub Actions，直到 `create-release`、macOS、Windows 和 `publish-release` 全部成功；不能把仅创建草稿或仅完成单个平台视为发布完成。
+- 完成前还要确认 Release 已公开且非预发布、`latest.json` 版本和各平台签名正确，并核对 macOS DMG、macOS 更新包、Windows EXE/MSI 及对应签名等必需产物全部存在。
+- 工作流失败时先保留草稿并定位失败步骤，不要静默移动已经推送的版本 Tag。修复策略应根据 Release 是否公开决定。
+- 只有用户明确要求“本地打包 / 本地 DMG / 手工交付文件”时，才按下面的本地 DMG 规则执行 `npm run dmg` 或 `npm run dmg:signed`。
 
 ## 交付偏好
 

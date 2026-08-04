@@ -1,7 +1,27 @@
-node_modules
-dist
-target
-src-tauri/target
+# Frontend dependencies and build output
+node_modules/
+dist/
+coverage/
+.vite/
+.vite-temp/
+*.tsbuildinfo
+
+# Rust and Tauri build output
+target/
+src-tauri/target/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS, editor, logs, and local agent state
 .DS_Store
-.superpowers
+*.log
+*.tmp
+*.swp
+.superpowers/
 .claude/
+skills-lock.json
