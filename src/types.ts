@@ -63,9 +63,12 @@ export interface FileIssue {
   code: string;
   severity: FileIssueSeverity;
   title: string;
+  actual: string;
+  expected: string;
   message: string;
   suggestion: string;
   count: number;
+  affected_records: number;
   affects_accuracy: boolean;
   samples: FileIssueLocation[];
 }

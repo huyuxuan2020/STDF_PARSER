@@ -43,6 +43,10 @@ pub struct ParsedRecord {
     /// turns it into a bounded, human-readable file issue summary.
     #[serde(skip)]
     pub parse_issue: Option<RecordParseIssue>,
+    /// A bounded payload prefix retained only for UNKNOWN records. Diagnostics
+    /// use it to prove a nearby record boundary without changing parse flow.
+    #[serde(skip)]
+    pub diagnostic_payload_prefix: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +249,11 @@ fn parse_record(
     } else {
         None
     };
+    let diagnostic_payload_prefix = if record_type == "UNKNOWN" {
+        payload.iter().take(128).copied().collect()
+    } else {
+        Vec::new()
+    };
     ParsedRecord {
         record_type,
         rec_typ,
@@ -255,6 +264,7 @@ fn parse_record(
         status,
         mpr_results,
         parse_issue,
+        diagnostic_payload_prefix,
     }
 }
 
@@ -685,7 +695,7 @@ pub(crate) fn record_specs(rec_typ: u8, rec_sub: u8) -> Option<&'static [FieldSp
     }
 }
 
-fn record_name(rec_typ: u8, rec_sub: u8) -> &'static str {
+pub(crate) fn record_name(rec_typ: u8, rec_sub: u8) -> &'static str {
     match (rec_typ, rec_sub) {
         (0, 10) => "FAR",
         (0, 20) => "ATR",

@@ -1440,18 +1440,33 @@ function FileIssuesPanel({ issues, complete }: { issues: FileIssue[]; complete: 
   const warningCount = issues
     .filter((issue) => issue.severity === "warning")
     .reduce((sum, issue) => sum + issue.count, 0);
+  const affectedRecords = issues.reduce((sum, issue) => sum + issue.affected_records, 0);
   const affectsAccuracy = issues.some((issue) => issue.affects_accuracy);
+  const hasErrors = errorCount > 0;
+  const PanelIcon = hasErrors ? AlertCircle : AlertTriangle;
 
   return (
     <section
-      className="fade-rise shrink-0 overflow-hidden rounded-xl border border-danger-border/70 bg-card shadow-card"
+      className={`fade-rise shrink-0 overflow-hidden rounded-xl border bg-card shadow-card ${
+        hasErrors ? "border-danger-border/70" : "border-warning-border/80"
+      }`}
       aria-label="文件检查"
       style={{ ["--stagger" as string]: 0 }}
     >
-      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-danger-border/60 bg-danger-soft px-4 py-3.5">
+      <div
+        className={`flex flex-wrap items-start justify-between gap-3 border-b px-4 py-3.5 ${
+          hasErrors
+            ? "border-danger-border/60 bg-danger-soft"
+            : "border-warning-border/70 bg-warning-soft"
+        }`}
+      >
         <div className="flex min-w-0 items-start gap-3">
-          <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-danger text-white">
-            <AlertTriangle size={18} aria-hidden="true" />
+          <span
+            className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-white ${
+              hasErrors ? "bg-danger" : "bg-warning"
+            }`}
+          >
+            <PanelIcon size={18} aria-hidden="true" />
           </span>
           <div className="min-w-0">
             <h2 className="text-[15px] font-semibold text-foreground">文件检查发现问题</h2>
@@ -1474,6 +1489,11 @@ function FileIssuesPanel({ issues, complete }: { issues: FileIssue[]; complete: 
             <span className="inline-flex items-center gap-1.5 rounded-md border border-warning-border bg-card px-2 py-1 font-medium text-warning">
               <AlertTriangle size={13} aria-hidden="true" />
               {warningCount.toLocaleString()} 个提醒
+            </span>
+          )}
+          {affectedRecords > 0 && (
+            <span className="inline-flex items-center rounded-md border border-border-strong bg-card px-2 py-1 font-medium text-foreground">
+              影响 {affectedRecords.toLocaleString()} 条记录
             </span>
           )}
         </div>
@@ -1499,14 +1519,40 @@ function FileIssuesPanel({ issues, complete }: { issues: FileIssue[]; complete: 
                         共 {issue.count.toLocaleString()} 处
                       </span>
                     )}
+                    {issue.affected_records > 0 && (
+                      <span className="text-xs tabular-nums text-muted-foreground">
+                        影响 {issue.affected_records.toLocaleString()} 条记录
+                      </span>
+                    )}
                     {index === 0 && issue.affects_accuracy && (
                       <span className="rounded bg-danger-soft px-1.5 py-0.5 text-[11px] font-medium text-danger">
                         建议优先处理
                       </span>
                     )}
                   </div>
-                  <p className="mt-1 text-sm leading-6 text-muted-foreground">{issue.message}</p>
-                  <p className="mt-1 text-sm leading-6 text-foreground">
+                  <dl className="mt-2.5 grid gap-3 sm:grid-cols-2">
+                    <div
+                      className={`border-l-2 pl-3 ${error ? "border-danger" : "border-warning"}`}
+                    >
+                      <dt className={`text-xs font-semibold ${error ? "text-danger" : "text-warning"}`}>
+                        文件中实际是
+                      </dt>
+                      <dd className="mt-1 break-words text-sm leading-5 text-foreground">
+                        {issue.actual}
+                      </dd>
+                    </div>
+                    <div className="border-l-2 border-primary pl-3">
+                      <dt className="text-xs font-semibold text-primary">正常情况下应为</dt>
+                      <dd className="mt-1 break-words text-sm leading-5 text-foreground">
+                        {issue.expected}
+                      </dd>
+                    </div>
+                  </dl>
+                  <p className="mt-2.5 text-sm leading-6 text-muted-foreground">
+                    <span className="font-medium text-foreground">因此报错：</span>
+                    {issue.message}
+                  </p>
+                  <p className="mt-1.5 text-sm leading-6 text-foreground">
                     <span className="font-medium">建议：</span>
                     {issue.suggestion}
                   </p>
@@ -1514,7 +1560,7 @@ function FileIssuesPanel({ issues, complete }: { issues: FileIssue[]; complete: 
                   {issue.samples.length > 0 && (
                     <details className="group mt-2.5">
                       <summary className="inline-flex cursor-pointer list-none items-center gap-1 text-xs font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
-                        查看位置与技术信息
+                        查看出错位置和判断依据
                         <ChevronDown
                           size={14}
                           aria-hidden="true"
@@ -1536,7 +1582,7 @@ function FileIssuesPanel({ issues, complete }: { issues: FileIssue[]; complete: 
                                 文件位置 {formatBytes(sample.offset)}（byte {sample.offset.toLocaleString()}）
                               </span>
                             </div>
-                            <p className="mt-1 break-words font-mono text-[11px] leading-5 text-foreground">
+                            <p className="mt-1 break-words text-xs leading-5 text-foreground">
                               {sample.detail}
                             </p>
                           </div>

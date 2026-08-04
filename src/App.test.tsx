@@ -131,10 +131,13 @@ describe("App", () => {
           {
             code: "nonstandard_record",
             severity: "error",
-            title: "大量内容无法识别，文件边界可能已经错位",
-            message: "共发现 238,850 条无法识别的记录，软件仍会继续解析。",
-            suggestion: "请让文件生成方重新导出原始 STDF。",
-            count: 238850,
+            title: "上一条 PTR 的长度少了 2 字节，导致记录边界错位",
+            actual: "上一条 PTR 写的是 REC_LEN=50、TEST_TXT 长度=37；错位后得到 REC_LEN=26163。",
+            expected: "TEST_TXT 应为 33 字节；上一条 PTR 的 REC_LEN 应为 52。下一条应为 REC_LEN=50、REC_TYP=15、REC_SUB=10（PTR）。",
+            message: "26163 来自字符串“%5.3f”末尾的字节 33 66，并不是真正的记录长度。",
+            suggestion: "请让文件生成方修正上一条 PTR 后重新导出。",
+            count: 1,
+            affected_records: 238850,
             affects_accuracy: true,
             samples: [
               {
@@ -150,18 +153,67 @@ describe("App", () => {
     });
 
     const report = await screen.findByRole("region", { name: "文件检查" });
-    expect(within(report).getByText("大量内容无法识别，文件边界可能已经错位")).toBeInTheDocument();
-    expect(within(report).getByText("238,850 个错误")).toBeInTheDocument();
+    expect(within(report).getByText("上一条 PTR 的长度少了 2 字节，导致记录边界错位")).toBeInTheDocument();
+    expect(within(report).getByText("1 个错误")).toBeInTheDocument();
+    expect(within(report).getAllByText("影响 238,850 条记录")).toHaveLength(2);
     expect(within(report).getByText(/良率和统计结果可能不准确/)).toBeInTheDocument();
+    expect(within(report).getByText("文件中实际是")).toBeInTheDocument();
+    expect(within(report).getByText(/REC_LEN=50、TEST_TXT 长度=37/)).toBeInTheDocument();
+    expect(within(report).getByText("正常情况下应为")).toBeInTheDocument();
+    expect(within(report).getByText(/TEST_TXT 应为 33 字节/)).toBeInTheDocument();
+    expect(within(report).getByText(/REC_LEN 应为 52/)).toBeInTheDocument();
+    expect(within(report).getByText(/下一条应为 REC_LEN=50、REC_TYP=15、REC_SUB=10/)).toBeInTheDocument();
+    expect(within(report).getByText(/因此报错/)).toBeInTheDocument();
 
     const yieldLabel = screen.getByText("良率");
     expect(
       report.compareDocumentPosition(yieldLabel) & Node.DOCUMENT_POSITION_FOLLOWING
     ).toBeTruthy();
 
-    await user.click(within(report).getByText("查看位置与技术信息"));
+    await user.click(within(report).getByText("查看出错位置和判断依据"));
     expect(within(report).getByText(/byte 22,548,484/)).toBeInTheDocument();
     expect(within(report).getByText(/REC_TYP=50/)).toBeInTheDocument();
+  });
+
+  it("uses warning styling when file checks contain no errors", async () => {
+    const api = createMockApi();
+    const user = userEvent.setup();
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
+    await screen.findByRole("main", { name: "文件摘要" });
+
+    act(() => {
+      api.emitSnapshot({
+        session_id: "session-1",
+        groups: [],
+        key_fields: {},
+        first_records: {},
+        bytes_read: 100,
+        total_bytes: 100,
+        status: "complete",
+        issues: [
+          {
+            code: "missing_mir",
+            severity: "warning",
+            title: "文件缺少测试主信息",
+            actual: "整份文件中 MIR 数量为 0。",
+            expected: "一份完整的测试数据通常应包含 1 条 MIR。",
+            message: "批次和产品信息可能无法显示。",
+            suggestion: "建议确认文件是否从测试中途截取。",
+            count: 1,
+            affected_records: 0,
+            affects_accuracy: false,
+            samples: []
+          }
+        ]
+      });
+    });
+
+    const report = await screen.findByRole("region", { name: "文件检查" });
+    expect(report).toHaveClass("border-warning-border/80");
+    expect(report).not.toHaveClass("border-danger-border/70");
+    expect(within(report).getByText("1 个提醒")).toBeInTheDocument();
+    expect(within(report).queryByText(/个错误/)).not.toBeInTheDocument();
   });
 
   it("opens the test-item matrix view after parsing completes", async () => {
