@@ -1,8 +1,7 @@
-use stdf_core::parser::{ParseErrorEvent, ParseProgress};
 use stdf_core::sessions::{
-    BinSummary, DtrParseResult, EnrichedField, MprPinDetails, RecordGroup, RecordSummaryPage,
-    SearchProgress, SearchResultPage, SessionManager, SessionSnapshot, TestItemColumnLite,
-    TestItemPage,
+    BinSummary, DtrParseResult, EnrichedField, GdrParseResult, MprPinDetails, RecordGroup,
+    RecordSummaryPage, SearchProgress, SearchResultPage, SessionManager, SessionSnapshot,
+    TestItemColumnLite, TestItemPage,
 };
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, State};
@@ -115,6 +114,23 @@ fn save_dtr_text(
     manager.save_dtr_text(&session_id, &path)
 }
 
+#[tauri::command(async)]
+fn parse_gdr_text(
+    session_id: String,
+    manager: State<'_, SessionManager>,
+) -> Result<GdrParseResult, String> {
+    manager.parse_gdr_text(&session_id)
+}
+
+#[tauri::command(async)]
+fn save_gdr_text(
+    session_id: String,
+    path: String,
+    manager: State<'_, SessionManager>,
+) -> Result<(), String> {
+    manager.save_gdr_text(&session_id, &path)
+}
+
 // `(async)`: expanding an MPR cell re-reads (and possibly re-decompresses)
 // the source file up to the clicked record — IO-heavy like parse_dtr_text.
 #[tauri::command(async)]
@@ -195,13 +211,19 @@ fn search_fields(
     // Promise, so ordering is guaranteed and there is no window where the JS
     // side "hasn't subscribed yet".
     let sid = session_id.clone();
-    manager.search_fields(&session_id, &query, page, page_size, move |scanned, total| {
-        let _ = on_progress.send(SearchProgress {
-            session_id: sid.clone(),
-            scanned,
-            total,
-        });
-    })
+    manager.search_fields(
+        &session_id,
+        &query,
+        page,
+        page_size,
+        move |scanned, total| {
+            let _ = on_progress.send(SearchProgress {
+                session_id: sid.clone(),
+                scanned,
+                total,
+            });
+        },
+    )
 }
 
 pub fn run() {
@@ -222,6 +244,8 @@ pub fn run() {
             export_test_item_csv,
             parse_dtr_text,
             save_dtr_text,
+            parse_gdr_text,
+            save_gdr_text,
             get_mpr_pin_details,
             export_mpr_pins_xlsx,
             get_record_groups,
@@ -232,6 +256,3 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-
-#[allow(dead_code)]
-fn _event_types(_: ParseProgress, _: ParseErrorEvent) {}

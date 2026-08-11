@@ -736,6 +736,190 @@ pub fn decode_dtr_text(payload: &[u8]) -> String {
     String::from_utf8_lossy(&rest[..end]).to_string()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecodedGdr {
+    pub(crate) field_count: u16,
+    pub(crate) fields: Vec<DecodedGdrField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecodedGdrField {
+    pub(crate) field_type: &'static str,
+    pub(crate) value: String,
+    pub(crate) preview_value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("GEN_DATA[{item_index}]: {detail}")]
+pub(crate) struct GdrDecodeError {
+    pub(crate) item_index: usize,
+    detail: String,
+}
+
+/// Decode a GDR's heterogeneous V*n array. GDR stays out of the initial
+/// record index; this decoder is used by the explicit preview/download scan.
+pub(crate) fn decode_gdr(payload: &[u8]) -> Result<DecodedGdr, GdrDecodeError> {
+    if payload.len() < 2 {
+        return Err(GdrDecodeError {
+            item_index: 0,
+            detail: format!("FLD_CNT 需要 2 字节，实际只有 {} 字节", payload.len()),
+        });
+    }
+    let field_count = u16::from_le_bytes([payload[0], payload[1]]);
+    let mut cursor = 2_usize;
+    let mut fields = Vec::with_capacity(usize::from(field_count));
+    for item_index in 1..=usize::from(field_count) {
+        let type_code = *payload.get(cursor).ok_or_else(|| GdrDecodeError {
+            item_index,
+            detail: "缺少 V*n 类型码".to_string(),
+        })?;
+        cursor += 1;
+        let field = match type_code {
+            0 => DecodedGdrField {
+                field_type: "B*0",
+                value: "<padding>".to_string(),
+                preview_value: "<padding>".to_string(),
+            },
+            1 => {
+                let bytes = take_gdr(payload, &mut cursor, 1, item_index, "U*1")?;
+                gdr_scalar("U*1", bytes[0].to_string())
+            }
+            2 => {
+                let bytes = take_gdr(payload, &mut cursor, 2, item_index, "U*2")?;
+                gdr_scalar("U*2", u16::from_le_bytes([bytes[0], bytes[1]]).to_string())
+            }
+            3 => {
+                let bytes = take_gdr(payload, &mut cursor, 4, item_index, "U*4")?;
+                gdr_scalar(
+                    "U*4",
+                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).to_string(),
+                )
+            }
+            4 => {
+                let bytes = take_gdr(payload, &mut cursor, 1, item_index, "I*1")?;
+                gdr_scalar("I*1", (bytes[0] as i8).to_string())
+            }
+            5 => {
+                let bytes = take_gdr(payload, &mut cursor, 2, item_index, "I*2")?;
+                gdr_scalar("I*2", i16::from_le_bytes([bytes[0], bytes[1]]).to_string())
+            }
+            6 => {
+                let bytes = take_gdr(payload, &mut cursor, 4, item_index, "I*4")?;
+                gdr_scalar(
+                    "I*4",
+                    i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).to_string(),
+                )
+            }
+            7 => {
+                let bytes = take_gdr(payload, &mut cursor, 4, item_index, "R*4")?;
+                gdr_scalar(
+                    "R*4",
+                    f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).to_string(),
+                )
+            }
+            8 => {
+                let bytes = take_gdr(payload, &mut cursor, 8, item_index, "R*8")?;
+                gdr_scalar(
+                    "R*8",
+                    f64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ])
+                    .to_string(),
+                )
+            }
+            10 => {
+                let len = take_gdr(payload, &mut cursor, 1, item_index, "C*n 长度")?[0] as usize;
+                let bytes = take_gdr(payload, &mut cursor, len, item_index, "C*n 内容")?;
+                gdr_scalar("C*n", String::from_utf8_lossy(bytes).to_string())
+            }
+            11 => {
+                let len = take_gdr(payload, &mut cursor, 1, item_index, "B*n 长度")?[0] as usize;
+                let bytes = take_gdr(payload, &mut cursor, len, item_index, "B*n 内容")?;
+                DecodedGdrField {
+                    field_type: "B*n",
+                    value: hex_bytes(bytes),
+                    preview_value: format!("bytes={len}, preview={}", hex_preview(bytes)),
+                }
+            }
+            12 => {
+                let count = take_gdr(payload, &mut cursor, 2, item_index, "D*n bit 数")?;
+                let bit_count = u16::from_le_bytes([count[0], count[1]]) as usize;
+                let byte_count = bit_count.div_ceil(8);
+                let bytes = take_gdr(payload, &mut cursor, byte_count, item_index, "D*n 内容")?;
+                DecodedGdrField {
+                    field_type: "D*n",
+                    value: format!("bits={bit_count}, hex={}", hex_bytes(bytes)),
+                    preview_value: format!(
+                        "bits={bit_count}, bytes={byte_count}, preview={}",
+                        hex_preview(bytes)
+                    ),
+                }
+            }
+            13 => {
+                let bytes = take_gdr(payload, &mut cursor, 1, item_index, "N*1")?;
+                gdr_scalar("N*1", format!("{:X}", bytes[0] & 0x0F))
+            }
+            _ => {
+                return Err(GdrDecodeError {
+                    item_index,
+                    detail: format!("不支持的 V*n 类型码 {type_code}"),
+                });
+            }
+        };
+        fields.push(field);
+    }
+    if cursor != payload.len() {
+        return Err(GdrDecodeError {
+            item_index: usize::from(field_count) + 1,
+            detail: format!("解析结束后仍有 {} 个尾随字节", payload.len() - cursor),
+        });
+    }
+    Ok(DecodedGdr {
+        field_count,
+        fields,
+    })
+}
+
+fn take_gdr<'a>(
+    payload: &'a [u8],
+    cursor: &mut usize,
+    len: usize,
+    item_index: usize,
+    label: &str,
+) -> Result<&'a [u8], GdrDecodeError> {
+    let start = *cursor;
+    let end = start.checked_add(len).ok_or_else(|| GdrDecodeError {
+        item_index,
+        detail: format!("{label} 长度溢出"),
+    })?;
+    let bytes = payload.get(start..end).ok_or_else(|| GdrDecodeError {
+        item_index,
+        detail: format!(
+            "{label} 需要 {len} 字节，实际只剩 {} 字节",
+            payload.len().saturating_sub(start)
+        ),
+    })?;
+    *cursor = end;
+    Ok(bytes)
+}
+
+fn gdr_scalar(field_type: &'static str, value: String) -> DecodedGdrField {
+    DecodedGdrField {
+        field_type,
+        preview_value: value.clone(),
+        value,
+    }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Integer Display via itoa: byte-identical output to `to_string()` without
 /// the fmt machinery, landing in an inline CompactString — zero heap traffic.
 fn itoa_string(value: impl itoa::Integer) -> CompactString {
@@ -799,7 +983,7 @@ impl<'a> FieldCursor<'a> {
                     });
                 }
             }
-            if let Some(value) = field.value.parse::<usize>().ok() {
+            if let Ok(value) = field.value.parse::<usize>() {
                 values.push((spec.name, value));
             }
             fields.push(field);
@@ -1556,6 +1740,92 @@ mod tests {
         assert_eq!(parsed[0].record_type, "DTR");
         assert_eq!(parsed[0].status, RecordStatus::Parsed);
         assert!(parsed[0].fields.is_empty());
+    }
+
+    #[test]
+    fn gdr_decoder_supports_every_stdf_v4_vn_type() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&13_u16.to_le_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&[1, 255]);
+        payload.push(2);
+        payload.extend_from_slice(&500_u16.to_le_bytes());
+        payload.push(3);
+        payload.extend_from_slice(&70_000_u32.to_le_bytes());
+        payload.extend_from_slice(&[4, (-2_i8) as u8]);
+        payload.push(5);
+        payload.extend_from_slice(&(-300_i16).to_le_bytes());
+        payload.push(6);
+        payload.extend_from_slice(&(-70_000_i32).to_le_bytes());
+        payload.push(7);
+        payload.extend_from_slice(&1.5_f32.to_le_bytes());
+        payload.push(8);
+        payload.extend_from_slice(&2.5_f64.to_le_bytes());
+        payload.push(10);
+        payload.extend(cn("AB"));
+        payload.extend_from_slice(&[11, 3, 0xAA, 0xBB, 0xCC]);
+        payload.push(12);
+        payload.extend(dn(10, &[0x55, 0x03]));
+        payload.extend_from_slice(&[13, 0x0A]);
+
+        let decoded = decode_gdr(&payload).expect("decode all GDR types");
+        assert_eq!(decoded.field_count, 13);
+        assert_eq!(
+            decoded
+                .fields
+                .iter()
+                .map(|field| field.field_type)
+                .collect::<Vec<_>>(),
+            vec![
+                "B*0", "U*1", "U*2", "U*4", "I*1", "I*2", "I*4", "R*4", "R*8", "C*n", "B*n", "D*n",
+                "N*1"
+            ]
+        );
+        assert_eq!(decoded.fields[0].value, "<padding>");
+        assert_eq!(decoded.fields[1].value, "255");
+        assert_eq!(decoded.fields[4].value, "-2");
+        assert_eq!(decoded.fields[7].value, "1.5");
+        assert_eq!(decoded.fields[9].value, "AB");
+        assert_eq!(decoded.fields[10].value, "AA BB CC");
+        assert!(decoded.fields[11].value.contains("bits=10"));
+        assert_eq!(decoded.fields[12].value, "A");
+    }
+
+    #[test]
+    fn gdr_decoder_reports_item_for_truncation_unknown_type_and_trailing_bytes() {
+        let truncated = decode_gdr(&[1, 0, 10, 5, b'A']).expect_err("truncated C*n");
+        assert_eq!(truncated.item_index, 1);
+        assert!(truncated.to_string().contains("需要 5 字节"));
+
+        let unknown = decode_gdr(&[1, 0, 9]).expect_err("unknown V*n type");
+        assert_eq!(unknown.item_index, 1);
+        assert!(unknown.to_string().contains("类型码 9"));
+
+        let trailing = decode_gdr(&[0, 0, 0xFF]).expect_err("trailing byte");
+        assert_eq!(trailing.item_index, 1);
+        assert!(trailing.to_string().contains("尾随字节"));
+    }
+
+    #[test]
+    fn gdr_decoder_handles_empty_lossy_and_record_sized_field_limits() {
+        let empty = decode_gdr(&[3, 0, 10, 0, 11, 0, 12, 0, 0]).expect("empty values");
+        assert_eq!(empty.fields[0].value, "");
+        assert_eq!(empty.fields[1].value, "");
+        assert_eq!(empty.fields[1].preview_value, "bytes=0, preview=");
+        assert_eq!(empty.fields[2].value, "bits=0, hex=");
+
+        let lossy = decode_gdr(&[1, 0, 10, 1, 0xFF]).expect("lossy C*n");
+        assert_eq!(lossy.fields[0].value, "\u{FFFD}");
+
+        // REC_LEN is U*2, so a GDR filled with one-byte B*0 entries can carry
+        // at most 65,533 fields after its two-byte FLD_CNT.
+        let field_count = u16::MAX - 2;
+        let mut maximum = Vec::with_capacity(usize::from(u16::MAX));
+        maximum.extend_from_slice(&field_count.to_le_bytes());
+        maximum.resize(usize::from(u16::MAX), 0);
+        let decoded = decode_gdr(&maximum).expect("record-sized field limit");
+        assert_eq!(decoded.field_count, field_count);
+        assert_eq!(decoded.fields.len(), usize::from(field_count));
     }
 
     #[test]

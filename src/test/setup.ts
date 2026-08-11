@@ -18,6 +18,12 @@ if (typeof window !== "undefined" && !window.matchMedia) {
   }));
 }
 
+// jsdom exposes canvas.getContext but reports a not-implemented error when it
+// is called. Returning null exercises the production heuristic fallback.
+if (typeof HTMLCanvasElement !== "undefined") {
+  HTMLCanvasElement.prototype.getContext = vi.fn(() => null) as typeof HTMLCanvasElement.prototype.getContext;
+}
+
 afterEach(() => {
   cleanup();
 });

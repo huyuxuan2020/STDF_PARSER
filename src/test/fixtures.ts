@@ -46,7 +46,8 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
     { record_type: "FAR", count: 1 },
     { record_type: "MIR", count: 1 },
     { record_type: "PTR", count: 2 },
-    { record_type: "DTR", count: 3 }
+    { record_type: "DTR", count: 3 },
+    { record_type: "GDR", count: 3 }
   ];
 
   const records: RecordSummaryPage = {
@@ -81,8 +82,22 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
     ]
   };
 
+  const ptrRecords: RecordSummaryPage = {
+    page: 0,
+    page_size: 50,
+    total: 2,
+    records: [2, 3].map((idx, position) => ({
+      id: `session-1:${idx}`,
+      record_type: "PTR",
+      index: idx,
+      offset: 126 + position * 48,
+      length: 44,
+      status: "parsed" as const
+    }))
+  };
+
   // DTR rows exist in the record list but expose no expanded fields — the
-  // panel offers the on-demand parse & txt download instead.
+  // inspector offers the on-demand parse, preview, and TXT download instead.
   const dtrRecords: RecordSummaryPage = {
     page: 0,
     page_size: 50,
@@ -93,6 +108,20 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
       index: idx,
       offset: 300 + position * 20,
       length: 16,
+      status: "parsed" as const
+    }))
+  };
+
+  const gdrRecords: RecordSummaryPage = {
+    page: 0,
+    page_size: 50,
+    total: 3,
+    records: [8, 9, 10].map((idx, position) => ({
+      id: `session-1:${idx}`,
+      record_type: "GDR",
+      index: idx,
+      offset: 400 + position * 80,
+      length: 64,
       status: "parsed" as const
     }))
   };
@@ -280,15 +309,54 @@ export function createMockApi(overrides: Partial<StdfApi> = {}): MockApi {
     exportTestItemCsv: async () => undefined,
     saveXlsxDialog: async () => "/tmp/pins.xlsx",
     exportMprPinsXlsx: async () => undefined,
-    parseDtrText: async () => ({ session_id: "session-1", count: 3 }),
+    parseDtrText: async () => ({
+      session_id: "session-1",
+      count: 3,
+      previews: [1, 2, 3].map((index) => ({
+        index,
+        offset: 300 + (index - 1) * 20,
+        scope: "part" as const,
+        parts: [{ part_id: "PART-1", head_num: "1", site_num: "1" }],
+        text: index === 1 ? "first line" : `line ${index}`
+      }))
+    }),
+    parseGdrText: async () => ({
+      session_id: "session-1",
+      count: 3,
+      previews: [1, 2, 3].map((index) => ({
+        index,
+        offset: 400 + (index - 1) * 80,
+        field_count: 3,
+        scope: "shared" as const,
+        parts: [
+          { part_id: "PART-1", head_num: "1", site_num: "1" },
+          { part_id: "PART-2", head_num: "1", site_num: "2" }
+        ],
+        fields: [
+          { index: 1, field_type: "C*n", value: "Add two String data ..." },
+          { index: 2, field_type: "C*n", value: `String ${index}` }
+        ],
+        omitted_field_count: index === 3 ? 1 : 0
+      }))
+    }),
     saveTxtDialog: async () => "/tmp/export.txt",
     saveDtrText: async () => undefined,
+    saveGdrText: async () => undefined,
     getRecordGroups: async () => groups,
     getRecords: async (_sessionId, group) =>
-      group === "MIR" ? mirRecords : group === "DTR" ? dtrRecords : records,
+      group === "MIR"
+        ? mirRecords
+        : group === "PTR"
+          ? ptrRecords
+        : group === "DTR"
+          ? dtrRecords
+          : group === "GDR"
+            ? gdrRecords
+            : records,
     getRecordFields: async (_sessionId, recordId) => {
       if (recordId.endsWith(":1")) return mirFields;
       if (dtrRecords.records.some((record) => record.id === recordId)) return [];
+      if (gdrRecords.records.some((record) => record.id === recordId)) return [];
       return fields;
     },
     searchFields: async (): Promise<SearchResultPage> => ({

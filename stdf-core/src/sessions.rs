@@ -1,6 +1,7 @@
 use crate::diagnostics::{FileIssue, FileIssueCollector};
 use crate::parser::{
-    parse_reader, ParseErrorEvent, ParseProgress, ParsedRecord, ParserError, RecordStatus,
+    decode_gdr, parse_reader, ParseErrorEvent, ParseProgress, ParsedRecord, ParserError,
+    RecordStatus,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -34,6 +35,8 @@ const PARSE_BUFFER_SIZE: usize = 8 * 1_024 * 1_024;
 /// COMMIT flush (~50k rows) without stalling the parse thread; at ~200 bytes a
 /// row the peak buffer stays around 15 MB.
 const WRITE_QUEUE_DEPTH: usize = 65_536;
+const TEXT_PREVIEW_RECORD_LIMIT: usize = 3;
+const GDR_PREVIEW_FIELD_LIMIT: usize = 20;
 
 const RECORD_INSERT_SQL: &str = "INSERT INTO records \
     (record_type, idx, group_idx, rec_offset, rec_length, status, fields_json) \
@@ -272,6 +275,7 @@ pub struct BinSummary {
 
 #[derive(Clone, Default)]
 struct PendingPartContext {
+    pir_record_index: Option<usize>,
     head_num: String,
     site_num: String,
     site_nums: Vec<String>,
@@ -284,6 +288,15 @@ struct PendingPartContext {
     hbin_name: String,
     hbin_pf: String,
     results: FxHashMap<(String, u32), TestItemCell>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PartInterval {
+    start_index: usize,
+    end_index: usize,
+    part_id: String,
+    head_num: String,
+    site_num: String,
 }
 
 /// Official bin counts from HBR/SBR records. HEAD_NUM=255 marks the tester's
@@ -322,6 +335,7 @@ struct TestItemAccumulator {
     /// earlier touchdown, so counting this map yields per-die final results.
     die_bins: FxHashMap<String, (String, String)>,
     open_parts: FxHashMap<(String, String), PendingPartContext>,
+    part_intervals: Vec<PartInterval>,
     part_rows: FxHashMap<(String, String), TestItemPartRow>,
     part_order: Vec<(String, String)>,
     /// Per-record-type counter used to stamp the position each PTR/MPR/FTR
@@ -386,12 +400,60 @@ pub struct SearchProgress {
     pub total: usize,
 }
 
-/// Result of an on-demand DTR text extraction: how many DTR records were
-/// written (one line each) to the session's temp txt, ready for save_dtr_text.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TextRecordScope {
+    Part,
+    Shared,
+    Unassigned,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TextRecordPart {
+    pub part_id: String,
+    pub head_num: String,
+    pub site_num: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DtrPreview {
+    pub index: usize,
+    pub offset: u64,
+    pub scope: TextRecordScope,
+    pub parts: Vec<TextRecordPart>,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct DtrParseResult {
     pub session_id: String,
     pub count: usize,
+    pub previews: Vec<DtrPreview>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GdrPreviewField {
+    pub index: usize,
+    pub field_type: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GdrPreview {
+    pub index: usize,
+    pub offset: u64,
+    pub field_count: usize,
+    pub scope: TextRecordScope,
+    pub parts: Vec<TextRecordPart>,
+    pub fields: Vec<GdrPreviewField>,
+    pub omitted_field_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GdrParseResult {
+    pub session_id: String,
+    pub count: usize,
+    pub previews: Vec<GdrPreview>,
 }
 
 #[derive(Debug, Clone)]
@@ -511,6 +573,7 @@ impl SessionManager {
                 old.cancel_flag.store(true, Ordering::SeqCst);
                 let _ = std::fs::remove_file(&old.db_path);
                 let _ = std::fs::remove_file(dtr_text_path(&old_id));
+                let _ = std::fs::remove_file(gdr_text_path(&old_id));
             }
         }
         self.sessions
@@ -1127,59 +1190,104 @@ impl SessionManager {
         std::fs::write(path, csv).map_err(|error| format!("写入 CSV 失败: {error}"))
     }
 
-    /// Re-scan the session's source file (plain / gz / zip alike) and extract
-    /// every DTR TEXT_DAT into a temp txt, one line per record in file order.
-    /// The txt never crosses the IPC bridge — save_dtr_text copies it to the
-    /// user-chosen destination afterwards.
-    pub fn parse_dtr_text(&self, session_id: &str) -> Result<DtrParseResult, String> {
-        let (file_path, file_size) = {
-            let guard = self.sessions.lock().map_err(|_| "session lock poisoned")?;
-            let state = guard
-                .get(session_id)
-                .ok_or_else(|| "解析会话不存在".to_string())?;
-            (state.session.file_path.clone(), state.session.file_size)
-        };
-        let txt_path = dtr_text_path(session_id);
-        let scan = File::create(&txt_path)
-            .map_err(|error| format!("写入 DTR 文本失败: {error}"))
-            .and_then(|file| {
-                let mut writer = BufWriter::new(file);
-                let count = with_input_reader(Path::new(&file_path), file_size, |reader, _| {
-                    extract_dtr_text(reader, &mut writer)
-                })??;
-                writer
-                    .flush()
-                    .map_err(|error| format!("写入 DTR 文本失败: {error}"))?;
-                Ok(count)
-            });
-        match scan {
-            Ok(count) => Ok(DtrParseResult {
-                session_id: session_id.to_string(),
-                count,
-            }),
-            Err(error) => {
-                // Never leave a partial txt behind — save_dtr_text treats its
-                // existence as "parse succeeded".
-                let _ = std::fs::remove_file(&txt_path);
-                Err(error)
-            }
+    fn text_export_source(
+        &self,
+        session_id: &str,
+    ) -> Result<(String, u64, Vec<PartInterval>), String> {
+        let guard = self.sessions.lock().map_err(|_| "session lock poisoned")?;
+        let state = guard
+            .get(session_id)
+            .ok_or_else(|| "解析会话不存在".to_string())?;
+        if !matches!(state.snapshot.status, ParseStatus::Complete) {
+            return Err("请等待 STDF 主解析完成后再解析 GDR/DTR".to_string());
         }
+        let mut intervals = state.test_items.part_intervals.clone();
+        intervals.extend(state.test_items.open_parts.values().filter_map(|part| {
+            part.pir_record_index.map(|start_index| PartInterval {
+                start_index,
+                end_index: usize::MAX,
+                part_id: "-".to_string(),
+                head_num: part.head_num.clone(),
+                site_num: part.site_num.clone(),
+            })
+        }));
+        intervals.sort_by_key(|part| (part.start_index, part.end_index));
+        Ok((
+            state.session.file_path.clone(),
+            state.session.file_size,
+            intervals,
+        ))
+    }
+
+    /// Re-scan the source and extract DTR text with PIR/PRR context sections.
+    pub fn parse_dtr_text(&self, session_id: &str) -> Result<DtrParseResult, String> {
+        let (file_path, file_size, intervals) = self.text_export_source(session_id)?;
+        let txt_path = dtr_text_path(session_id);
+        let extracted = stage_text_export(&txt_path, "DTR 文本", |writer| {
+            with_input_reader(Path::new(&file_path), file_size, |reader, _| {
+                extract_dtr_text(reader, writer, &intervals)
+            })?
+        })?;
+        Ok(DtrParseResult {
+            session_id: session_id.to_string(),
+            count: extracted.count,
+            previews: extracted.previews,
+        })
     }
 
     /// Copy the session's parsed DTR txt to `path`. Errors if parse_dtr_text
     /// has not succeeded for this session yet.
     pub fn save_dtr_text(&self, session_id: &str, path: &str) -> Result<(), String> {
+        self.save_text_export(
+            session_id,
+            path,
+            &dtr_text_path(session_id),
+            "DTR 文本尚未解析，请先解析",
+        )
+    }
+
+    /// Re-scan the source and decode every GDR into a context-separated txt.
+    pub fn parse_gdr_text(&self, session_id: &str) -> Result<GdrParseResult, String> {
+        let (file_path, file_size, intervals) = self.text_export_source(session_id)?;
+        let txt_path = gdr_text_path(session_id);
+        let extracted = stage_text_export(&txt_path, "GDR 文本", |writer| {
+            with_input_reader(Path::new(&file_path), file_size, |reader, _| {
+                extract_gdr_text(reader, writer, &intervals)
+            })?
+        })?;
+        Ok(GdrParseResult {
+            session_id: session_id.to_string(),
+            count: extracted.count,
+            previews: extracted.previews,
+        })
+    }
+
+    pub fn save_gdr_text(&self, session_id: &str, path: &str) -> Result<(), String> {
+        self.save_text_export(
+            session_id,
+            path,
+            &gdr_text_path(session_id),
+            "GDR 数据尚未解析，请先解析",
+        )
+    }
+
+    fn save_text_export(
+        &self,
+        session_id: &str,
+        path: &str,
+        staged_path: &Path,
+        missing_message: &str,
+    ) -> Result<(), String> {
         {
             let guard = self.sessions.lock().map_err(|_| "session lock poisoned")?;
             if !guard.contains_key(session_id) {
                 return Err("解析会话不存在".to_string());
             }
         }
-        let txt_path = dtr_text_path(session_id);
-        if !txt_path.exists() {
-            return Err("DTR 文本尚未解析，请先解析".to_string());
+        if !staged_path.exists() {
+            return Err(missing_message.to_string());
         }
-        std::fs::copy(&txt_path, path)
+        std::fs::copy(staged_path, path)
             .map(|_| ())
             .map_err(|error| format!("写入 TXT 失败: {error}"))
     }
@@ -1507,42 +1615,328 @@ fn display_or_dash(value: &str) -> String {
     }
 }
 
-/// Walk record headers, skipping every payload except DTR (50,30), whose
-/// TEXT_DAT becomes one line of `writer`. A truncated tail record ends the
-/// scan quietly — same tolerance as the main parse, which keeps what it read.
-fn extract_dtr_text(reader: &mut dyn Read, writer: &mut impl Write) -> Result<usize, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordTextContext {
+    scope: TextRecordScope,
+    parts: Vec<TextRecordPart>,
+}
+
+struct ContextTracker {
+    starts: FxHashMap<usize, Vec<(usize, TextRecordPart)>>,
+    ends: FxHashMap<usize, Vec<usize>>,
+    active: Vec<(usize, TextRecordPart)>,
+}
+
+impl ContextTracker {
+    fn new(intervals: &[PartInterval]) -> Self {
+        let mut starts = FxHashMap::default();
+        let mut ends = FxHashMap::default();
+        for interval in intervals {
+            starts
+                .entry(interval.start_index)
+                .or_insert_with(Vec::new)
+                .push((
+                    interval.start_index,
+                    TextRecordPart {
+                        part_id: interval.part_id.clone(),
+                        head_num: interval.head_num.clone(),
+                        site_num: interval.site_num.clone(),
+                    },
+                ));
+            if interval.end_index != usize::MAX {
+                ends.entry(interval.end_index)
+                    .or_insert_with(Vec::new)
+                    .push(interval.start_index);
+            }
+        }
+        Self {
+            starts,
+            ends,
+            active: Vec::new(),
+        }
+    }
+
+    fn context_at(&mut self, record_index: usize) -> RecordTextContext {
+        if let Some(ending) = self.ends.remove(&record_index) {
+            self.active
+                .retain(|(start_index, _)| !ending.contains(start_index));
+        }
+        if let Some(starting) = self.starts.remove(&record_index) {
+            self.active.extend(starting);
+            self.active.sort_by_key(|(start_index, _)| *start_index);
+        }
+        let parts = self
+            .active
+            .iter()
+            .map(|(_, part)| part.clone())
+            .collect::<Vec<_>>();
+        let scope = match parts.len() {
+            0 => TextRecordScope::Unassigned,
+            1 => TextRecordScope::Part,
+            _ => TextRecordScope::Shared,
+        };
+        RecordTextContext { scope, parts }
+    }
+}
+
+fn stage_text_export<T>(
+    staged_path: &Path,
+    label: &str,
+    extract: impl FnOnce(&mut BufWriter<File>) -> Result<T, String>,
+) -> Result<T, String> {
+    let result = File::create(staged_path)
+        .map_err(|error| format!("写入 {label}失败: {error}"))
+        .and_then(|file| {
+            let mut writer = BufWriter::new(file);
+            let extracted = extract(&mut writer)?;
+            writer
+                .flush()
+                .map_err(|error| format!("写入 {label}失败: {error}"))?;
+            Ok(extracted)
+        });
+    if result.is_err() {
+        // A staged file is the success marker used by the save commands.
+        let _ = std::fs::remove_file(staged_path);
+    }
+    result
+}
+
+fn read_up_to<R: Read>(reader: &mut R, bytes: &mut [u8]) -> Result<usize, String> {
+    let mut read = 0_usize;
+    while read < bytes.len() {
+        match reader.read(&mut bytes[read..]) {
+            Ok(0) => break,
+            Ok(count) => read += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(ParserError::Io(error).to_string()),
+        }
+    }
+    Ok(read)
+}
+
+fn scan_contextual_records(
+    reader: &mut dyn Read,
+    target: (u8, u8),
+    intervals: &[PartInterval],
+    mut on_record: impl FnMut(usize, u64, &[u8], &RecordTextContext) -> Result<(), String>,
+) -> Result<(), String> {
     let mut reader = BufReader::with_capacity(PARSE_BUFFER_SIZE, reader);
-    let mut count = 0_usize;
+    let mut tracker = ContextTracker::new(intervals);
+    let mut record_index = 0_usize;
+    let mut offset = 0_u64;
+    let mut payload = Vec::<u8>::new();
     loop {
         let mut header = [0_u8; 4];
-        match reader.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(error) => return Err(format!("读取 STDF 失败: {error}")),
+        let header_read = read_up_to(&mut reader, &mut header)?;
+        if header_read == 0 {
+            break;
         }
-        let length = u64::from(u16::from_le_bytes([header[0], header[1]]));
-        if header[2] == 50 && header[3] == 30 {
-            let mut payload = vec![0_u8; length as usize];
-            match reader.read_exact(&mut payload) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(error) => return Err(format!("读取 STDF 失败: {error}")),
+        if header_read < header.len() {
+            return Err(ParserError::TruncatedHeader {
+                offset,
+                available: header_read,
             }
-            let text = crate::parser::decode_dtr_text(&payload);
+            .to_string());
+        }
+        let length = u16::from_le_bytes([header[0], header[1]]);
+        let payload_length = usize::from(length);
+        let rec_typ = header[2];
+        let rec_sub = header[3];
+        let context = tracker.context_at(record_index);
+        if (rec_typ, rec_sub) == target {
+            if payload.len() < payload_length {
+                payload.resize(payload_length, 0);
+            }
+            let payload_read = read_up_to(&mut reader, &mut payload[..payload_length])?;
+            if payload_read < payload_length {
+                return Err(ParserError::TruncatedPayload {
+                    offset,
+                    expected: payload_length,
+                    available: payload_read,
+                    rec_typ,
+                    rec_sub,
+                }
+                .to_string());
+            }
+            on_record(record_index, offset, &payload[..payload_length], &context)?;
+        } else {
+            let expected = u64::from(length);
+            let skipped = io::copy(&mut (&mut reader).take(expected), &mut io::sink())
+                .map_err(|error| ParserError::Io(error).to_string())?;
+            if skipped < expected {
+                return Err(ParserError::TruncatedPayload {
+                    offset,
+                    expected: payload_length,
+                    available: skipped as usize,
+                    rec_typ,
+                    rec_sub,
+                }
+                .to_string());
+            }
+        }
+        offset += 4 + u64::from(length);
+        record_index += 1;
+    }
+    Ok(())
+}
+
+struct DtrExtraction {
+    count: usize,
+    previews: Vec<DtrPreview>,
+}
+
+fn extract_dtr_text(
+    reader: &mut dyn Read,
+    writer: &mut impl Write,
+    intervals: &[PartInterval],
+) -> Result<DtrExtraction, String> {
+    let mut count = 0_usize;
+    let mut previews = Vec::new();
+    let mut last_context: Option<RecordTextContext> = None;
+    scan_contextual_records(
+        reader,
+        (50, 30),
+        intervals,
+        |_, offset, payload, context| {
+            let text = crate::parser::decode_dtr_text(payload);
+            if last_context.as_ref() != Some(context) {
+                if count > 0 {
+                    writeln!(writer).map_err(|error| format!("写入 DTR 文本失败: {error}"))?;
+                }
+                write_context_header(writer, context)
+                    .map_err(|error| format!("写入 DTR 文本失败: {error}"))?;
+                writeln!(writer).map_err(|error| format!("写入 DTR 文本失败: {error}"))?;
+                last_context = Some(context.clone());
+            }
             writer
                 .write_all(text.as_bytes())
                 .and_then(|_| writer.write_all(b"\n"))
                 .map_err(|error| format!("写入 DTR 文本失败: {error}"))?;
             count += 1;
-        } else {
-            let skipped = io::copy(&mut (&mut reader).take(length), &mut io::sink())
-                .map_err(|error| format!("读取 STDF 失败: {error}"))?;
-            if skipped < length {
-                break;
+            if previews.len() < TEXT_PREVIEW_RECORD_LIMIT {
+                previews.push(DtrPreview {
+                    index: count,
+                    offset,
+                    scope: context.scope.clone(),
+                    parts: context.parts.clone(),
+                    text,
+                });
             }
-        }
+            Ok(())
+        },
+    )?;
+    Ok(DtrExtraction { count, previews })
+}
+
+struct GdrExtraction {
+    count: usize,
+    previews: Vec<GdrPreview>,
+}
+
+fn extract_gdr_text(
+    reader: &mut dyn Read,
+    writer: &mut impl Write,
+    intervals: &[PartInterval],
+) -> Result<GdrExtraction, String> {
+    let mut count = 0_usize;
+    let mut previews = Vec::new();
+    scan_contextual_records(
+        reader,
+        (50, 10),
+        intervals,
+        |_, offset, payload, context| {
+            let decoded = decode_gdr(payload)
+                .map_err(|error| format!("GDR 解析失败: offset {offset}, {error}"))?;
+            count += 1;
+            if count > 1 {
+                writeln!(writer).map_err(|error| format!("写入 GDR 文本失败: {error}"))?;
+            }
+            write_context_header(writer, context)
+                .map_err(|error| format!("写入 GDR 文本失败: {error}"))?;
+            writeln!(writer).map_err(|error| format!("写入 GDR 文本失败: {error}"))?;
+            writeln!(
+                writer,
+                "-------------------- GDR #{count} --------------------"
+            )
+            .and_then(|_| writeln!(writer, "OFFSET: {offset}"))
+            .and_then(|_| writeln!(writer, "FLD_CNT: {}", decoded.field_count))
+            .map_err(|error| format!("写入 GDR 文本失败: {error}"))?;
+            for (index, field) in decoded.fields.iter().enumerate() {
+                writeln!(
+                    writer,
+                    "GEN_DATA[{}] | {} | {}",
+                    index + 1,
+                    field.field_type,
+                    field.value
+                )
+                .map_err(|error| format!("写入 GDR 文本失败: {error}"))?;
+            }
+            if previews.len() < TEXT_PREVIEW_RECORD_LIMIT {
+                let fields = decoded
+                    .fields
+                    .iter()
+                    .take(GDR_PREVIEW_FIELD_LIMIT)
+                    .enumerate()
+                    .map(|(index, field)| GdrPreviewField {
+                        index: index + 1,
+                        field_type: field.field_type.to_string(),
+                        value: field.preview_value.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                previews.push(GdrPreview {
+                    index: count,
+                    offset,
+                    field_count: usize::from(decoded.field_count),
+                    scope: context.scope.clone(),
+                    parts: context.parts.clone(),
+                    omitted_field_count: usize::from(decoded.field_count)
+                        .saturating_sub(fields.len()),
+                    fields,
+                });
+            }
+            Ok(())
+        },
+    )?;
+    Ok(GdrExtraction { count, previews })
+}
+
+fn write_context_header(writer: &mut impl Write, context: &RecordTextContext) -> io::Result<()> {
+    writeln!(
+        writer,
+        "==================== PART CONTEXT ===================="
+    )?;
+    let scope = match context.scope {
+        TextRecordScope::Part => "PART",
+        TextRecordScope::Shared => "SHARED",
+        TextRecordScope::Unassigned => "UNASSIGNED",
+    };
+    writeln!(writer, "SCOPE: {scope}")?;
+    for part in &context.parts {
+        writeln!(
+            writer,
+            "PART: PART_ID={} | HEAD_NUM={} | SITE_NUM={}",
+            context_header_value(&part.part_id),
+            context_header_value(&part.head_num),
+            context_header_value(&part.site_num)
+        )?;
     }
-    Ok(count)
+    writeln!(
+        writer,
+        "======================================================"
+    )
+}
+
+fn context_header_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '\r' | '\n' | '\t') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
 }
 
 /// Dedicated temp directory for decompressed files and per-session indexes.
@@ -1555,6 +1949,10 @@ pub fn temp_workspace_dir() -> PathBuf {
 /// picks a destination. Lives in the startup-wiped temp workspace.
 fn dtr_text_path(session_id: &str) -> PathBuf {
     temp_workspace_dir().join(format!("{session_id}.dtr.txt"))
+}
+
+fn gdr_text_path(session_id: &str) -> PathBuf {
+    temp_workspace_dir().join(format!("{session_id}.gdr.txt"))
 }
 
 /// Open a fresh per-session SQLite database. It is a rebuildable temp index, so
@@ -1719,7 +2117,19 @@ fn update_test_item_accumulator(
         }
         "PIR" => {
             let site_key = site_key(fields);
+            if let Some(previous) = acc.open_parts.get(&site_key) {
+                if let Some(start_index) = previous.pir_record_index {
+                    acc.part_intervals.push(PartInterval {
+                        start_index,
+                        end_index: idx,
+                        part_id: "-".to_string(),
+                        head_num: previous.head_num.clone(),
+                        site_num: previous.site_num.clone(),
+                    });
+                }
+            }
             let entry = acc.open_parts.entry(site_key).or_default();
+            entry.pir_record_index = Some(idx);
             entry.head_num = field_value(fields, "HEAD_NUM").to_string();
             entry.site_num = field_value(fields, "SITE_NUM").to_string();
             if entry.site_nums.is_empty() && !entry.site_num.is_empty() {
@@ -1836,6 +2246,20 @@ fn update_test_item_accumulator(
             if pending.site_nums.is_empty() && !pending.site_num.is_empty() {
                 pending.site_nums.push(pending.site_num.clone());
             }
+            if let Some(start_index) = pending.pir_record_index {
+                let raw_part_id = field_value(fields, "PART_ID");
+                acc.part_intervals.push(PartInterval {
+                    start_index,
+                    end_index: idx,
+                    part_id: if raw_part_id.is_empty() {
+                        "-".to_string()
+                    } else {
+                        raw_part_id.to_string()
+                    },
+                    head_num: pending.head_num.clone(),
+                    site_num: pending.site_num.clone(),
+                });
+            }
             let sbin_num = field_value(fields, "SOFT_BIN").to_string();
             let hbin_num = field_value(fields, "HARD_BIN").to_string();
             // Track final bins per die: X/Y is the die identity on wafer files
@@ -1844,7 +2268,7 @@ fn update_test_item_accumulator(
             {
                 let x = field_value(fields, "X_COORD");
                 let y = field_value(fields, "Y_COORD");
-                let has_xy = !x.is_empty() && !y.is_empty() && !(x == "-32768" || y == "-32768");
+                let has_xy = !(x.is_empty() || y.is_empty() || x == "-32768" || y == "-32768");
                 let die_key = if has_xy {
                     format!("xy:{x}:{y}")
                 } else {
@@ -2689,13 +3113,13 @@ fn resolve_column(
     //   bit 0 (0x01): RES_SCAL invalid
     //   bit 4 (0x10): LO_LIMIT + LLM_SCAL invalid   bit 6 (0x40): no low limit
     //   bit 5 (0x20): HI_LIMIT + HLM_SCAL invalid   bit 7 (0x80): no high limit
-    let opt_flag = parse_b1(&field_value(fields, "OPT_FLAG"));
+    let opt_flag = parse_b1(field_value(fields, "OPT_FLAG"));
     let low_valid = opt_flag.is_none_or(|flag| flag & 0b0101_0000 == 0);
     let high_valid = opt_flag.is_none_or(|flag| flag & 0b1010_0000 == 0);
     let res_scal_valid = opt_flag.is_none_or(|flag| flag & 0b0000_0001 == 0);
 
     let res_scal = if res_scal_valid {
-        parse_scale(&field_value(fields, "RES_SCAL"))
+        parse_scale(field_value(fields, "RES_SCAL"))
     } else {
         0
     };
@@ -2704,13 +3128,13 @@ fn resolve_column(
     let llm_scal = if llm_raw_scal.trim().is_empty() {
         res_scal
     } else {
-        parse_scale(&llm_raw_scal)
+        parse_scale(llm_raw_scal)
     };
     let hlm_raw_scal = field_value(fields, "HLM_SCAL");
     let hlm_scal = if hlm_raw_scal.trim().is_empty() {
         res_scal
     } else {
-        parse_scale(&hlm_raw_scal)
+        parse_scale(hlm_raw_scal)
     };
     let units = field_value(fields, "UNITS");
     let lo_raw = if low_valid {
@@ -2735,15 +3159,15 @@ fn resolve_column(
             record_type: record_type.to_string(),
             test_num,
             test_name,
-            low_limit: display_limit(&lo_raw, res_scal),
-            high_limit: display_limit(&hi_raw, res_scal),
+            low_limit: display_limit(lo_raw, res_scal),
+            high_limit: display_limit(hi_raw, res_scal),
             unit,
             pmr_indices,
         },
         ColumnMeta {
             res_scal,
-            low_base: parse_float(&lo_raw).map(|v| to_base(v, llm_scal)),
-            high_base: parse_float(&hi_raw).map(|v| to_base(v, hlm_scal)),
+            low_base: parse_float(lo_raw).map(|v| to_base(v, llm_scal)),
+            high_base: parse_float(hi_raw).map(|v| to_base(v, hlm_scal)),
         },
     )
 }
@@ -3311,27 +3735,26 @@ fn with_input_reader<T>(
     // in the data descriptor + central directory, which the pure streaming
     // reader rejects ("file length is not available in the local header").
     let input = File::open(path).map_err(|error| error.to_string())?;
-    match zip::ZipArchive::new(BufReader::with_capacity(PARSE_BUFFER_SIZE, input)) {
-        Ok(mut archive) => {
-            for index in 0..archive.len() {
-                let mut entry = archive
-                    .by_index(index)
-                    .map_err(|error| format!("zip 解析失败: {error}"))?;
-                if entry.is_file() && is_stdf_entry_name(entry.name()) {
-                    let total_bytes = if entry.size() == 0 {
-                        fallback_total
-                    } else {
-                        entry.size()
-                    };
-                    return Ok(parse(&mut entry, total_bytes));
-                }
+    if let Ok(mut archive) =
+        zip::ZipArchive::new(BufReader::with_capacity(PARSE_BUFFER_SIZE, input))
+    {
+        for index in 0..archive.len() {
+            let mut entry = archive
+                .by_index(index)
+                .map_err(|error| format!("zip 解析失败: {error}"))?;
+            if entry.is_file() && is_stdf_entry_name(entry.name()) {
+                let total_bytes = if entry.size() == 0 {
+                    fallback_total
+                } else {
+                    entry.size()
+                };
+                return Ok(parse(&mut entry, total_bytes));
             }
-            return Err("zip 包内没有可解析的文件".to_string());
         }
-        // No usable central directory (truncated download, exotic writer):
-        // fall back to walking local headers as before.
-        Err(_) => {}
+        return Err("zip 包内没有可解析的文件".to_string());
     }
+    // No usable central directory (truncated download, exotic writer): fall
+    // back to walking local headers as before.
 
     let input = File::open(path).map_err(|error| error.to_string())?;
     let mut zip_stream = BufReader::with_capacity(PARSE_BUFFER_SIZE, input);
@@ -3674,6 +4097,37 @@ mod tests {
 
     fn dn(bit_count: u16) -> Vec<u8> {
         bit_count.to_le_bytes().to_vec()
+    }
+
+    fn prr(head_num: u8, site_num: u8, part_id: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        push_payload(
+            &mut payload,
+            &[
+                u1(head_num),
+                u1(site_num),
+                u1(0),
+                u2(1),
+                u2(1),
+                u2(1),
+                i2(-32768),
+                i2(-32768),
+                u4(10),
+                cn(part_id),
+                cn(""),
+                vec![0],
+            ],
+        );
+        payload
+    }
+
+    fn gdr_strings(values: &[&str]) -> Vec<u8> {
+        let mut payload = (values.len() as u16).to_le_bytes().to_vec();
+        for value in values {
+            payload.push(10);
+            payload.extend(cn(value));
+        }
+        payload
     }
 
     fn push_payload(buf: &mut Vec<u8>, parts: &[Vec<u8>]) {
@@ -5142,7 +5596,12 @@ mod tests {
 
         // One text line per DTR in file order; empty text stays an empty line,
         // and the invalid 0xFF byte decodes lossily instead of failing.
-        let expected = "first line\n良率 100%\n\nA\u{FFFD}\nhi\n";
+        let expected = concat!(
+            "==================== PART CONTEXT ====================\n",
+            "SCOPE: UNASSIGNED\n",
+            "======================================================\n\n",
+            "first line\n良率 100%\n\nA\u{FFFD}\nhi\n"
+        );
 
         for (label, path) in [("plain", &stdf_path), ("zip", &zip_path)] {
             let manager = SessionManager::default();
@@ -5171,6 +5630,9 @@ mod tests {
                 .expect("parse dtr text");
             assert_eq!(result.session_id, session.session_id, "{label}");
             assert_eq!(result.count, 5, "{label}: DTR record count");
+            assert_eq!(result.previews.len(), 3, "{label}: preview limit");
+            assert_eq!(result.previews[0].text, "first line");
+            assert_eq!(result.previews[0].scope, TextRecordScope::Unassigned);
 
             let dest = dir.path().join(format!("dtr-out-{label}.txt"));
             manager
@@ -5182,6 +5644,181 @@ mod tests {
                 "{label}: saved txt content"
             );
         }
+    }
+
+    #[test]
+    fn gdr_and_dtr_exports_include_resolved_part_contexts_and_previews() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stdf_path = dir.path().join("context-records.std");
+        let mut bytes = Vec::new();
+        bytes.extend(record(0, 10, &[2, 4]));
+        bytes.extend(record(5, 10, &[1, 1]));
+        bytes.extend(record(5, 10, &[1, 2]));
+        bytes.extend(record(50, 30, &cn("shared dtr")));
+        bytes.extend(record(50, 10, &gdr_strings(&["shared gdr"])));
+        bytes.extend(record(5, 20, &prr(1, 1, "P1")));
+        bytes.extend(record(5, 20, &prr(1, 2, "P2")));
+        bytes.extend(record(50, 30, &cn("unassigned dtr")));
+        bytes.extend(record(50, 10, &gdr_strings(&["unassigned gdr"])));
+        bytes.extend(record(5, 10, &[1, 1]));
+        bytes.extend(record(50, 30, &cn("part dtr")));
+        let many_values = (1..=21)
+            .map(|index| format!("value {index}"))
+            .collect::<Vec<_>>();
+        let many_refs = many_values.iter().map(String::as_str).collect::<Vec<_>>();
+        bytes.extend(record(50, 10, &gdr_strings(&many_refs)));
+        bytes.extend(record(5, 20, &prr(1, 1, "P3")));
+        std::fs::write(&stdf_path, bytes).expect("write STDF");
+
+        let manager = SessionManager::default();
+        let (tx, rx) = mpsc::channel();
+        let session = manager
+            .open_stdf(stdf_path.to_string_lossy().to_string(), move |event| {
+                let _ = tx.send(event);
+            })
+            .expect("open session");
+        for _ in 0..100 {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(SessionEvent::Complete(_)) => break,
+                Ok(SessionEvent::Error(error)) => panic!("unexpected parse error: {error:?}"),
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        let dtr = manager
+            .parse_dtr_text(&session.session_id)
+            .expect("parse DTR");
+        assert_eq!(dtr.count, 3);
+        assert_eq!(dtr.previews.len(), 3);
+        assert_eq!(dtr.previews[0].scope, TextRecordScope::Shared);
+        assert_eq!(
+            dtr.previews[0]
+                .parts
+                .iter()
+                .map(|part| part.part_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["P1", "P2"]
+        );
+        assert_eq!(dtr.previews[1].scope, TextRecordScope::Unassigned);
+        assert_eq!(dtr.previews[2].scope, TextRecordScope::Part);
+        assert_eq!(dtr.previews[2].parts[0].part_id, "P3");
+
+        let gdr = manager
+            .parse_gdr_text(&session.session_id)
+            .expect("parse GDR");
+        assert_eq!(gdr.count, 3);
+        assert_eq!(gdr.previews.len(), 3);
+        assert_eq!(gdr.previews[0].scope, TextRecordScope::Shared);
+        assert_eq!(gdr.previews[0].fields[0].value, "shared gdr");
+        assert_eq!(gdr.previews[1].scope, TextRecordScope::Unassigned);
+        assert_eq!(gdr.previews[2].scope, TextRecordScope::Part);
+        assert_eq!(gdr.previews[2].fields.len(), GDR_PREVIEW_FIELD_LIMIT);
+        assert_eq!(gdr.previews[2].omitted_field_count, 1);
+
+        let dtr_dest = dir.path().join("context-dtr.txt");
+        manager
+            .save_dtr_text(&session.session_id, &dtr_dest.to_string_lossy())
+            .expect("save DTR");
+        let dtr_text = std::fs::read_to_string(dtr_dest).expect("read DTR");
+        assert!(dtr_text.contains("SCOPE: SHARED"));
+        assert!(dtr_text.contains("PART_ID=P1 | HEAD_NUM=1 | SITE_NUM=1"));
+        assert!(dtr_text.contains("SCOPE: UNASSIGNED"));
+        assert!(dtr_text.contains("shared dtr"));
+
+        let gdr_dest = dir.path().join("context-gdr.txt");
+        manager
+            .save_gdr_text(&session.session_id, &gdr_dest.to_string_lossy())
+            .expect("save GDR");
+        let gdr_text = std::fs::read_to_string(gdr_dest).expect("read GDR");
+        assert!(gdr_text.contains("-------------------- GDR #1 --------------------"));
+        assert!(gdr_text.contains("GEN_DATA[1] | C*n | shared gdr"));
+        assert!(gdr_text.contains("GEN_DATA[21] | C*n | value 21"));
+    }
+
+    #[test]
+    fn text_context_tracks_missing_ids_unclosed_parts_and_scope_switches() {
+        let intervals = vec![
+            PartInterval {
+                start_index: 0,
+                end_index: 4,
+                part_id: "-".to_string(),
+                head_num: "1".to_string(),
+                site_num: "1".to_string(),
+            },
+            PartInterval {
+                start_index: 1,
+                end_index: 5,
+                part_id: "P2".to_string(),
+                head_num: "1".to_string(),
+                site_num: "2".to_string(),
+            },
+            PartInterval {
+                start_index: 10,
+                end_index: usize::MAX,
+                part_id: "-".to_string(),
+                head_num: "2".to_string(),
+                site_num: "3".to_string(),
+            },
+        ];
+        let mut tracker = ContextTracker::new(&intervals);
+
+        let missing_id = tracker.context_at(0);
+        assert_eq!(missing_id.scope, TextRecordScope::Part);
+        assert_eq!(missing_id.parts[0].part_id, "-");
+
+        let shared = tracker.context_at(1);
+        assert_eq!(shared.scope, TextRecordScope::Shared);
+        assert_eq!(shared.parts.len(), 2);
+
+        let switched = tracker.context_at(4);
+        assert_eq!(switched.scope, TextRecordScope::Part);
+        assert_eq!(switched.parts[0].part_id, "P2");
+        assert_eq!(tracker.context_at(5).scope, TextRecordScope::Unassigned);
+
+        let unclosed = tracker.context_at(10);
+        assert_eq!(unclosed.scope, TextRecordScope::Part);
+        assert_eq!(unclosed.parts[0].site_num, "3");
+        assert_eq!(tracker.context_at(100).scope, TextRecordScope::Part);
+    }
+
+    #[test]
+    #[ignore = "requires STDF_GDR_SAMPLE_PATH pointing at the local debug sample"]
+    fn gdr_export_reads_configured_real_sample() {
+        let Ok(path) = std::env::var("STDF_GDR_SAMPLE_PATH") else {
+            eprintln!("skipped: set STDF_GDR_SAMPLE_PATH to the GDR sample");
+            return;
+        };
+        let manager = SessionManager::default();
+        let (tx, rx) = mpsc::channel();
+        let session = manager
+            .open_stdf(path, move |event| {
+                let _ = tx.send(event);
+            })
+            .expect("open sample");
+        let mut completed = false;
+        for _ in 0..200 {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(SessionEvent::Complete(_)) => {
+                    completed = true;
+                    break;
+                }
+                Ok(SessionEvent::Error(error)) => panic!("unexpected parse error: {error:?}"),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(completed, "sample parse should complete");
+
+        let result = manager
+            .parse_gdr_text(&session.session_id)
+            .expect("parse sample GDR");
+        assert_eq!(result.count, 30);
+        assert_eq!(result.previews.len(), 3);
+        assert_eq!(result.previews[0].scope, TextRecordScope::Shared);
+        assert_eq!(result.previews[0].parts[0].part_id, "1");
+        assert_eq!(result.previews[0].parts[1].part_id, "2");
+        assert_eq!(result.previews[0].fields[1].value, "String 1");
+        assert_eq!(result.previews[1].fields[1].value, "String 2");
+        assert_eq!(result.previews[2].fields[0].value, "MAINTENANCE_STATE");
     }
 
     #[test]
@@ -5223,6 +5860,123 @@ mod tests {
             .parse_dtr_text(&session.session_id)
             .expect("parse dtr text");
         assert_eq!(result.count, 0);
+    }
+
+    #[test]
+    fn malformed_gdr_reports_offset_and_removes_partial_export() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stdf_path = dir.path().join("bad-gdr.std");
+        let mut bytes = record(0, 10, &[2, 4]);
+        bytes.extend(record(50, 10, &[1, 0, 10, 5, b'A']));
+        std::fs::write(&stdf_path, bytes).expect("write STDF");
+
+        let manager = SessionManager::default();
+        let (tx, rx) = mpsc::channel();
+        let session = manager
+            .open_stdf(stdf_path.to_string_lossy().to_string(), move |event| {
+                let _ = tx.send(event);
+            })
+            .expect("open session");
+        for _ in 0..100 {
+            if matches!(
+                rx.recv_timeout(Duration::from_millis(50)),
+                Ok(SessionEvent::Complete(_))
+            ) {
+                break;
+            }
+        }
+
+        let error = manager
+            .parse_gdr_text(&session.session_id)
+            .expect_err("malformed GDR must fail");
+        assert!(
+            error.contains("offset 6"),
+            "error should identify record: {error}"
+        );
+        assert!(
+            error.contains("GEN_DATA[1]"),
+            "error should identify item: {error}"
+        );
+        assert!(!gdr_text_path(&session.session_id).exists());
+    }
+
+    #[test]
+    fn contextual_scan_rejects_partial_headers_and_payloads() {
+        let partial_header = [0x04, 0x00];
+        let error = scan_contextual_records(
+            &mut Cursor::new(partial_header),
+            (50, 30),
+            &[],
+            |_, _, _, _| Ok(()),
+        )
+        .expect_err("partial header must fail");
+        assert!(error.contains("offset 0"), "{error}");
+        assert!(error.contains("实际只有 2 字节"), "{error}");
+
+        let target_payload = [4, 0, 50, 30, b'a', b'b'];
+        let error = scan_contextual_records(
+            &mut Cursor::new(target_payload),
+            (50, 30),
+            &[],
+            |_, _, _, _| Ok(()),
+        )
+        .expect_err("truncated target payload must fail");
+        assert!(error.contains("REC_TYP=50, REC_SUB=30"), "{error}");
+        assert!(
+            error.contains("声明需要 4 字节，实际只有 2 字节"),
+            "{error}"
+        );
+
+        let skipped_payload = [4, 0, 15, 10, b'a', b'b'];
+        let error = scan_contextual_records(
+            &mut Cursor::new(skipped_payload),
+            (50, 30),
+            &[],
+            |_, _, _, _| Ok(()),
+        )
+        .expect_err("truncated skipped payload must fail");
+        assert!(error.contains("REC_TYP=15, REC_SUB=10"), "{error}");
+        assert!(
+            error.contains("声明需要 4 字节，实际只有 2 字节"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn failed_text_rescans_remove_previous_dtr_and_gdr_exports() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stdf_path = dir.path().join("truncated-text-rescan.std");
+        let mut valid = record(0, 10, &[2, 4]);
+        valid.extend(record(50, 30, &cn("complete DTR")));
+        valid.extend(record(50, 10, &gdr_strings(&["complete GDR"])));
+        std::fs::write(&stdf_path, valid).expect("write valid STDF");
+
+        let manager = SessionManager::default();
+        let session = open_and_wait_complete(&manager, &stdf_path);
+        manager
+            .parse_dtr_text(&session.session_id)
+            .expect("stage DTR");
+        manager
+            .parse_gdr_text(&session.session_id)
+            .expect("stage GDR");
+        assert!(dtr_text_path(&session.session_id).exists());
+        assert!(gdr_text_path(&session.session_id).exists());
+
+        let mut truncated = record(0, 10, &[2, 4]);
+        truncated.extend_from_slice(&[4, 0, 50, 30, b'a', b'b']);
+        std::fs::write(&stdf_path, truncated).expect("replace with truncated STDF");
+
+        let dtr_error = manager
+            .parse_dtr_text(&session.session_id)
+            .expect_err("truncated DTR rescan must fail");
+        assert!(dtr_error.contains("offset 6"), "{dtr_error}");
+        assert!(!dtr_text_path(&session.session_id).exists());
+
+        let gdr_error = manager
+            .parse_gdr_text(&session.session_id)
+            .expect_err("truncated skipped record must fail GDR rescan");
+        assert!(gdr_error.contains("offset 6"), "{gdr_error}");
+        assert!(!gdr_text_path(&session.session_id).exists());
     }
 
     #[test]

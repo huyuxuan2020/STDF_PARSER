@@ -1313,9 +1313,7 @@ impl FileIssueCollector {
         };
         issue.expected = "正常 STDF 数据应持续落在可识别的记录边界上；仅凭错位后的字节无法可靠反推出前一条记录正确的 REC_LEN。".to_string();
         issue.message = if final_count {
-            format!(
-                "大量不同类型连续出现，通常不是单一厂商扩展，而是更早的 REC_LEN 或字段长度错误导致后续内容被误当成记录头。软件已按文件声明继续解析，但相关统计可能不准确。"
-            )
+            "大量不同类型连续出现，通常不是单一厂商扩展，而是更早的 REC_LEN 或字段长度错误导致后续内容被误当成记录头。软件已按文件声明继续解析，但相关统计可能不准确。".to_string()
         } else {
             "大量不同类型连续出现，通常表示更早的 REC_LEN 或字段长度错误已经破坏记录边界。软件仍会按文件声明继续解析，但相关统计可能不准确。".to_string()
         };
@@ -1421,10 +1419,9 @@ impl FileIssueCollector {
 
 fn suspicious_text_split(record: &ParsedRecord) -> Option<SuspiciousTextSplit> {
     let payload_end = record.offset + 4 + u64::from(record.length);
-    let field_index = record
-        .fields
-        .iter()
-        .rposition(|field| field.offset.is_some() && field.length.is_some_and(|length| length > 0))?;
+    let field_index = record.fields.iter().rposition(|field| {
+        field.offset.is_some() && field.length.is_some_and(|length| length > 0)
+    })?;
     let field = record.fields.get(field_index)?;
     let following = record.fields.get(field_index + 1)?;
     if field.field_type.as_ref() != "C*n"
@@ -1795,10 +1792,7 @@ mod tests {
             .find(|issue| issue.code == "nonstandard_record")
             .unwrap();
         assert!(issue.actual.contains("上一条 MPR"));
-        assert!(
-            issue.actual.contains("TEST_TXT 长度=12"),
-            "{issue:#?}"
-        );
+        assert!(issue.actual.contains("TEST_TXT 长度=12"), "{issue:#?}");
         assert!(issue.expected.contains("TEST_TXT 应为 8 字节"));
         assert!(issue.expected.contains("ALARM_ID 是“abcde”"));
         assert!(issue.expected.contains("REC_LEN 应为 27"));

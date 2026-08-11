@@ -3816,9 +3816,8 @@ dependencies = [
 
 [[package]]
 name = "stdf-viewer-mac"
-version = "1.1.5"
+version = "1.2.0"
 dependencies = [
- "serde",
  "serde_json",
  "stdf-core",
  "tauri",
@@ -3826,9 +3825,6 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-process",
  "tauri-plugin-updater",
- "tempfile",
- "thiserror 2.0.18",
- "uuid",
 ]
 
 [[package]]

@@ -161,11 +161,48 @@ export interface TestItemPage {
   status: ParseStatus;
 }
 
-// Result of the on-demand DTR text extraction: the backend staged a txt with
-// `count` lines (one per DTR record); saveDtrText copies it to a user path.
+export type TextRecordScope = "part" | "shared" | "unassigned";
+
+export interface TextRecordPart {
+  part_id: string;
+  head_num: string;
+  site_num: string;
+}
+
+export interface DtrPreview {
+  index: number;
+  offset: number;
+  scope: TextRecordScope;
+  parts: TextRecordPart[];
+  text: string;
+}
+
 export interface DtrParseResult {
   session_id: string;
   count: number;
+  previews: DtrPreview[];
+}
+
+export interface GdrPreviewField {
+  index: number;
+  field_type: string;
+  value: string;
+}
+
+export interface GdrPreview {
+  index: number;
+  offset: number;
+  field_count: number;
+  scope: TextRecordScope;
+  parts: TextRecordPart[];
+  fields: GdrPreviewField[];
+  omitted_field_count: number;
+}
+
+export interface GdrParseResult {
+  session_id: string;
+  count: number;
+  previews: GdrPreview[];
 }
 
 // One pin row of an expanded MPR cell. The grid cell only shows the parser's
@@ -236,6 +273,7 @@ export interface StdfApi {
   saveCsvDialog(defaultName: string): Promise<string | null>;
   exportTestItemCsv(sessionId: string, path: string): Promise<void>;
   parseDtrText(sessionId: string): Promise<DtrParseResult>;
+  parseGdrText(sessionId: string): Promise<GdrParseResult>;
   getMprPinDetails(
     sessionId: string,
     testNum: number,
@@ -252,6 +290,7 @@ export interface StdfApi {
   ): Promise<void>;
   saveTxtDialog(defaultName: string): Promise<string | null>;
   saveDtrText(sessionId: string, path: string): Promise<void>;
+  saveGdrText(sessionId: string, path: string): Promise<void>;
   getRecordGroups(sessionId: string): Promise<RecordGroup[]>;
   getRecords(
     sessionId: string,

@@ -42,7 +42,7 @@ describe("App", () => {
     expect((await screen.findAllByText("demo-2.stdf")).length).toBeGreaterThan(0);
   });
 
-  it("parses DTR text from the DTR record panel and downloads the txt", async () => {
+  it("parses DTR text from the DTR inspector and downloads the txt", async () => {
     const api = createMockApi();
     const parseDtrText = vi.spyOn(api, "parseDtrText");
     const saveTxtDialog = vi.spyOn(api, "saveTxtDialog");
@@ -52,19 +52,105 @@ describe("App", () => {
     render(<App api={api} />);
     await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
     await screen.findByRole("main", { name: "文件摘要" });
+    act(() => api.emitComplete("session-1"));
     await user.click(screen.getByRole("button", { name: "明细" }));
     await user.click(await screen.findByRole("button", { name: "DTR 3 条记录" }));
 
-    // The DTR panel replaces the generic "no data fields" empty state with a
-    // parse call to action; downloading only unlocks after a successful parse.
+    // The DTR inspector replaces the generic "no data fields" empty state;
+    // downloading only unlocks after a successful parse.
     await user.click(await screen.findByRole("button", { name: "解析 DTR 文本" }));
     expect(parseDtrText).toHaveBeenCalledWith("session-1");
     expect(await screen.findByText(/共 3 条/)).toBeInTheDocument();
+    expect(await screen.findByText("first line")).toBeInTheDocument();
+    expect(screen.getAllByText(/PART_ID=PART-1/).length).toBeGreaterThan(0);
 
     await user.click(screen.getByRole("button", { name: "下载 TXT" }));
     expect(saveTxtDialog).toHaveBeenCalledWith("demo-1_DTR.txt");
     await waitFor(() => expect(saveDtrText).toHaveBeenCalledWith("session-1", "/tmp/export.txt"));
     expect(await screen.findByText("已保存 ✓")).toBeInTheDocument();
+  });
+
+  it("parses GDR data, previews fields and downloads the txt", async () => {
+    const api = createMockApi();
+    const parseGdrText = vi.spyOn(api, "parseGdrText");
+    const saveTxtDialog = vi.spyOn(api, "saveTxtDialog");
+    const saveGdrText = vi.spyOn(api, "saveGdrText");
+    const user = userEvent.setup();
+
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
+    await screen.findByRole("main", { name: "文件摘要" });
+    act(() => api.emitComplete("session-1"));
+    await user.click(screen.getByRole("button", { name: "明细" }));
+    await user.click(await screen.findByRole("button", { name: "GDR 3 条记录" }));
+
+    await user.click(await screen.findByRole("button", { name: "解析 GDR 数据" }));
+    expect(parseGdrText).toHaveBeenCalledWith("session-1");
+    expect(await screen.findByText(/共 3 条 GDR 数据/)).toBeInTheDocument();
+    expect((await screen.findAllByText("Add two String data ...")).length).toBe(3);
+    expect(screen.getAllByText("SHARED").length).toBeGreaterThan(0);
+    expect(screen.getByText(/其余 1 项请下载完整 TXT/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "下载 TXT" }));
+    expect(saveTxtDialog).toHaveBeenCalledWith("demo-1_GDR.txt");
+    await waitFor(() => expect(saveGdrText).toHaveBeenCalledWith("session-1", "/tmp/export.txt"));
+    expect(await screen.findByText("已保存 ✓")).toBeInTheDocument();
+  });
+
+  it("keeps GDR and DTR parsing disabled until the main parse completes", async () => {
+    const api = createMockApi();
+    const user = userEvent.setup();
+
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
+    await screen.findByRole("main", { name: "文件摘要" });
+    await user.click(screen.getByRole("button", { name: "明细" }));
+
+    await user.click(await screen.findByRole("button", { name: "DTR 3 条记录" }));
+    expect(await screen.findByRole("button", { name: "解析 DTR 文本" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "GDR 3 条记录" }));
+    expect(await screen.findByRole("button", { name: "解析 GDR 数据" })).toBeDisabled();
+
+    act(() => api.emitComplete("session-1"));
+    expect(await screen.findByRole("button", { name: "解析 GDR 数据" })).toBeEnabled();
+  });
+
+  it("keeps DTR and GDR preview-only while normal records retain paging", async () => {
+    const api = createMockApi();
+    const getRecords = vi.spyOn(api, "getRecords");
+    const user = userEvent.setup();
+
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
+    await screen.findByRole("main", { name: "文件摘要" });
+    act(() => api.emitComplete("session-1"));
+    await user.click(screen.getByRole("button", { name: "明细" }));
+
+    await user.click(await screen.findByRole("button", { name: "DTR 3 条记录" }));
+    await screen.findByRole("button", { name: "解析 DTR 文本" });
+    expect(screen.queryByRole("button", { name: "上一条记录" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "下一条记录" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("spinbutton", { name: "跳转到第几条记录" })).not.toBeInTheDocument();
+    const dtrCalls = getRecords.mock.calls.length;
+    await user.keyboard("{ArrowRight}");
+    expect(getRecords).toHaveBeenCalledTimes(dtrCalls);
+
+    await user.click(screen.getByRole("button", { name: "GDR 3 条记录" }));
+    await screen.findByRole("button", { name: "解析 GDR 数据" });
+    const gdrCalls = getRecords.mock.calls.length;
+    await user.keyboard("{ArrowRight}");
+    expect(getRecords).toHaveBeenCalledTimes(gdrCalls);
+    expect(screen.queryByRole("button", { name: "下一条记录" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "PTR 2 条记录" }));
+    const next = await screen.findByRole("button", { name: "下一条记录" });
+    const jump = screen.getByRole("spinbutton", { name: "跳转到第几条记录" });
+    expect(jump).toHaveValue(1);
+    await user.click(next);
+    expect(jump).toHaveValue(2);
+    await user.keyboard("{ArrowLeft}");
+    expect(jump).toHaveValue(1);
   });
 
   it("shows an inline error and allows retry when DTR parsing fails", async () => {
@@ -78,6 +164,7 @@ describe("App", () => {
     render(<App api={api} />);
     await user.click(screen.getByRole("button", { name: "打开 STDF 文件" }));
     await screen.findByRole("main", { name: "文件摘要" });
+    act(() => api.emitComplete("session-1"));
     await user.click(screen.getByRole("button", { name: "明细" }));
     await user.click(await screen.findByRole("button", { name: "DTR 3 条记录" }));
 

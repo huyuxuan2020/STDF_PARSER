@@ -5,6 +5,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   BinSummary,
   DtrParseResult,
+  GdrParseResult,
   MprPinDetails,
   ParseErrorEvent,
   ParseProgress,
@@ -107,6 +108,10 @@ export const tauriApi: StdfApi = {
     return invoke<DtrParseResult>("parse_dtr_text", { sessionId });
   },
 
+  parseGdrText(sessionId: string) {
+    return invoke<GdrParseResult>("parse_gdr_text", { sessionId });
+  },
+
   getMprPinDetails(sessionId: string, testNum: number, recordPosition: number) {
     return invoke<MprPinDetails>("get_mpr_pin_details", {
       sessionId,
@@ -149,6 +154,10 @@ export const tauriApi: StdfApi = {
 
   saveDtrText(sessionId: string, path: string) {
     return invoke<void>("save_dtr_text", { sessionId, path });
+  },
+
+  saveGdrText(sessionId: string, path: string) {
+    return invoke<void>("save_gdr_text", { sessionId, path });
   },
 
   getRecordGroups(sessionId: string) {

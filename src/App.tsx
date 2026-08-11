@@ -8,7 +8,6 @@ import {
   ChevronDown,
   CircleDot,
   Download,
-  FileText,
   Filter,
   FolderOpen,
   Hourglass,
@@ -17,7 +16,6 @@ import {
   Loader2,
   Moon,
   MousePointerClick,
-  ScanText,
   Search,
   SearchX,
   Sun,
@@ -27,10 +25,21 @@ import {
   XCircle,
   type LucideIcon
 } from "lucide-react";
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type Dispatch,
+  type ReactNode,
+  type SetStateAction,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from "react";
 import { createPortal } from "react-dom";
 import { computeMatrixWindow } from "./matrixWindow";
+import { RecordTextInspector, type TextParseState } from "./RecordTextInspector";
 import type {
+  DtrPreview,
+  GdrPreview,
   MprPinDetails,
   FileIssue,
   ParseErrorEvent,
@@ -44,7 +53,6 @@ import type {
   TestItemColumn,
   BinSummary,
   TestItemColumnLite,
-  TestItemPage,
   TestItemPartRow,
   StdfApi
 } from "./types";
@@ -60,6 +68,11 @@ const PAGE_SIZE = 50;
 const TI_ROW_BATCH = 500;
 const TI_COL_SIZE_OPTIONS = [200, 500, 1000];
 const THEME_KEY = "stdf-theme";
+const TEXT_PREVIEW_RECORD_TYPES = new Set(["DTR", "GDR"]);
+
+function isTextPreviewRecordType(recordType: string | undefined): boolean {
+  return recordType !== undefined && TEXT_PREVIEW_RECORD_TYPES.has(recordType);
+}
 
 /* ------------------------------------------------------------------ *
  * Shared Tailwind class tokens — small component-system style layer.  *
@@ -182,22 +195,97 @@ const ONEDATA_KEY_FIELDS: KeyFieldSpec[] = [
   { rec: "SDR", field: "LOAD_ID", oneData: "probecardLoadboardId", scope: "ft" }
 ];
 
-// On-demand DTR text extraction (明细 → DTR 记录面板). Per-session state:
-// parse re-scans the file into a backend temp txt, download copies it out.
-interface DtrParseState {
-  phase: "idle" | "parsing" | "done" | "error";
-  count: number;
-  message: string;
-  saving: boolean;
-  saved: boolean;
-}
-const IDLE_DTR_PARSE: DtrParseState = {
+const IDLE_DTR_PARSE: TextParseState<DtrPreview> = {
   phase: "idle",
   count: 0,
+  previews: [],
   message: "",
   saving: false,
   saved: false
 };
+
+const IDLE_GDR_PARSE: TextParseState<GdrPreview> = {
+  phase: "idle",
+  count: 0,
+  previews: [],
+  message: "",
+  saving: false,
+  saved: false
+};
+
+type TextStateSetter<TPreview> = Dispatch<SetStateAction<TextParseState<TPreview>>>;
+
+async function parseTextRecords<TPreview>({
+  sessionId,
+  state,
+  idleState,
+  setState,
+  parse,
+  isCurrent
+}: {
+  sessionId: string | undefined;
+  state: TextParseState<TPreview>;
+  idleState: TextParseState<TPreview>;
+  setState: TextStateSetter<TPreview>;
+  parse(sessionId: string): Promise<{ count: number; previews: TPreview[] }>;
+  isCurrent(sessionId: string): boolean;
+}) {
+  if (!sessionId || state.phase === "parsing") return;
+  setState({ ...idleState, phase: "parsing" });
+  try {
+    const result = await parse(sessionId);
+    if (!isCurrent(sessionId)) return;
+    setState({
+      ...idleState,
+      phase: "done",
+      count: result.count,
+      previews: result.previews
+    });
+  } catch (error) {
+    if (!isCurrent(sessionId)) return;
+    setState({ ...idleState, phase: "error", message: String(error) });
+  }
+}
+
+async function downloadTextRecords<TPreview>({
+  sessionId,
+  state,
+  setState,
+  defaultName,
+  selectPath,
+  save,
+  isCurrent
+}: {
+  sessionId: string | undefined;
+  state: TextParseState<TPreview>;
+  setState: TextStateSetter<TPreview>;
+  defaultName: string;
+  selectPath(defaultName: string): Promise<string | null>;
+  save(sessionId: string, path: string): Promise<void>;
+  isCurrent(sessionId: string): boolean;
+}) {
+  if (!sessionId || state.phase !== "done" || state.saving) return;
+  const path = await selectPath(defaultName);
+  if (!path || !isCurrent(sessionId)) return;
+  setState((previous) => ({ ...previous, saving: true, saved: false, message: "" }));
+  try {
+    await save(sessionId, path);
+    if (!isCurrent(sessionId)) return;
+    setState((previous) => ({ ...previous, saving: false, saved: true }));
+    window.setTimeout(() => {
+      if (isCurrent(sessionId)) {
+        setState((previous) => ({ ...previous, saved: false }));
+      }
+    }, 2500);
+  } catch (error) {
+    if (!isCurrent(sessionId)) return;
+    setState((previous) => ({
+      ...previous,
+      saving: false,
+      message: `保存 TXT 失败：${String(error)}`
+    }));
+  }
+}
 
 interface AppProps {
   api?: StdfApi;
@@ -252,7 +340,8 @@ export default function App({ api = tauriApi }: AppProps) {
   const [tiColumnsLoading, setTiColumnsLoading] = useState(false);
   const [tiExporting, setTiExporting] = useState(false);
   const [tiExported, setTiExported] = useState(false);
-  const [dtrParse, setDtrParse] = useState<DtrParseState>(IDLE_DTR_PARSE);
+  const [dtrParse, setDtrParse] = useState<TextParseState<DtrPreview>>(IDLE_DTR_PARSE);
+  const [gdrParse, setGdrParse] = useState<TextParseState<GdrPreview>>(IDLE_GDR_PARSE);
   const [tiHasBinPf, setTiHasBinPf] = useState(true);
   // Bumped whenever the column window / selection changes, to drop stale "load more" responses.
   const tiEpoch = useRef(0);
@@ -440,6 +529,7 @@ export default function App({ api = tauriApi }: AppProps) {
     setTiFilterOpen(false);
     setTiAllColumns([]);
     setDtrParse(IDLE_DTR_PARSE);
+    setGdrParse(IDLE_GDR_PARSE);
   }, [session?.session_id]);
 
   // Fetch the yield/bin distribution once parsing completes.
@@ -527,10 +617,10 @@ export default function App({ api = tauriApi }: AppProps) {
     const onKey = (event: KeyboardEvent) => {
       const el = document.activeElement;
       if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) return;
-      if (event.key === "ArrowLeft" && recordTotal > 1) {
+      if (event.key === "ArrowLeft" && recordTotal > 1 && !isTextPreviewRecordType(selectedGroup)) {
         event.preventDefault();
         setCursor((current) => Math.max(0, current - 1));
-      } else if (event.key === "ArrowRight" && recordTotal > 1) {
+      } else if (event.key === "ArrowRight" && recordTotal > 1 && !isTextPreviewRecordType(selectedGroup)) {
         event.preventDefault();
         setCursor((current) => Math.min(recordTotal - 1, current + 1));
       } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
@@ -652,7 +742,7 @@ export default function App({ api = tauriApi }: AppProps) {
   }
 
   // STDF filename without compression/format extensions — the stem every
-  // export (CSV, DTR txt) derives its default filename from.
+  // export (CSV or staged record TXT) derives its default filename from.
   function sessionBaseName() {
     return (session?.file_name || "export")
       .replace(/\.(gz|zip)$/i, "")
@@ -679,37 +769,52 @@ export default function App({ api = tauriApi }: AppProps) {
     }
   }
 
-  // Scan the whole file for DTR records and stage their text in a backend
-  // temp txt. Deliberately re-runnable — 重新解析 just repeats the scan.
+  // GDR/DTR stay out of the initial record index; these actions re-scan the
+  // source on demand and stage a context-separated TXT in the backend.
   async function handleParseDtr() {
-    const sessionId = session?.session_id;
-    if (!sessionId || dtrParse.phase === "parsing") return;
-    setDtrParse({ ...IDLE_DTR_PARSE, phase: "parsing" });
-    try {
-      const result = await api.parseDtrText(sessionId);
-      if (sessionIdRef.current !== sessionId) return; // superseded by a newer open
-      setDtrParse({ ...IDLE_DTR_PARSE, phase: "done", count: result.count });
-    } catch (err) {
-      if (sessionIdRef.current !== sessionId) return;
-      setDtrParse({ ...IDLE_DTR_PARSE, phase: "error", message: String(err) });
-    }
+    await parseTextRecords({
+      sessionId: session?.session_id,
+      state: dtrParse,
+      idleState: IDLE_DTR_PARSE,
+      setState: setDtrParse,
+      parse: api.parseDtrText,
+      isCurrent: (sessionId) => sessionIdRef.current === sessionId
+    });
   }
 
-  // Copy the staged DTR txt to a user-picked path (save dialog first, so a
-  // cancelled dialog costs nothing).
   async function handleDownloadDtr() {
-    const sessionId = session?.session_id;
-    if (!sessionId || dtrParse.phase !== "done" || dtrParse.saving) return;
-    const path = await api.saveTxtDialog(`${sessionBaseName()}_DTR.txt`);
-    if (!path) return;
-    setDtrParse((prev) => ({ ...prev, saving: true, saved: false, message: "" }));
-    try {
-      await api.saveDtrText(sessionId, path);
-      setDtrParse((prev) => ({ ...prev, saving: false, saved: true }));
-      window.setTimeout(() => setDtrParse((prev) => ({ ...prev, saved: false })), 2500);
-    } catch (err) {
-      setDtrParse((prev) => ({ ...prev, saving: false, message: `保存 TXT 失败：${String(err)}` }));
-    }
+    await downloadTextRecords({
+      sessionId: session?.session_id,
+      state: dtrParse,
+      setState: setDtrParse,
+      defaultName: `${sessionBaseName()}_DTR.txt`,
+      selectPath: api.saveTxtDialog,
+      save: api.saveDtrText,
+      isCurrent: (sessionId) => sessionIdRef.current === sessionId
+    });
+  }
+
+  async function handleParseGdr() {
+    await parseTextRecords({
+      sessionId: session?.session_id,
+      state: gdrParse,
+      idleState: IDLE_GDR_PARSE,
+      setState: setGdrParse,
+      parse: api.parseGdrText,
+      isCurrent: (sessionId) => sessionIdRef.current === sessionId
+    });
+  }
+
+  async function handleDownloadGdr() {
+    await downloadTextRecords({
+      sessionId: session?.session_id,
+      state: gdrParse,
+      setState: setGdrParse,
+      defaultName: `${sessionBaseName()}_GDR.txt`,
+      selectPath: api.saveTxtDialog,
+      save: api.saveGdrText,
+      isCurrent: (sessionId) => sessionIdRef.current === sessionId
+    });
   }
 
   async function refreshGroups(sessionId: string) {
@@ -780,6 +885,7 @@ export default function App({ api = tauriApi }: AppProps) {
     setTiFilterOpen(false);
     setTiAllColumns([]);
     setDtrParse(IDLE_DTR_PARSE);
+    setGdrParse(IDLE_GDR_PARSE);
     const initialSnapshot = await api.getSessionSnapshot(nextSession.session_id);
     // A newer open may have taken over while the snapshot was in flight —
     // its state must not be clobbered with this session's data.
@@ -981,8 +1087,12 @@ export default function App({ api = tauriApi }: AppProps) {
               <RecordsView
                 groups={groups}
                 dtrParse={dtrParse}
+                gdrParse={gdrParse}
                 onParseDtr={handleParseDtr}
                 onDownloadDtr={handleDownloadDtr}
+                onParseGdr={handleParseGdr}
+                onDownloadGdr={handleDownloadGdr}
+                parseComplete={session.status === "complete"}
                 selectedGroup={selectedGroup}
                 onSelectGroup={(group) => {
                   setSelectedGroup(group);
@@ -1901,8 +2011,12 @@ function RecordsView({
   recordTotal,
   onCursorChange,
   dtrParse,
+  gdrParse,
   onParseDtr,
-  onDownloadDtr
+  onDownloadDtr,
+  onParseGdr,
+  onDownloadGdr,
+  parseComplete
 }: {
   groups: RecordGroup[];
   selectedGroup: string;
@@ -1912,9 +2026,13 @@ function RecordsView({
   cursor: number;
   recordTotal: number;
   onCursorChange(index: number): void;
-  dtrParse: DtrParseState;
+  dtrParse: TextParseState<DtrPreview>;
+  gdrParse: TextParseState<GdrPreview>;
   onParseDtr(): void;
   onDownloadDtr(): void;
+  onParseGdr(): void;
+  onDownloadGdr(): void;
+  parseComplete: boolean;
 }) {
   return (
     <section
@@ -1953,39 +2071,54 @@ function RecordsView({
         </nav>
       </aside>
       <FieldDetailPanel
+        selectedGroup={selectedGroup}
         selectedRecord={selectedRecord}
         fields={fields}
         cursor={cursor}
         recordTotal={recordTotal}
         onCursorChange={onCursorChange}
         dtrParse={dtrParse}
+        gdrParse={gdrParse}
         onParseDtr={onParseDtr}
         onDownloadDtr={onDownloadDtr}
+        onParseGdr={onParseGdr}
+        onDownloadGdr={onDownloadGdr}
+        parseComplete={parseComplete}
       />
     </section>
   );
 }
 
 function FieldDetailPanel({
+  selectedGroup,
   selectedRecord,
   fields,
   cursor,
   recordTotal,
   onCursorChange,
   dtrParse,
+  gdrParse,
   onParseDtr,
-  onDownloadDtr
+  onDownloadDtr,
+  onParseGdr,
+  onDownloadGdr,
+  parseComplete
 }: {
+  selectedGroup: string;
   selectedRecord: RecordSummary | null;
   fields: RecordField[];
   cursor: number;
   recordTotal: number;
   onCursorChange(index: number): void;
-  dtrParse: DtrParseState;
+  dtrParse: TextParseState<DtrPreview>;
+  gdrParse: TextParseState<GdrPreview>;
   onParseDtr(): void;
   onDownloadDtr(): void;
+  onParseGdr(): void;
+  onDownloadGdr(): void;
+  parseComplete: boolean;
 }) {
-  const hasPager = recordTotal > 1;
+  const hasPager = recordTotal > 1 && !isTextPreviewRecordType(selectedGroup);
   const [draft, setDraft] = useState(String(cursor + 1));
   useEffect(() => {
     setDraft(String(cursor + 1));
@@ -2073,7 +2206,21 @@ function FieldDetailPanel({
       </div>
       {selectedRecord ? (
         selectedRecord.record_type === "DTR" ? (
-          <DtrTextCard state={dtrParse} onParse={onParseDtr} onDownload={onDownloadDtr} />
+          <RecordTextInspector
+            kind="DTR"
+            state={dtrParse}
+            onParse={onParseDtr}
+            onDownload={onDownloadDtr}
+            parseComplete={parseComplete}
+          />
+        ) : selectedRecord.record_type === "GDR" ? (
+          <RecordTextInspector
+            kind="GDR"
+            state={gdrParse}
+            onParse={onParseGdr}
+            onDownload={onDownloadGdr}
+            parseComplete={parseComplete}
+          />
         ) : (
           <FieldsTable fields={fields} />
         )
@@ -2085,116 +2232,6 @@ function FieldDetailPanel({
         />
       )}
     </section>
-  );
-}
-
-// DTR TEXT_DAT is deliberately not expanded during the initial parse (huge
-// datalog files can hold millions of DTR lines). This card offers the
-// on-demand path instead: scan the file once, then download the txt.
-function DtrTextCard({
-  state,
-  onParse,
-  onDownload
-}: {
-  state: DtrParseState;
-  onParse(): void;
-  onDownload(): void;
-}) {
-  const parsing = state.phase === "parsing";
-  const done = state.phase === "done";
-  const failed = state.phase === "error";
-  const empty = done && state.count === 0;
-  // Icon chip tone tracks the phase (same 44px chip idiom as EmptyState and
-  // the update dialog): primary while idle/scanning, success when the text is
-  // staged, danger when the scan failed, neutral when the file has no DTRs.
-  const chipTone = failed
-    ? "bg-danger-soft text-danger"
-    : empty
-      ? "bg-muted text-muted-foreground"
-      : done
-        ? "bg-success-soft text-success"
-        : "bg-primary-soft text-primary";
-  const ChipIcon = failed ? AlertCircle : empty ? FileText : done ? CheckCircle2 : ScanText;
-  return (
-    <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto">
-      <div className="fade-rise flex w-full max-w-[460px] flex-col items-center gap-3 rounded-xl border border-border/60 bg-card px-6 py-8 text-center shadow-card">
-        {/* Keyed on phase so idle → parsing → done each re-enters with the
-            same soft rise the rest of the app uses. */}
-        <div key={state.phase} className="fade-rise flex w-full flex-col items-center gap-3">
-          <div className={`flex h-11 w-11 items-center justify-center rounded-xl ${chipTone}`}>
-            {parsing ? (
-              <Loader2 size={20} className="animate-spin" aria-hidden="true" />
-            ) : (
-              <ChipIcon size={20} aria-hidden="true" />
-            )}
-          </div>
-          <strong className="text-[15px] font-semibold text-foreground">
-            {done
-              ? `解析完成，共 ${state.count.toLocaleString()} 条 DTR 文本`
-              : parsing
-                ? "正在扫描 DTR 文本…"
-                : failed
-                  ? "DTR 解析失败"
-                  : "DTR 文本未解析"}
-          </strong>
-          <p className="max-w-[360px] text-pretty text-xs leading-relaxed text-muted-foreground">
-            {done
-              ? empty
-                ? "整份文件没有扫描到 DTR 记录，无可下载的文本。"
-                : "已按文件顺序整理，每条 DTR 一行，可下载为 TXT 文件。"
-              : parsing
-                ? "正在重新扫描整份文件提取全部 DTR 文本，大文件需要几秒，期间其他页面可正常使用。"
-                : "DTR 的 TEXT_DAT 默认不在解析时展开。点击解析会重新扫描整份文件，提取全部 DTR 文本。"}
-          </p>
-        </div>
-        {state.message && (
-          <p
-            className="w-full rounded-lg border border-danger-border bg-danger-soft px-3 py-2 text-left text-xs leading-relaxed text-danger [overflow-wrap:anywhere]"
-            role="alert"
-          >
-            {state.message}
-          </p>
-        )}
-        {parsing ? (
-          // Scan duration is unknown, so the buttons row hands its space to the
-          // same indeterminate sweep the search kick-off uses.
-          <div className="flex min-h-[40px] w-full max-w-[280px] items-center pt-1">
-            <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-muted">
-              <div className="indeterminate-sweep absolute inset-y-0 left-0 w-1/3 rounded-full bg-primary" />
-            </div>
-          </div>
-        ) : (
-          <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
-            {done ? (
-              <>
-                <button
-                  type="button"
-                  className={BTN_PRIMARY}
-                  onClick={onDownload}
-                  disabled={state.saving || state.count === 0}
-                >
-                  {state.saving ? (
-                    <Loader2 size={16} className="animate-spin" />
-                  ) : (
-                    <Download size={16} />
-                  )}
-                  {state.saving ? "保存中…" : state.saved ? "已保存 ✓" : "下载 TXT"}
-                </button>
-                <button type="button" className={BTN_SECONDARY} onClick={onParse}>
-                  <ScanText size={16} />
-                  重新解析
-                </button>
-              </>
-            ) : (
-              <button type="button" className={BTN_PRIMARY} onClick={onParse}>
-                <ScanText size={16} />
-                解析 DTR 文本
-              </button>
-            )}
-          </div>
-        )}
-      </div>
-    </div>
   );
 }
 

@@ -25,7 +25,10 @@ fn main() {
         eprintln!("usage: parse_bench <stdf-file> [runs]");
         std::process::exit(2);
     };
-    let runs: usize = args.next().and_then(|value| value.parse().ok()).unwrap_or(3);
+    let runs: usize = args
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3);
     let size = std::fs::metadata(&path).expect("stat input").len();
     let mb = size as f64 / 1048576.0;
     println!("file: {path} ({mb:.1} MB), {runs} run(s)");
@@ -79,8 +82,8 @@ fn main() {
         let dt = start.elapsed().as_secs_f64();
         println!("full  run {}: {dt:.3}s  {:.1} MB/s", run + 1, mb / dt);
         drop(manager);
-        let db = stdf_core::sessions::temp_workspace_dir()
-            .join(format!("{}.db", session.session_id));
+        let db =
+            stdf_core::sessions::temp_workspace_dir().join(format!("{}.db", session.session_id));
         let _ = std::fs::remove_file(db);
     }
 }
